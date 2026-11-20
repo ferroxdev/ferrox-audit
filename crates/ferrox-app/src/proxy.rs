@@ -75,4 +75,104 @@ pub(crate) fn serve_json(label: &str, body: &str, test: bool) -> ! {
 /// Xray's own wire form; the pinned scenario suite spawns this binary with `-config=stdin: -format=pb`.
 pub(crate) fn serve_protobuf(label: &str, bytes: &[u8], test: bool) -> ! {
     let (root, seed) = crate::xray_pb::to_json_seeded(bytes)
-        .unwrap_or_else(|error| exit(&format!("bad config {label}: {e
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    serve_root(label, &root, Some(&seed), test)
+}
+
+/// The listen addresses an inbound names: every port its `port` field expands, on the
+/// `listen` host, or the `unix` path standing in for both. An empty answer is an inbound
+/// naming no socket, which the caller skips; a datagram carrier keeps the IP address by
+/// the same rule.
+fn inbound_addresses(inbound: &Json) -> Vec<String> {
+    #[cfg(unix)]
+    {
+        let unix_path = inbound
+            .get("unix")
+            .and_then(Json::as_str)
+            .filter(|path| !path.is_empty());
+        if let Some(path) = unix_path {
+            return vec![format!("unix:{path}")];
+        }
+    }
+    let Some(field) = inbound.get("port") else {
+        return Vec::new();
+    };
+    let ports = inbound_ports(field);
+    if ports.is_empty() {
+        return Vec::new();
+    }
+    let host = inbound
+        .get("listen")
+        .and_then(Json::as_str)
+        .filter(|listen| !listen.is_empty())
+        .unwrap_or("0.0.0.0");
+    ports
+        .into_iter()
+        .map(|port| format!("{host}:{port}"))
+        .collect()
+}
+
+/// The ports a `port` field names, in the forms the reference `PortList` accepts: a JSON
+/// number, a plain or `"env:NAME"`-sourced decimal string, an `"a-b"` range expanded to
+/// every port in it, and comma-separated combinations of those.
+fn inbound_ports(field: &Json) -> Vec<u16> {
+    if let Some(port) = field.as_port() {
+        return vec![port];
+    }
+    let Some(spec) = field.as_str() else {
+        return Vec::new();
+    };
+    let mut ports = Vec::new();
+    for piece in spec.split(',') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let env_value = piece
+            .strip_prefix("env:")
+            .and_then(|name| std::env::var(name).ok());
+        if piece.starts_with("env:") && env_value.is_none() {
+            eprintln!(
+                "env `{}` in the port list is unset, so its piece names no port",
+                &piece[4..]
+            );
+            continue;
+        }
+        let piece = env_value.as_deref().unwrap_or(piece);
+        let (from, to) = piece.split_once('-').unwrap_or((piece, piece));
+        let (Ok(from), Ok(to)) = (from.parse::<u16>(), to.parse::<u16>()) else {
+            eprintln!("port piece `{piece}` is not a port the reference names; piece skipped");
+            continue;
+        };
+        if from > to {
+            eprintln!("port range `{piece}` descends, piece skipped");
+            continue;
+        }
+        ports.extend(from..=to);
+    }
+    ports
+}
+
+/// The address and port dokodemo-door rewrites every flow to, each half optional so the
+/// flow's own local address can fill what the config omits.
+#[derive(Clone, Debug, Default)]
+struct DokodemoRewrite {
+    host: Option<String>,
+    port: Option<u16>,
+}
+
+impl DokodemoRewrite {
+    fn from_config(inbound: &Json) -> Self {
+        let Some(settings) = inbound.get("settings") else {
+            return Self::default();
+        };
+        let host = settings
+            .get("address")
+            .or_else(|| settings.get("rewriteAddress"))
+            .and_then(Json::as_str)
+            .map(str::to_owned);
+        let port = settings
+            .get("port")
+            .and_then(Json::as_port)
+            .filter(|port| *port != 0)
+            .or_else(|| settings.get("rewritePort").and_th
