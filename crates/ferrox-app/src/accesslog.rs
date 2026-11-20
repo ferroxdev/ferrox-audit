@@ -1,0 +1,925 @@
+use crate::json::Json;
+use std::cell::RefCell;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::net::SocketAddr;
+use std::sync::{Mutex, MutexGuard};
+
+#[derive(Clone, Default)]
+struct Flow {
+    source: Option<SocketAddr>,
+    email: String,
+    level: u32,
+}
+
+thread_local! {
+    static FLOW: RefCell<Flow> = RefCell::new(Flow::default());
+}
+
+/// The source and account a front's flows are logged with until the session ends.
+pub(crate) struct FlowGuard;
+
+/// The flow a thread is serving, carried to a thread that continues the same session.
+#[derive(Clone, Default)]
+pub(crate) struct Snapshot(Flow);
+
+pub(crate) fn snapshot() -> Snapshot {
+    FLOW.with(|flow| Snapshot(flow.borrow().clone()))
+}
+
+pub(crate) fn install_snapshot(snapshot: Snapshot) -> FlowGuard {
+    FLOW.with(|flow| *flow.borrow_mut() = snapshot.0);
+    FlowGuard
+}
+
+pub(crate) fn flow(source: Option<SocketAddr>, email: &str, level: u32) -> FlowGuard {
+    install_snapshot(Snapshot(Flow {
+        source,
+        email: email.to_owned(),
+        level,
+    }))
+}
+
+impl Drop for FlowGuard {
+    fn drop(&mut self) {
+        FLOW.with(|flow| *flow.borrow_mut() = Flow::default());
+    }
+}
+
+/// The source a front's user meter hands its online lease, so the flow is named once by its real peer.
+pub(crate) fn source_ip() -> Option<std::net::IpAddr> {
+    FLOW.with(|flow| flow.borrow().source.map(|source| source.ip()))
+}
+
+/// The account the front named before its protocol authenticated, for the paths that meter only after the header opens.
+pub(crate) fn identity() -> (String, u32) {
+    FLOW.with(|flow| {
+        let flow = flow.borrow();
+        (flow.email.clone(), flow.level)
+    })
+}
+
+/// The account a front authenticates after its flow opened: the source stays, the identity is the one the client proved.
+pub(crate) fn reidentify(email: &str, level: u32) {
+    FLOW.with(|flow| {
+        let mut flow = flow.borrow_mut();
+        email.clone_into(&mut flow.email);
+        flow.level = level;
+    });
+}
+
+/// One accepted line for the flow the current front is serving, at the destination its request named.
+pub(crate) fn record_current(destination: &dyn std::fmt::Display) {
+    let (source, email) = FLOW.with(|flow| {
+        let flow = flow.borrow();
+        (flow.source, flow.email.clone())
+    });
+    record(source, true, destination, None, "", &email);
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Config {
+    pub(crate) access: Option<String>,
+    pub(crate) mask_address: bool,
+}
+
+static CONFIG: Mutex<Option<Config>> = Mutex::new(None);
+static SINK: Mutex<Option<Box<dyn Write + Send>>> = Mutex::new(None);
+
+fn lock() -> MutexGuard<'static, Option<Config>> {
+    CONFIG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn sink() -> MutexGuard<'static, Option<Box<dyn Write + Send>>> {
+    SINK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Read the top-level `log` object, keeping the reference's names and the access path's meaning.
+pub(crate) fn parse(root: &Json) -> Result<Config, String> {
+    let Some(section) = root.get("log") else {
+        return Ok(Config::default());
+    };
+    let Json::Obj(pairs) = section else {
+        return Err("`log` is not an object".to_owned());
+    };
+    let mut config = Config::default();
+    for (key, value) in pairs {
+        match key.as_str() {
+            "access" => {
+                let path = value
+                    .as_str()
+                    .ok_or_else(|| "`log.access` is not a string".to_owned())?;
+                config.access = (!path.is_empty()).then(|| path.to_owned());
+            }
+            "maskAddress" => {
+                config.mask_address = value
+                    .as_str()
+                    .is_some_and(|mask| !mask.is_empty() && !mask.eq_ignore_ascii_case("none"));
+            }
+            _ => {}
+        }
+    }
+    Ok(config)
+}
+
+/// Install the access sink before any inbound opens; a path that cannot be opened stops startup.
+pub(crate) fn install(root: &Json) -> Result<Config, String> {
+    let config = parse(root)?;
+    let writer = open_access(config.access.as_deref())?;
+    *sink() = writer;
+    *lock() = Some(config.clone());
+    Ok(config)
+}
+
+/// Reopen the access path on `RestartLogger`, so a rotated file is picked up without a restart.
+/// The new writer is opened before the old one is dropped; a path that cannot be opened leaves
+/// the running sink in place and answers the call with the failure.
+pub(crate) fn restart() -> Result<(), String> {
+    let Some(config) = lock().clone() else {
+        return Ok(());
+    };
+    let writer = open_access(config.access.as_deref())?;
+    *sink() = writer;
+    Ok(())
+}
+
+fn open_access(access: Option<&str>) -> Result<Option<Box<dyn Write + Send>>, String> {
+    match access {
+        Some("-") => Ok(Some(Box::new(std::io::stdout()))),
+        Some(path) => OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map(|file| Some(Box::new(file) as Box<dyn Write + Send>))
+            .map_err(|error| format!("cannot open access log `{path}`: {error}")),
+        None => Ok(None),
+    }
+}
+
+/// One reference access line: `from <source> <accepted|rejected> <destination> [detour] reason email: <email>`.
+pub(crate) fn record(
+    source: Option<SocketAddr>,
+    accepted: bool,
+    destination: &dyn std::fmt::Display,
+    detour: Option<&str>,
+    reason: &str,
+    email: &str,
+) {
+    let Some(config) = lock().clone() else {
+        return;
+    };
+    let mut sink = sink();
+    let Some(writer) = sink.as_mut() else {
+        return;
+    };
+    let source = source.map_or_else(
+        || "unknown".to_owned(),
+        |source| address(source, config.mask_address),
+    );
+    let mut line = String::with_capacity(64 + source.len());
+    line.push_str("from ");
+    line.push_str(&source);
+    line.push(' ');
+    line.push_str(if accepted { "accepted " } else { "rejected " });
+    let _ = std::fmt::write(
+        &mut Escaper { out: &mut line },
+        format_args!("{destination}"),
+    );
+    if let Some(detour) = detour.filter(|detour| !detour.is_empty()) {
+        line.push_str(" [");
+        push_escaped(&mut line, detour);
+        line.push(']');
+    }
+    if !reason.is_empty() {
+        line.push(' ');
+        push_escaped(&mut line, reason);
+    }
+    if !email.is_empty() {
+        line.push_str(" email: ");
+        push_escaped(&mut line, email);
+    }
+    line.push('\n');
+    let _ = writer.write_all(line.as_bytes());
+    let _ = writer.flush();
+}
+
+const ONES: u64 = 0x0101_0101_0101_0101;
+const HIGHS: u64 = 0x8080_8080_8080_8080;
+
+/// Whether any lane of `word` is at or below `limit`; borrows only start in such a lane, so the answer is exact.
+fn at_or_below(word: u64, limit: u8) -> u64 {
+    let edge = ONES * (u64::from(limit) + 1);
+    word.wrapping_sub(edge) & !word & HIGHS
+}
+
+/// A high bit in every lane equal to `byte`.
+fn same_byte(word: u64, byte: u8) -> u64 {
+    let flipped = word ^ (ONES * u64::from(byte));
+    flipped.wrapping_sub(ONES) & !flipped & HIGHS
+}
+
+/// Whether an eight-byte window carries a byte `push_escaped` rewrites or a byte it must decode.
+fn needs_escape(word: u64) -> bool {
+    at_or_below(word, b' ')
+        | same_byte(word, 0x7f)
+        | same_byte(word, b'\\')
+        | same_byte(word, b'[')
+        | same_byte(word, b']')
+        | (word & HIGHS)
+        != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn escape_mask(bytes: *const u8) -> u32 {
+    use core::arch::x86_64::{
+        _mm256_and_si256, _mm256_andnot_si256, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8,
+        _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi8,
+    };
+    let data = unsafe { _mm256_loadu_si256(bytes.cast()) };
+    let printable = _mm256_and_si256(
+        _mm256_cmpgt_epi8(data, _mm256_set1_epi8(0x20)),
+        _mm256_cmpgt_epi8(_mm256_set1_epi8(0x7f), data),
+    );
+    let brackets = _mm256_or_si256(
+        _mm256_or_si256(
+            _mm256_cmpeq_epi8(data, _mm256_set1_epi8(b'\\'.cast_signed())),
+            _mm256_cmpeq_epi8(data, _mm256_set1_epi8(b'['.cast_signed())),
+        ),
+        _mm256_cmpeq_epi8(data, _mm256_set1_epi8(b']'.cast_signed())),
+    );
+    let bad = _mm256_or_si256(
+        _mm256_andnot_si256(printable, _mm256_set1_epi8(-1)),
+        brackets,
+    );
+    _mm256_movemask_epi8(bad) as u32
+}
+
+/// A field holds one token: a path, tag or account that carries a control byte, whitespace or a
+/// bracket is escaped, not written through, so nothing a peer names can start a second field or record.
+fn push_escaped(out: &mut String, value: &str) {
+    let bytes = value.as_bytes();
+    let mut start = 0;
+    let mut at = 0;
+    #[cfg(target_arch = "x86_64")]
+    if bytes.len() >= 32 && std::is_x86_feature_detected!("avx2") {
+        while at + 32 <= bytes.len() {
+            // SAFETY: the feature is present and the load stays inside the thirty-two bytes still ahead.
+            let mask = unsafe { escape_mask(bytes.as_ptr().add(at)) };
+            if mask == 0 {
+                at += 32;
+                continue;
+            }
+            at += mask.trailing_zeros() as usize;
+            break;
+        }
+    }
+    while at + 8 <= bytes.len() {
+        if at + 16 <= bytes.len() {
+            let lo = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+            let hi = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap());
+            if !needs_escape(lo) && !needs_escape(hi) {
+                at += 16;
+                continue;
+            }
+        }
+        let word = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        if needs_escape(word) {
+            let offset = (0..8)
+                .find(|&offset| {
+                    let byte = bytes[at + offset];
+                    byte & 0x80 != 0 || ascii_escaped(byte)
+                })
+                .unwrap_or(8);
+            if offset < 8 {
+                let pos = at + offset;
+                let byte = bytes[pos];
+                out.push_str(&value[start..pos]);
+                if byte & 0x80 != 0 {
+                    push_escaped_codepoints(out, &value[pos..]);
+                    return;
+                }
+                push_escape(out, byte);
+                start = pos + 1;
+                at = pos + 1;
+                continue;
+            }
+        }
+        at += 8;
+    }
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if byte & 0x80 != 0 {
+            out.push_str(&value[start..at]);
+            push_escaped_codepoints(out, &value[at..]);
+            return;
+        }
+        if ascii_escaped(byte) {
+            out.push_str(&value[start..at]);
+            push_escape(out, byte);
+            start = at + 1;
+        }
+        at += 1;
+    }
+    out.push_str(&value[start..]);
+}
+
+/// The ASCII bytes `push_escaped` writes differently: controls, space, and the three punctuation
+/// marks that delimit a field.
+fn ascii_escaped(byte: u8) -> bool {
+    byte <= b' ' || byte == 0x7f || matches!(byte, b'\\' | b'[' | b']')
+}
+
+fn push_escape(out: &mut String, byte: u8) {
+    match byte {
+        b'\\' => out.push_str("\\\\"),
+        b'[' => out.push_str("\\["),
+        b']' => out.push_str("\\]"),
+        b' ' => out.push_str("\\u{20}"),
+        control => out.extend((control as char).escape_default()),
+    }
+}
+
+/// The code-point half a byte outside ASCII hands the rest of the field to.
+fn push_escaped_codepoints(out: &mut String, value: &str) {
+    let mut start = 0;
+    for (at, ch) in value.char_indices() {
+        let escaped = match ch {
+            '\\' => Some("\\\\"),
+            '[' => Some("\\["),
+            ']' => Some("\\]"),
+            _ => None,
+        };
+        if let Some(escaped) = escaped {
+            out.push_str(&value[start..at]);
+            out.push_str(escaped);
+            start = at + 1;
+        } else if ch.is_control() {
+            out.push_str(&value[start..at]);
+            out.extend(ch.escape_default());
+            start = at + ch.len_utf8();
+        } else if ch.is_whitespace() {
+            out.push_str(&value[start..at]);
+            let _ = std::fmt::Write::write_fmt(out, format_args!("\\u{{{:x}}}", ch as u32));
+            start = at + ch.len_utf8();
+        }
+    }
+    out.push_str(&value[start..]);
+}
+
+/// The destination is a `Display`, so its bytes are escaped as they are written rather than materialised into a second string first.
+struct Escaper<'a> {
+    out: &'a mut String,
+}
+
+impl std::fmt::Write for Escaper<'_> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        push_escaped(self.out, text);
+        Ok(())
+    }
+}
+
+fn address(address: SocketAddr, masked: bool) -> String {
+    if !masked {
+        return address.to_string();
+    }
+    match address {
+        SocketAddr::V4(address) => format!("{}:{}", address.ip().octets()[0], address.port()),
+        SocketAddr::V6(address) => format!("{}:{}", address.ip().segments()[0], address.port()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn escaped(value: &str) -> String {
+        let mut out = String::new();
+        push_escaped(&mut out, value);
+        out
+    }
+
+    fn reference(value: &str) -> String {
+        let mut out = String::new();
+        reference_into(&mut out, value);
+        out
+    }
+
+    fn reference_into(out: &mut String, value: &str) {
+        let mut start = 0;
+        for (at, ch) in value.char_indices() {
+            let escaped = match ch {
+                '\\' => Some("\\\\"),
+                '[' => Some("\\["),
+                ']' => Some("\\]"),
+                _ => None,
+            };
+            if let Some(escaped) = escaped {
+                out.push_str(&value[start..at]);
+                out.push_str(escaped);
+                start = at + 1;
+            } else if ch.is_control() {
+                out.push_str(&value[start..at]);
+                out.extend(ch.escape_default());
+                start = at + ch.len_utf8();
+            } else if ch.is_whitespace() {
+                out.push_str(&value[start..at]);
+                let _ = std::fmt::Write::write_fmt(out, format_args!("\\u{{{:x}}}", ch as u32));
+                start = at + ch.len_utf8();
+            }
+        }
+        out.push_str(&value[start..]);
+    }
+
+    #[test]
+    fn the_ascii_scan_escapes_exactly_as_the_codepoint_path() {
+        let mut corpus = String::new();
+        for byte in 0u8..=0x7f {
+            corpus.push(byte as char);
+        }
+        corpus.push_str("caf\u{e9} \u{a0}\u{2000}\u{2028}\u{3000}\u{1f600}");
+        for value in [
+            "",
+            "example.com:443",
+            "a b\tc\nd\\e[f]g",
+            corpus.as_str(),
+            "\u{7f}\u{1b}[31m",
+            "\u{85}\u{9f}",
+        ] {
+            assert_eq!(escaped(value), reference(value), "{value:?}");
+        }
+        for first in 0u8..=0x7f {
+            for second in [0u8, b'a', b' ', b'\\', b'[', b']', 0x7f, 0x1b, b'\n'] {
+                let mut value = String::new();
+                value.push(first as char);
+                value.push(second as char);
+                assert_eq!(escaped(&value), reference(&value), "{value:?}");
+            }
+        }
+        for lead in 0..16 {
+            for ch in ['\u{e9}', '\u{a0}', '\u{1f600}', '\u{7f}', '\\', ' ', '['] {
+                for tail in ["", "z", "[x]", " b", "\\", "\u{e9}", "\u{1f600}x"] {
+                    let value = format!("{}{ch}{tail}", "a".repeat(lead));
+                    assert_eq!(escaped(&value), reference(&value), "{value:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_sixteen_byte_window_escapes_like_the_byte_walk() {
+        fn oracle(value: &str) -> String {
+            let bytes = value.as_bytes();
+            let mut out = String::new();
+            let mut at = 0;
+            while at < bytes.len() {
+                let byte = bytes[at];
+                if byte & 0x80 != 0 {
+                    for ch in value[at..].chars() {
+                        match ch {
+                            '\\' => out.push_str("\\\\"),
+                            '[' => out.push_str("\\["),
+                            ']' => out.push_str("\\]"),
+                            _ if ch.is_control() => out.extend(ch.escape_default()),
+                            _ if ch.is_whitespace() => {
+                                let _ = std::fmt::Write::write_fmt(
+                                    &mut out,
+                                    format_args!("\\u{{{:x}}}", ch as u32),
+                                );
+                            }
+                            _ => out.push(ch),
+                        }
+                    }
+                    return out;
+                }
+                match byte {
+                    b'\\' => out.push_str("\\\\"),
+                    b'[' => out.push_str("\\["),
+                    b']' => out.push_str("\\]"),
+                    b' ' => out.push_str("\\u{20}"),
+                    0x7f => out.push_str("\\u{7f}"),
+                    0x00..=0x1f => out.extend((byte as char).escape_default()),
+                    _ => out.push(byte as char),
+                }
+                at += 1;
+            }
+            out
+        }
+        fn check(input: &str, expected: &str) {
+            assert_eq!(oracle(input), expected, "oracle {input:?}");
+            assert_eq!(escaped(input), expected, "escaped {input:?}");
+        }
+
+        let clean = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        assert_eq!(clean.len(), 40);
+        check(clean, clean);
+
+        let mut second = clean.as_bytes().to_vec();
+        second[9] = b'\\';
+        let input = String::from_utf8(second).expect("ascii");
+        check(&input, &format!("{}\\\\{}", &clean[..9], &clean[10..]));
+
+        let mut first = clean.as_bytes().to_vec();
+        first[0] = b' ';
+        check(
+            &String::from_utf8(first).expect("ascii"),
+            &format!("\\u{{20}}{}", &clean[1..]),
+        );
+
+        let mut brackets = clean.as_bytes().to_vec();
+        brackets[15] = b'[';
+        brackets[16] = b']';
+        brackets[17] = 0x7f;
+        check(
+            &String::from_utf8(brackets).expect("ascii"),
+            &format!("{}\\[\\]\\u{{7f}}{}", &clean[..15], &clean[18..]),
+        );
+
+        let input = format!("{}\u{80}", "a".repeat(15));
+        check(&input, &format!("{}\\u{{80}}", "a".repeat(15)));
+
+        for len in [15, 16, 17, 31, 32, 33, 63, 64, 65] {
+            let input = "a".repeat(len);
+            check(&input, &input);
+        }
+
+        for at in [0, 1, 15, 16, 17, 31, 32, 33, 63] {
+            let mut bytes = vec![b'a'; 64];
+            bytes[at] = b'\\';
+            let input = String::from_utf8(bytes).expect("ascii");
+            check(
+                &input,
+                &format!("{}\\\\{}", "a".repeat(at), "a".repeat(63 - at)),
+            );
+        }
+
+        let input = format!("{}\u{80}", "a".repeat(32));
+        check(&input, &format!("{}\\u{{80}}", "a".repeat(32)));
+    }
+
+    /// The merged byte-position walk, kept as the number the word scan has to beat.
+    fn position_scan(out: &mut String, value: &str) {
+        if !value.is_ascii() {
+            reference_into(out, value);
+            return;
+        }
+        let bytes = value.as_bytes();
+        let mut start = 0;
+        while let Some(at) = bytes[start..].iter().position(|&byte| ascii_escaped(byte)) {
+            let at = start + at;
+            out.push_str(&value[start..at]);
+            push_escape(out, bytes[at]);
+            start = at + 1;
+        }
+        out.push_str(&value[start..]);
+    }
+
+    fn bulk_field() -> String {
+        "example.com:443/some/really/long/path?q=value&x=1#fragment".repeat(64)
+    }
+
+    #[test]
+    fn the_ascii_scan_over_a_bulk_field() {
+        let field = bulk_field();
+        let mut out = String::with_capacity(field.len());
+        let mut acc = 0usize;
+        for _ in 0..64 {
+            out.clear();
+            position_scan(&mut out, &field);
+            acc += out.len();
+        }
+        std::hint::black_box(acc);
+    }
+
+    #[test]
+    fn the_swar_scan_over_a_bulk_field() {
+        let field = bulk_field();
+        let mut out = String::with_capacity(field.len());
+        let mut acc = 0usize;
+        for _ in 0..64 {
+            out.clear();
+            push_escaped(&mut out, &field);
+            acc += out.len();
+        }
+        std::hint::black_box(acc);
+    }
+
+    #[test]
+    fn the_codepoint_walk_over_a_bulk_field() {
+        let field = bulk_field();
+        let mut out = String::with_capacity(field.len());
+        let mut acc = 0usize;
+        for _ in 0..64 {
+            out.clear();
+            reference_into(&mut out, &field);
+            acc += out.len();
+        }
+        std::hint::black_box(acc);
+    }
+
+    #[test]
+    fn a_clean_field_is_escaped_without_a_second_buffer() {
+        let mut out = String::with_capacity(64);
+        let ((), counts) =
+            ferrox_core::alloc_count::measure(|| push_escaped(&mut out, "example.com:443"));
+        assert_eq!(counts.allocs, 0, "a clean field allocated: {counts:?}");
+        assert_eq!(out, "example.com:443");
+    }
+
+    #[test]
+    fn the_reference_access_and_mask_are_read() {
+        let root = crate::json::parse(r#"{"log":{"access":"/tmp/access.log","maskAddress":"/8"}}"#)
+            .expect("parses");
+        assert_eq!(
+            parse(&root).expect("log parses"),
+            Config {
+                access: Some("/tmp/access.log".to_owned()),
+                mask_address: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_log_section_that_is_not_an_object_is_refused() {
+        let root = crate::json::parse(r#"{"log":1}"#).expect("parses");
+        assert!(parse(&root).expect_err("log is an object").contains("log"));
+    }
+
+    #[test]
+    fn a_recorded_line_names_the_source_verdict_destination_detour_reason_and_email() {
+        let _guard = crate::stats::test_lock();
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-access-{}-{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let mut quoted = String::new();
+        crate::json::write(&Json::Str(path.to_string_lossy().into_owned()), &mut quoted);
+        let root =
+            crate::json::parse(&format!(r#"{{"log":{{"access":{quoted}}}}}"#)).expect("parses");
+        install(&root).expect("access log installs");
+        let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+        record(
+            Some(source),
+            true,
+            &"example.com:443",
+            Some("proxy"),
+            "accept",
+            "a@b.c",
+        );
+        let text = std::fs::read_to_string(&path).expect("reads the line");
+        assert_eq!(
+            text,
+            "from 192.0.2.10:1234 accepted example.com:443 [proxy] accept email: a@b.c\n"
+        );
+        let _ = std::fs::remove_file(&path);
+        install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
+    }
+
+    #[test]
+    fn a_flow_snapshot_carries_the_identity_to_another_thread() {
+        let _guard = crate::stats::test_lock();
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-access-snapshot-{}-{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let mut quoted = String::new();
+        crate::json::write(&Json::Str(path.to_string_lossy().into_owned()), &mut quoted);
+        let root =
+            crate::json::parse(&format!(r#"{{"log":{{"access":{quoted}}}}}"#)).expect("parses");
+        install(&root).expect("access log installs");
+        let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+        let _flow = flow(Some(source), "a@b.c", 1);
+        let snapshot = snapshot();
+        std::thread::spawn(move || {
+            let _flow = install_snapshot(snapshot);
+            record_current(&"example.com:443");
+        })
+        .join()
+        .expect("the detached flow records");
+        let text = std::fs::read_to_string(&path).expect("reads the line");
+        assert_eq!(
+            text,
+            "from 192.0.2.10:1234 accepted example.com:443 email: a@b.c\n"
+        );
+        let _ = std::fs::remove_file(&path);
+        install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
+    }
+
+    #[test]
+    fn a_destination_from_the_wire_cannot_forge_a_second_line() {
+        let _guard = crate::stats::test_lock();
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-access-wire-{}-{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let mut quoted = String::new();
+        crate::json::write(&Json::Str(path.to_string_lossy().into_owned()), &mut quoted);
+        let root =
+            crate::json::parse(&format!(r#"{{"log":{{"access":{quoted}}}}}"#)).expect("parses");
+        install(&root).expect("access log installs");
+        let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+        record(
+            Some(source),
+            false,
+            &"bad\nline:443",
+            Some("tag\nx"),
+            "why\ny",
+            "a@b.c\nz",
+        );
+        let text = std::fs::read_to_string(&path).expect("reads the line");
+        assert_eq!(text.lines().count(), 1, "one request writes one line");
+        for field in ["bad\\nline:443", "[tag\\nx]", "why\\ny", "email: a@b.c\\nz"] {
+            assert!(text.contains(field), "{field:?} is escaped: {text:?}");
+        }
+        let _ = std::fs::remove_file(&path);
+        install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
+    }
+
+    #[test]
+    fn a_name_from_the_wire_cannot_forge_a_log_field() {
+        let _guard = crate::stats::test_lock();
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-access-forge-{}-{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let mut quoted = String::new();
+        crate::json::write(&Json::Str(path.to_string_lossy().into_owned()), &mut quoted);
+        let root =
+            crate::json::parse(&format!(r#"{{"log":{{"access":{quoted}}}}}"#)).expect("parses");
+        install(&root).expect("access log installs");
+        let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+        record(
+            Some(source),
+            true,
+            &"evil.example] [detour] reason email: victim@example.com:443",
+            None,
+            "",
+            "a@b.c",
+        );
+        record(
+            Some(source),
+            true,
+            &"example.com:443",
+            None,
+            "",
+            "evil] [proxy] accept email: victim@example.com",
+        );
+        let text = std::fs::read_to_string(&path).expect("reads the lines");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one record writes one line: {text:?}");
+        for line in lines {
+            assert_eq!(
+                line.matches(" email: ").count(),
+                1,
+                "one record has one email field: {line:?}"
+            );
+        }
+        assert!(!text.contains("] [detour]"), "{text:?}");
+        assert!(!text.contains("] [proxy]"), "{text:?}");
+        let _ = std::fs::remove_file(&path);
+        install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
+    }
+
+    #[test]
+    fn a_flow_records_the_fronts_source_and_email() {
+        let _guard = crate::stats::test_lock();
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-access-flow-{}-{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let mut quoted = String::new();
+        crate::json::write(&Json::Str(path.to_string_lossy().into_owned()), &mut quoted);
+        let root =
+            crate::json::parse(&format!(r#"{{"log":{{"access":{quoted}}}}}"#)).expect("parses");
+        install(&root).expect("access log installs");
+        let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+        let flow = flow(Some(source), "a@b.c", 0);
+        record_current(&"example.com:443");
+        drop(flow);
+        let text = std::fs::read_to_string(&path).expect("reads the line");
+        assert_eq!(
+            text,
+            "from 192.0.2.10:1234 accepted example.com:443 email: a@b.c
+"
+        );
+        let _ = std::fs::remove_file(&path);
+        install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
+    }
+
+    #[test]
+    fn a_flow_meter_holds_the_online_lease() {
+        let _guard = crate::stats::test_lock();
+        crate::stats::clear();
+        crate::policy::clear();
+        install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
+        let root = crate::json::parse(
+            r#"{"stats":{},"policy":{"levels":{"1":{"statsUserOnline":true}}}}"#,
+        )
+        .expect("parses");
+        crate::policy::install(&root).expect("policy installs");
+        crate::stats::install(&root).expect("stats installs");
+        let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+        let flow = flow(Some(source), "a@b.c", 1);
+        let meter = crate::stats::user("a@b.c", 1);
+        record_current(&"example.com:443");
+        assert_eq!(crate::stats::snapshot().online.get("a@b.c"), Some(&1));
+        assert_eq!(
+            crate::stats::online_count("user>>>a@b.c>>>online"),
+            Some(1),
+            "one flow holds one online lease"
+        );
+        drop(flow);
+        assert_eq!(
+            crate::stats::snapshot().online.get("a@b.c"),
+            Some(&1),
+            "the meter owns the lease, not the log guard"
+        );
+        drop(meter);
+        assert_eq!(crate::stats::snapshot().online.get("a@b.c"), None);
+        crate::stats::clear();
+        crate::policy::clear();
+    }
+
+    #[test]
+    fn a_spawned_flow_keeps_the_online_lease_after_its_parent_returns() {
+        let _guard = crate::stats::test_lock();
+        crate::stats::clear();
+        crate::policy::clear();
+        install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
+        let root = crate::json::parse(
+            r#"{"stats":{},"policy":{"levels":{"1":{"statsUserOnline":true}}}}"#,
+        )
+        .expect("parses");
+        crate::policy::install(&root).expect("policy installs");
+        crate::stats::install(&root).expect("stats installs");
+        let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+        let (carried, meter) = {
+            let flow = flow(Some(source), "a@b.c", 1);
+            let meter = crate::stats::user("a@b.c", 1);
+            record_current(&"example.com:443");
+            let carried = snapshot();
+            drop(flow);
+            (carried, meter)
+        };
+        assert_eq!(crate::stats::snapshot().online.get("a@b.c"), Some(&1));
+        std::thread::spawn(move || {
+            let _flow = install_snapshot(carried);
+            let _meter = meter;
+            assert_eq!(crate::stats::snapshot().online.get("a@b.c"), Some(&1));
+            record_current(&"example.net:443");
+        })
+        .join()
+        .expect("the spawned flow records");
+        assert_eq!(crate::stats::snapshot().online.get("a@b.c"), None);
+        crate::stats::clear();
+        crate::policy::clear();
+    }
+
+    #[test]
+    fn a_masked_address_keeps_the_first_octet_and_the_port() {
+        let peer: SocketAddr = "192.0.2.10:443".parse().expect("address");
+        assert_eq!(address(peer, true), "192:443");
+        assert_eq!(address(peer, false), "192.0.2.10:443");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_reopens_the_rotated_access_path() {
+        let _guard = crate::stats::test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-access-restart-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("creates the log directory");
+        let path = dir.join("access.log");
+        let rotated = dir.join("access.log.1");
+        let mut quoted = String::new();
+        crate::json::write(&Json::Str(path.to_string_lossy().into_owned()), &mut quoted);
+        let root =
+            crate::json::parse(&format!(r#"{{"log":{{"access":{quoted}}}}}"#)).expect("parses");
+        install(&root).expect("access log installs");
+        let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+        record(Some(source), true, &"first.example:443", None, "", "");
+        std::fs::rename(&path, &rotated).expect("rotates the access log");
+        restart().expect("reopens the path");
+        record(Some(source), true, &"second.example:443", None, "", "");
+        let opened = std::fs::read_to_string(&path).expect("reads the new file");
+        let previous = std::fs::read_to_string(&rotated).expect("reads the rotated file");
+        assert_eq!(opened, "from 192.0.2.10:1234 accepted second.example:443\n");
+        assert_eq!(
+            previous,
+            "from 192.0.2.10:1234 accepted first.example:443\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
+    }
+}
