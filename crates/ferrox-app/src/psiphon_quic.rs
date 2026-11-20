@@ -1,0 +1,3930 @@
+//! A synchronous `QUIC-OSSH` client: a `rustls` TLS 1.3 handshake carried in
+//! QUIC packets, one bidirectional stream, and the Psiphon obfuscation layer.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names,
+    clippy::missing_const_for_fn,
+    clippy::similar_names,
+    clippy::struct_excessive_bools
+)]
+
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::{self, Cursor, ErrorKind, IoSlice, Read, Write};
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use chacha20::cipher::{KeyIvInit, StreamCipher};
+use chacha20::ChaCha20;
+use hkdf::Hkdf;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::{
+    ClientSessionMemoryCache, ClientSessionStore, ResolvesClientCert, Resumption,
+};
+use rustls::crypto::SecureRandom;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::quic::{ClientConnection, DirectionalKeys, KeyChange, Keys, Secrets, Version};
+use rustls::server::{ProducesTickets, ServerConfig, ServerConnection};
+use rustls::sign::CertifiedKey;
+use rustls::{DigitallySignedStruct, Side, SignatureScheme};
+use sha2::{Digest, Sha256};
+
+use crate::psiphon_ssh::{tls_passthrough, tls_passthrough_key, Proxy, Server};
+use crate::psiphon_webrtc::WebRtcStream;
+
+const READ_WAIT: Duration = Duration::from_millis(2);
+const KEEPALIVE: Duration = Duration::from_secs(15);
+const MAX_PACKET_SIZE: usize = 1452;
+const OBFUSCATION_OVERHEAD: usize = 13;
+const PADDING_LIMIT: usize = 1280;
+const MAX_SEND_QUEUE: usize = 512 * 1024;
+const MAX_RECV_QUEUE: usize = 512 * 1024;
+const MAX_PAYLOAD: usize = 1200;
+const MIN_DATAGRAM: usize = 1280;
+const PMTU_STEP: usize = 100;
+const PMTU_MIN_STEP: usize = 16;
+const PMTU_MAX_LOSSES: u8 = 4;
+const PMTU_BACKOFF: Duration = Duration::from_millis(250);
+const INPROXY_PACKET_ADJUSTMENT: usize = 110;
+const MAX_UDP_PAYLOAD: u64 = 1439;
+const INITIAL_WINDOW: u64 = 8 * 1024 * 1024;
+const STREAM_WINDOW: u64 = 8 * 1024 * 1024;
+const MSS: u64 = 1200;
+const INITIAL_CWND: u64 = 10 * MSS;
+const MAX_CWND: u64 = 8 * 1024 * 1024;
+const QUIC_VERSION: u32 = 1;
+const CID_LEN: usize = 16;
+const INITIAL: usize = 0;
+const HANDSHAKE: usize = 1;
+const ONE_RTT: usize = 2;
+
+pub(crate) const SUPPORTED_QUIC_VERSIONS: &[&str] = &[
+    "QUICv1",
+    "RANDOMIZED-QUICv1",
+    "OBFUSCATED-QUICv1",
+    "DECOY-QUICv1",
+];
+
+const NOISE_MAX_RANDOM: usize = 1024;
+const NOISE_MAX_PACKET: usize = 1200;
+const NOISE_FIRST_PAUSE: Duration = Duration::from_millis(2);
+const NOISE_LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const NOISE_DIGITS: &[u8] = b"0123456789";
+static NOISE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+struct QuicNoise {
+    before: u8,
+    after_first: u8,
+    junk_min: usize,
+    junk_max: usize,
+    first: &'static str,
+    second: &'static str,
+    interval: Duration,
+}
+
+impl QuicNoise {
+    fn lookup(name: &str) -> Option<Self> {
+        let (before, after_first, junk_min, junk_max, first, second, interval) =
+            match name.trim().to_ascii_lowercase().as_str() {
+                "" | "off" | "none" => return None,
+                "light" => (
+                    1,
+                    0,
+                    32,
+                    96,
+                    "<b 0d0a0d0a><t><r 16>",
+                    "",
+                    Duration::from_millis(3),
+                ),
+                "gfw" | "aggressive" | "heavy" => (
+                    2,
+                    1,
+                    64,
+                    256,
+                    "<b 0d0a0d0a><t><r 24>",
+                    "<r 32>",
+                    Duration::from_millis(5),
+                ),
+                _ => (
+                    2,
+                    2,
+                    48,
+                    190,
+                    "<b 0d0a0d0a><t><r 24>",
+                    "<r 48>",
+                    Duration::from_millis(4),
+                ),
+            };
+        Some(Self {
+            before,
+            after_first,
+            junk_min,
+            junk_max,
+            first,
+            second,
+            interval,
+        })
+    }
+
+    fn send(&self, socket: &UdpSocket) -> io::Result<()> {
+        for _ in 0..self.before {
+            self.junk(socket)?;
+            thread::sleep(self.interval);
+        }
+        let mut first = noise_expand(self.first);
+        if !first.is_empty() {
+            send_guarded(socket, &mut first)?;
+        }
+        thread::sleep(NOISE_FIRST_PAUSE);
+        for _ in 0..self.after_first {
+            self.junk(socket)?;
+            thread::sleep(self.interval);
+        }
+        let mut second = noise_expand(self.second);
+        if !second.is_empty() {
+            send_guarded(socket, &mut second)?;
+        }
+        Ok(())
+    }
+
+    fn junk(&self, socket: &UdpSocket) -> io::Result<()> {
+        let (low, high) = if self.junk_max <= self.junk_min || self.junk_min == 0 {
+            (40, 90)
+        } else {
+            (self.junk_min, self.junk_max)
+        };
+        let mut packet = noise_bytes(noise_range(low, high));
+        send_guarded(socket, &mut packet)
+    }
+}
+
+pub(crate) fn noise_expand(spec: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut rest = spec;
+    while let Some(open) = rest.find('<') {
+        let Some(close) = rest[open..].find('>') else {
+            break;
+        };
+        let body = &rest[open + 1..open + close];
+        rest = &rest[open + close + 1..];
+        let mut fields = body.split_whitespace();
+        let Some(kind) = fields.next() else {
+            continue;
+        };
+        let mut arg = String::new();
+        for field in fields {
+            arg.push_str(field);
+        }
+        match kind {
+            "b" => {
+                if let Some(bytes) = crate::psiphon::hex_decode(&arg) {
+                    out.extend_from_slice(&bytes);
+                }
+            }
+            "t" => {
+                let seconds =
+                    u32::try_from(std::time::UNIX_EPOCH.elapsed().map_or(0, |d| d.as_secs()))
+                        .unwrap_or(0);
+                out.extend_from_slice(&seconds.to_be_bytes());
+            }
+            "c" => {
+                let count = NOISE_COUNTER
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .wrapping_add(1);
+                out.extend_from_slice(&count.to_be_bytes());
+            }
+            "n" => out.extend_from_slice(&crate::psiphon_ssh::dial_random::<8>()),
+            "r" => out.extend_from_slice(&noise_bytes(noise_length(&arg))),
+            "rc" => noise_append(&mut out, NOISE_LETTERS, noise_length(&arg)),
+            "rd" => noise_append(&mut out, NOISE_DIGITS, noise_length(&arg)),
+            _ => {}
+        }
+    }
+    out.truncate(NOISE_MAX_PACKET);
+    out
+}
+
+fn noise_length(arg: &str) -> usize {
+    let (low, high) = match arg.split_once('-') {
+        Some((low, high)) => (low, Some(high)),
+        None => (arg, None),
+    };
+    let Ok(mut length) = low.parse::<usize>() else {
+        return 0;
+    };
+    if let Some(high) = high.and_then(|high| high.parse::<usize>().ok()) {
+        if high > length {
+            length = noise_range(length, high);
+        }
+    }
+    length.min(NOISE_MAX_RANDOM)
+}
+
+pub(crate) fn noise_range(low: usize, high: usize) -> usize {
+    if high <= low {
+        return low;
+    }
+    let span = u64::try_from(high - low)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = [0u8; 8];
+    crate::psiphon_ssh::dial_fill(&mut bytes);
+    low + usize::try_from(u64::from_le_bytes(bytes) % span).unwrap_or(0)
+}
+
+pub(crate) fn noise_bytes(length: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; length];
+    crate::psiphon_ssh::dial_fill(&mut bytes);
+    bytes
+}
+
+fn noise_append(out: &mut Vec<u8>, alphabet: &[u8], length: usize) {
+    let mut draws = vec![0u8; length];
+    crate::psiphon_ssh::dial_fill(&mut draws);
+    out.extend(
+        draws
+            .into_iter()
+            .map(|draw| alphabet[usize::from(draw) % alphabet.len()]),
+    );
+}
+
+fn send_guarded(socket: &UdpSocket, packet: &mut [u8]) -> io::Result<()> {
+    if packet.len() >= 5 && packet[0] >> 4 == 0x0c && packet[1..5] == [0, 0, 0, 1] {
+        packet[0] ^= 0x40;
+    }
+    for at in [29, 31, 34] {
+        if packet.len() >= at + 4 && &packet[at..at + 4] == b"CHLO" {
+            packet[at] ^= 0x20;
+        }
+    }
+    socket.send(packet).map(|_| ())
+}
+
+#[derive(Clone)]
+struct Remembered {
+    data: u64,
+    stream: u64,
+    bidi: u64,
+}
+
+static QUIC_SESSIONS: OnceLock<Mutex<HashMap<String, Remembered>>> = OnceLock::new();
+static QUIC_SESSION_STORE: OnceLock<Arc<dyn ClientSessionStore>> = OnceLock::new();
+static QUIC_PSK_TICKETS: OnceLock<Mutex<HashMap<String, u8>>> = OnceLock::new();
+static QUIC_VERIFIER: OnceLock<Arc<dyn ServerCertVerifier>> = OnceLock::new();
+static QUIC_CLIENT_AUTH: OnceLock<Arc<dyn ResolvesClientCert>> = OnceLock::new();
+const PSK_TICKETS_PER_MINT: u8 = 8;
+
+/// Shared flow-control grants remembered from completed handshakes.
+fn sessions() -> &'static Mutex<HashMap<String, Remembered>> {
+    QUIC_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The process-wide rustls ticket store shared by every QUIC dial.
+fn session_store() -> &'static Arc<dyn ClientSessionStore> {
+    QUIC_SESSION_STORE
+        .get_or_init(|| Arc::new(ClientSessionMemoryCache::new(256)) as Arc<dyn ClientSessionStore>)
+}
+
+/// The resumption handle over that store.
+fn resumption() -> Resumption {
+    Resumption::store(Arc::clone(session_store()))
+}
+
+/// How many minted obfuscated tickets remain for one server name.
+fn psk_tickets() -> &'static Mutex<HashMap<String, u8>> {
+    QUIC_PSK_TICKETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The permissive verifier shared by every QUIC client config.
+fn verifier() -> Arc<dyn ServerCertVerifier> {
+    Arc::clone(QUIC_VERIFIER.get_or_init(|| {
+        Arc::new(NoVerify {
+            schemes: rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes(),
+        }) as Arc<dyn ServerCertVerifier>
+    }))
+}
+
+/// The shared client-auth resolver that keeps rustls resumption enabled.
+fn client_auth() -> Arc<dyn ResolvesClientCert> {
+    Arc::clone(
+        QUIC_CLIENT_AUTH.get_or_init(|| Arc::new(NoClientAuth) as Arc<dyn ResolvesClientCert>),
+    )
+}
+
+#[derive(Debug)]
+struct NoClientAuth;
+
+impl ResolvesClientCert for NoClientAuth {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        None
+    }
+
+    fn has_certs(&self) -> bool {
+        false
+    }
+}
+thread_local! {
+    static PENDING_RANDOM: RefCell<Option<[u8; 32]>> = const { RefCell::new(None) };
+    static PENDING_ORDER_SEED: RefCell<Option<u16>> = const { RefCell::new(None) };
+}
+
+struct Shared {
+    state: Mutex<State>,
+    readable: Condvar,
+    writable: Condvar,
+}
+
+struct State {
+    send: VecDeque<Vec<u8>>,
+    send_bytes: usize,
+    recv: Vec<u8>,
+    read_at: usize,
+    error: Option<String>,
+    eof: bool,
+    write_closed: bool,
+    close_requested: bool,
+    timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
+}
+
+impl State {
+    fn fail(&mut self, why: impl Into<String>) {
+        if self.error.is_none() {
+            self.error = Some(why.into());
+        }
+        self.eof = true;
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// One bidirectional QUIC stream carrying the SSH transport.
+pub(crate) struct QuicStream {
+    shared: Arc<Shared>,
+}
+
+impl ferrox_core::tls::RecordAlignment for QuicStream {}
+
+impl Clone for QuicStream {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+/// The obfuscation mode, structural randomization, proof key and packet key an entry selects.
+fn quic_parameters(server: &Server) -> Result<(bool, bool, bool, &str, [u8; 32]), String> {
+    let version = if server.quic_versions.is_empty() {
+        SUPPORTED_QUIC_VERSIONS[bounded_random(SUPPORTED_QUIC_VERSIONS.len())]
+    } else {
+        server
+            .quic_versions
+            .iter()
+            .map(String::as_str)
+            .find(|version| SUPPORTED_QUIC_VERSIONS.contains(version))
+            .ok_or_else(|| {
+                "psiphon quic: the entry does not allow a supported QUIC mode".to_owned()
+            })?
+    };
+    let obfuscated = matches!(version, "OBFUSCATED-QUICv1" | "DECOY-QUICv1");
+    let decoy = version == "DECOY-QUICv1";
+    let randomized = version == "RANDOMIZED-QUICv1";
+    let proof_key = tls_passthrough_key(server);
+    if proof_key.is_empty() {
+        return Err("psiphon quic: entry has no passthrough key".to_owned());
+    }
+    let packet_key = if obfuscated {
+        let key = server
+            .obfuscation_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| "psiphon quic: entry has no obfuscation key".to_owned())?;
+        packet_key(key)?
+    } else {
+        [0u8; 32]
+    };
+    Ok((obfuscated, decoy, randomized, proof_key, packet_key))
+}
+
+/// The shared obfuscation key a non-fronted QUIC dial uses for a client-made PSK, when its coin
+/// lands and the entry carries one.
+fn psk_key(server: &Server, shape: &crate::psiphon_ssh::TlsShape) -> Option<[u8; 32]> {
+    if !coin(shape.quic_obfuscated_psk) {
+        return None;
+    }
+    let key = server.obfuscation_key.as_deref()?;
+    let shared = ferrox_core::realm::hex_decode::<32>(key);
+    if shared.is_none() {
+        eprintln!("psiphon quic: invalid obfuscated PSK key; dialing without a PSK");
+    }
+    shared
+}
+
+/// Wrap a packet source in the entry's QUIC obfuscation layer.
+fn packet_io(
+    io: PacketIo,
+    obfuscated: bool,
+    decoy: bool,
+    packet_key: [u8; 32],
+    shape: &crate::psiphon_ssh::TlsShape,
+) -> Udp {
+    if !obfuscated {
+        return Udp::Plain(io);
+    }
+    let limit = match &io {
+        PacketIo::WebRtc(stream) => stream.media_payload_limit().unwrap_or(MAX_PACKET_SIZE),
+        PacketIo::Socket(_) => MAX_PACKET_SIZE,
+    };
+    Udp::Obfuscated(ObfuscatedUdp {
+        io,
+        key: packet_key,
+        nonce: [0u8; 12],
+        nonce_transform: shape.quic_nonce_transform.selected(""),
+        decoy: if decoy {
+            Some(u8::try_from(bounded_random(10)).unwrap_or(0))
+        } else {
+            None
+        },
+        limit,
+    })
+}
+
+/// Mint a batch of client-made obfuscated tickets when this server's pool runs dry.
+fn ensure_obfuscated_psk(name: &str, shared: [u8; 32]) -> Result<(), String> {
+    let mut counts = lock(psk_tickets());
+    let remaining = counts.entry(name.to_owned()).or_insert(0);
+    if *remaining == 0 {
+        mint_obfuscated_sessions(name, shared, session_store(), PSK_TICKETS_PER_MINT)?;
+        *remaining = PSK_TICKETS_PER_MINT;
+    }
+    *remaining -= 1;
+    Ok(())
+}
+
+/// Run one local TLS 1.3 handshake whose ticket wraps a caller-supplied obfuscation key, so the
+/// resulting PSK has the reference's obfuscated ticket shape rather than rustls' own.
+fn mint_obfuscated_sessions(
+    name: &str,
+    shared: [u8; 32],
+    store: &Arc<dyn ClientSessionStore>,
+    count: u8,
+) -> Result<(), String> {
+    let server_name = ServerName::try_from(name)
+        .map_err(|error| format!("psiphon quic psk name: {error}"))?
+        .to_owned();
+    let (cert, key) = local_identity()?;
+    let mut server = ServerConfig::builder_with_provider(Arc::new(psk_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|error| format!("psiphon quic psk versions: {error}"))?
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(cert)],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
+        )
+        .map_err(|error| format!("psiphon quic psk certificate: {error}"))?;
+    server.ticketer = Arc::new(ObfuscatedTicketer { shared });
+    server.send_tls13_tickets = usize::from(count);
+    server.max_early_data_size = 0;
+    server.alpn_protocols = vec![b"h3".to_vec()];
+    let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(psk_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|error| format!("psiphon quic psk versions: {error}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier())
+        .with_client_cert_resolver(client_auth());
+    client.alpn_protocols = vec![b"h3".to_vec()];
+    client.resumption = Resumption::store(Arc::clone(store));
+    client.enable_early_data = false;
+    let mut client = rustls::ClientConnection::new(Arc::new(client), server_name)
+        .map_err(|error| format!("psiphon quic psk client: {error}"))?;
+    let mut server = ServerConnection::new(Arc::new(server))
+        .map_err(|error| format!("psiphon quic psk server: {error}"))?;
+    drive_handshake(&mut client, &mut server)
+}
+
+/// Move records between one in-memory client and server until both handshakes finish.
+fn drive_handshake(
+    client: &mut rustls::ClientConnection,
+    server: &mut ServerConnection,
+) -> Result<(), String> {
+    let mut to_server = Vec::new();
+    let mut to_client = Vec::new();
+    for _ in 0..32 {
+        let mut records = Vec::new();
+        client
+            .write_tls(&mut records)
+            .map_err(|error| format!("psiphon quic psk client write: {error}"))?;
+        to_server.extend_from_slice(&records);
+        let mut records = Vec::new();
+        server
+            .write_tls(&mut records)
+            .map_err(|error| format!("psiphon quic psk server write: {error}"))?;
+        to_client.extend_from_slice(&records);
+        if !to_server.is_empty() {
+            let mut cursor = Cursor::new(&to_server);
+            server
+                .read_tls(&mut cursor)
+                .map_err(|error| format!("psiphon quic psk server read: {error}"))?;
+            server
+                .process_new_packets()
+                .map_err(|error| format!("psiphon quic psk server handshake: {error}"))?;
+            to_server.clear();
+        }
+        if !to_client.is_empty() {
+            let mut cursor = Cursor::new(&to_client);
+            client
+                .read_tls(&mut cursor)
+                .map_err(|error| format!("psiphon quic psk client read: {error}"))?;
+            client
+                .process_new_packets()
+                .map_err(|error| format!("psiphon quic psk client handshake: {error}"))?;
+            to_client.clear();
+        }
+        if !client.is_handshaking()
+            && !server.is_handshaking()
+            && to_server.is_empty()
+            && to_client.is_empty()
+            && !client.wants_write()
+            && !server.wants_write()
+        {
+            return Ok(());
+        }
+    }
+    Err("psiphon quic psk: the local handshake did not finish".to_owned())
+}
+
+/// The AES-128-GCM suite the obfuscated ticket names, forced on both local ends.
+fn psk_provider() -> rustls::crypto::CryptoProvider {
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.cipher_suites = vec![rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256];
+    provider
+}
+
+type LocalIdentity = (Vec<u8>, Vec<u8>);
+
+/// One self-signed certificate and key reused by every local mint.
+fn local_identity() -> Result<LocalIdentity, String> {
+    static IDENTITY: OnceLock<Result<LocalIdentity, String>> = OnceLock::new();
+    IDENTITY
+        .get_or_init(|| {
+            let minted = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+                .map_err(|error| format!("psiphon quic psk identity: {error}"))?;
+            Ok((
+                minted.cert.der().to_vec(),
+                minted.signing_key.serialize_der(),
+            ))
+        })
+        .clone()
+}
+
+/// Encrypts rustls' session state around the caller's key, keeping the handshake's secret and
+/// creation time so the client's PSK is the state the server can parse.
+struct ObfuscatedTicketer {
+    shared: [u8; 32],
+}
+
+impl std::fmt::Debug for ObfuscatedTicketer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ObfuscatedTicketer(redacted)")
+    }
+}
+
+impl ProducesTickets for ObfuscatedTicketer {
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    fn lifetime(&self) -> u32 {
+        7 * 24 * 60 * 60
+    }
+
+    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
+        let (secret, created) = server_session(plain)?;
+        ferrox_core::tls::ObfuscatedTicket::new(self.shared)
+            .encode(secret, true, false, created)
+            .ok()
+    }
+
+    fn decrypt(&self, _ciphertext: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// The master secret and creation time out of rustls' `ServerSessionValue` encoding.
+fn server_session(plain: &[u8]) -> Option<(&[u8], u64)> {
+    let mut at = 1usize;
+    if *plain.first()? == 1 {
+        at = at.checked_add(1 + usize::from(*plain.get(at)?))?;
+    }
+    at = at.checked_add(4)?;
+    let length = usize::from(*plain.get(at)?);
+    at = at.checked_add(1)?;
+    let secret = plain.get(at..at.checked_add(length)?)?;
+    at = at.checked_add(length + 1)?;
+    if *plain.get(at)? == 1 {
+        return None;
+    }
+    at = at.checked_add(1)?;
+    if *plain.get(at)? == 1 {
+        let length = usize::from(*plain.get(at + 1)?);
+        at = at.checked_add(2 + length)?;
+    } else {
+        at = at.checked_add(1)?;
+    }
+    let length = usize::from(u16::from_be_bytes([*plain.get(at)?, *plain.get(at + 1)?]));
+    at = at.checked_add(2 + length)?;
+    let created = u64::from_be_bytes(plain.get(at..at.checked_add(8)?)?.try_into().ok()?);
+    Some((secret, created))
+}
+
+impl QuicStream {
+    /// Dial a direct QUIC-OSSH server over a UDP socket.
+    pub(crate) fn connect(
+        server: &Server,
+        timeout: Duration,
+        proxy: Option<&Proxy>,
+        shape: &crate::psiphon_ssh::TlsShape,
+    ) -> Result<Self, String> {
+        if proxy.is_some() {
+            return Err("psiphon quic: an upstream proxy cannot carry UDP QUIC".to_owned());
+        }
+        let (obfuscated, decoy, randomized, proof_key, packet_key) = quic_parameters(server)?;
+        let remote = SocketAddr::new(server.address, server.port);
+        let bind = if remote.is_ipv4() {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        } else {
+            SocketAddr::from(([0u16; 8], 0))
+        };
+        let socket = UdpSocket::bind(bind)
+            .and_then(|socket| socket.connect(remote).map(|()| socket))
+            .map_err(|error| format!("psiphon quic socket {remote}: {error}"))?;
+        socket
+            .set_read_timeout(Some(timeout))
+            .and_then(|()| socket.set_write_timeout(Some(timeout)))
+            .map_err(|error| format!("psiphon quic socket {remote}: {error}"))?;
+        if !obfuscated {
+            if let Some(noise) = server.quic_noise.as_deref().and_then(QuicNoise::lookup) {
+                noise
+                    .send(&socket)
+                    .map_err(|error| format!("psiphon quic noise {remote}: {error}"))?;
+            }
+        }
+        let udp = packet_io(
+            PacketIo::Socket(socket),
+            obfuscated,
+            decoy,
+            packet_key,
+            shape,
+        );
+        let psk = psk_key(server, shape);
+        Self::connect_over(
+            udp, remote, timeout, proof_key, randomized, obfuscated, false, psk, shape, None, None,
+        )
+    }
+
+    /// Dial QUIC-OSSH through an in-proxy WebRTC data channel.
+    pub(crate) fn connect_inproxy(
+        server: &Server,
+        timeout: Duration,
+        stream: WebRtcStream,
+        shape: &crate::psiphon_ssh::TlsShape,
+    ) -> Result<Self, String> {
+        let (obfuscated, decoy, randomized, proof_key, packet_key) = quic_parameters(server)?;
+        let remote = SocketAddr::new(server.address, server.port);
+        stream.set_timeout(Some(timeout));
+        let udp = packet_io(
+            PacketIo::WebRtc(stream),
+            obfuscated,
+            decoy,
+            packet_key,
+            shape,
+        );
+        let psk = psk_key(server, shape);
+        Self::connect_over(
+            udp, remote, timeout, proof_key, randomized, obfuscated, true, psk, shape, None, None,
+        )
+    }
+
+    /// Dial the QUIC reliability layer carried inside an in-proxy media track.
+    pub(crate) fn connect_inproxy_reliability(
+        remote: SocketAddr,
+        timeout: Duration,
+        stream: WebRtcStream,
+        root_secret: [u8; 32],
+    ) -> Result<Self, String> {
+        let mut secret = [0u8; 32];
+        Hkdf::<Sha256>::new(None, &root_secret)
+            .expand(b"in-proxy-RTP-QUIC-reliability-layer", &mut secret)
+            .map_err(|_| "psiphon quic: reliability secret".to_owned())?;
+        let mut psk = [0u8; 32];
+        let mut cipher = ChaCha20::new(&secret.into(), &[0u8; 12].into());
+        cipher.apply_keystream(&mut psk);
+        stream.set_timeout(Some(timeout));
+        let udp = Udp::Plain(PacketIo::WebRtc(stream));
+        let key = ferrox_core::realm::hex_encode(&secret[..8]);
+        Self::connect_over(
+            udp,
+            remote,
+            timeout,
+            &key,
+            false,
+            false,
+            true,
+            Some(psk),
+            &crate::psiphon_ssh::TlsShape::default(),
+            Some(secret),
+            Some(true),
+        )
+    }
+
+    /// Complete the QUIC handshake over a packet source and start its driver.
+    #[allow(clippy::too_many_arguments)]
+    fn connect_over(
+        mut udp: Udp,
+        remote: SocketAddr,
+        timeout: Duration,
+        proof_key: &str,
+        randomized: bool,
+        obfuscated: bool,
+        inproxy: bool,
+        psk: Option<[u8; 32]>,
+        shape: &crate::psiphon_ssh::TlsShape,
+        client_random: Option<[u8; 32]>,
+        force_early: Option<bool>,
+    ) -> Result<Self, String> {
+        let dial_early = force_early.unwrap_or_else(|| coin(shape.quic_dial_early));
+        let disable_path_mtu = obfuscated || inproxy || coin(shape.quic_disable_path_mtu);
+        let adjustment = (obfuscated as usize) * OBFUSCATION_OVERHEAD
+            + (inproxy as usize) * INPROXY_PACKET_ADJUSTMENT;
+        let packet_limit = if obfuscated || inproxy {
+            MIN_DATAGRAM - adjustment
+        } else {
+            MAX_PACKET_SIZE
+        };
+        let name = quic_server_name(remote, proof_key);
+        let resume = psk.is_some_and(|shared| {
+            if let Err(error) = ensure_obfuscated_psk(&name, shared) {
+                eprintln!("psiphon quic: {error}; continuing without an obfuscated PSK");
+                false
+            } else {
+                true
+            }
+        });
+        let mut engine = Engine::new(
+            proof_key,
+            randomized,
+            dial_early,
+            disable_path_mtu,
+            packet_limit,
+            name,
+            resume,
+            client_random,
+        )?;
+        if engine.early() {
+            engine.open_stream_early();
+            engine.flush(&mut udp, Instant::now())?;
+            return Self::start(udp, engine, timeout);
+        }
+        let deadline = Instant::now() + timeout;
+        let mut datagram = vec![0u8; 65535];
+        loop {
+            engine.flush(&mut udp, Instant::now())?;
+            if engine.ready() {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err("psiphon quic handshake timed out".to_owned());
+            }
+            let wait = engine
+                .wait_timeout(now)
+                .min(deadline.saturating_duration_since(now))
+                .max(Duration::from_millis(1));
+            udp.set_read_timeout(Some(wait));
+            match udp.recv(&mut datagram) {
+                Ok(count) => {
+                    let now = Instant::now();
+                    if let Err(error) = engine.receive(&mut datagram[..count], now) {
+                        if !discardable(&error) {
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(error) => return Err(format!("psiphon quic receive {remote}: {error}")),
+            }
+        }
+        engine.open_stream();
+        engine.flush(&mut udp, Instant::now())?;
+        Self::start(udp, engine, timeout)
+    }
+
+    /// Start a session from a connected socket and its prepared engine.
+    fn start(udp: Udp, engine: Engine, timeout: Duration) -> Result<Self, String> {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
+                send: VecDeque::new(),
+                send_bytes: 0,
+                recv: Vec::new(),
+                read_at: 0,
+                error: None,
+                eof: false,
+                write_closed: false,
+                close_requested: false,
+                timeout: Some(timeout),
+                write_timeout: Some(timeout),
+            }),
+            readable: Condvar::new(),
+            writable: Condvar::new(),
+        });
+        let driver = Arc::clone(&shared);
+        thread::Builder::new()
+            .name("psiphon-quic".to_owned())
+            .spawn(move || drive(&driver, udp, engine))
+            .map_err(|error| format!("psiphon quic thread: {error}"))?;
+        Ok(Self { shared })
+    }
+
+    pub(crate) fn set_timeout(&self, timeout: Option<Duration>) {
+        let mut state = lock(&self.shared.state);
+        state.timeout = timeout;
+        state.write_timeout = timeout;
+        drop(state);
+        self.shared.readable.notify_all();
+        self.shared.writable.notify_all();
+    }
+
+    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) {
+        let mut state = lock(&self.shared.state);
+        state.timeout = timeout;
+        drop(state);
+        self.shared.readable.notify_all();
+    }
+
+    pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) {
+        let mut state = lock(&self.shared.state);
+        state.write_timeout = timeout;
+        drop(state);
+        self.shared.writable.notify_all();
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let mut state = lock(&self.shared.state);
+        state.write_closed = true;
+        state.close_requested = true;
+        state.eof = true;
+        drop(state);
+        self.shared.readable.notify_all();
+        self.shared.writable.notify_all();
+    }
+}
+
+impl Read for QuicStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut state = lock(&self.shared.state);
+        loop {
+            if state.read_at < state.recv.len() {
+                let available = &state.recv[state.read_at..];
+                let count = buf.len().min(available.len());
+                buf[..count].copy_from_slice(&available[..count]);
+                state.read_at += count;
+                if state.read_at == state.recv.len() {
+                    state.recv.clear();
+                    state.read_at = 0;
+                } else if state.read_at >= 64 * 1024 {
+                    let read_at = state.read_at;
+                    state.recv.drain(..read_at);
+                    state.read_at = 0;
+                }
+                return Ok(count);
+            }
+            if let Some(error) = state.error.clone() {
+                return Err(io::Error::new(ErrorKind::BrokenPipe, error));
+            }
+            if state.eof {
+                return Ok(0);
+            }
+            let timeout = state.timeout;
+            let (next, expired) = match timeout {
+                Some(timeout) => {
+                    let (next, result) = self
+                        .shared
+                        .readable
+                        .wait_timeout(state, timeout)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    (next, result.timed_out())
+                }
+                None => (
+                    self.shared
+                        .readable
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner),
+                    false,
+                ),
+            };
+            state = next;
+            if expired && state.read_at == state.recv.len() && !state.eof && state.error.is_none() {
+                return Err(io::Error::new(
+                    ErrorKind::WouldBlock,
+                    "psiphon quic read timed out",
+                ));
+            }
+        }
+    }
+}
+
+impl Write for QuicStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut state = lock(&self.shared.state);
+        if state.write_closed || state.eof {
+            return Err(io::Error::new(
+                ErrorKind::BrokenPipe,
+                "psiphon quic is shut down",
+            ));
+        }
+        if let Some(error) = state.error.clone() {
+            return Err(io::Error::new(ErrorKind::BrokenPipe, error));
+        }
+        let deadline = state.write_timeout.map(|timeout| Instant::now() + timeout);
+        while state.send_bytes > 0 && state.send_bytes + buf.len() > MAX_SEND_QUEUE {
+            let (next, expired) = wait_writable(&self.shared, state, deadline);
+            state = next;
+            if expired {
+                return Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    "psiphon quic write timed out",
+                ));
+            }
+            if state.write_closed || state.eof {
+                return Err(io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "psiphon quic is shut down",
+                ));
+            }
+            if let Some(error) = state.error.clone() {
+                return Err(io::Error::new(ErrorKind::BrokenPipe, error));
+            }
+        }
+        state.send_bytes += buf.len();
+        state.send.push_back(buf.to_vec());
+        drop(state);
+        self.shared.writable.notify_one();
+        Ok(buf.len())
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        let total: usize = bufs.iter().map(|buf| buf.len()).sum();
+        if total == 0 {
+            return Ok(0);
+        }
+        let mut state = lock(&self.shared.state);
+        if state.write_closed || state.eof {
+            return Err(io::Error::new(
+                ErrorKind::BrokenPipe,
+                "psiphon quic is shut down",
+            ));
+        }
+        if let Some(error) = state.error.clone() {
+            return Err(io::Error::new(ErrorKind::BrokenPipe, error));
+        }
+        let deadline = state.write_timeout.map(|timeout| Instant::now() + timeout);
+        while state.send_bytes > 0 && state.send_bytes + total > MAX_SEND_QUEUE {
+            let (next, expired) = wait_writable(&self.shared, state, deadline);
+            state = next;
+            if expired {
+                return Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    "psiphon quic write timed out",
+                ));
+            }
+            if state.write_closed || state.eof {
+                return Err(io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "psiphon quic is shut down",
+                ));
+            }
+            if let Some(error) = state.error.clone() {
+                return Err(io::Error::new(ErrorKind::BrokenPipe, error));
+            }
+        }
+        for buf in bufs {
+            if !buf.is_empty() {
+                state.send_bytes += buf.len();
+                state.send.push_back(buf.to_vec());
+            }
+        }
+        drop(state);
+        self.shared.writable.notify_all();
+        Ok(total)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn wait_writable<'a>(
+    shared: &'a Shared,
+    state: MutexGuard<'a, State>,
+    deadline: Option<Instant>,
+) -> (MutexGuard<'a, State>, bool) {
+    let Some(deadline) = deadline else {
+        return (
+            shared
+                .writable
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
+            false,
+        );
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return (state, true);
+    }
+    let (next, result) = shared
+        .writable
+        .wait_timeout(state, remaining)
+        .unwrap_or_else(PoisonError::into_inner);
+    (next, result.timed_out())
+}
+
+enum PacketIo {
+    Socket(UdpSocket),
+    WebRtc(WebRtcStream),
+}
+
+impl PacketIo {
+    fn send(&mut self, plain: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Socket(socket) => socket.send(plain),
+            Self::WebRtc(stream) => stream.write(plain),
+        }
+    }
+
+    fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Socket(socket) => socket.recv(buf),
+            Self::WebRtc(stream) => stream.read(buf),
+        }
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) {
+        match self {
+            Self::Socket(socket) => {
+                let _ = socket.set_read_timeout(timeout);
+            }
+            Self::WebRtc(stream) => stream.set_read_timeout(timeout),
+        }
+    }
+}
+
+enum Udp {
+    Obfuscated(ObfuscatedUdp),
+    Plain(PacketIo),
+}
+
+impl Udp {
+    fn send(&mut self, plain: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Obfuscated(udp) => udp.send(plain),
+            Self::Plain(io) => io.send(plain),
+        }
+    }
+
+    fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Obfuscated(udp) => udp.recv(buf),
+            Self::Plain(io) => io.recv(buf),
+        }
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) {
+        match self {
+            Self::Obfuscated(udp) => udp.io.set_read_timeout(timeout),
+            Self::Plain(io) => io.set_read_timeout(timeout),
+        }
+    }
+}
+
+struct ObfuscatedUdp {
+    io: PacketIo,
+    key: [u8; 32],
+    nonce: [u8; 12],
+    nonce_transform: Option<std::sync::Arc<Vec<crate::psiphon_dns::Transform>>>,
+    decoy: Option<u8>,
+    limit: usize,
+}
+
+impl ObfuscatedUdp {
+    fn send(&mut self, plain: &[u8]) -> io::Result<usize> {
+        if plain.len() > self.limit.saturating_sub(OBFUSCATION_OVERHEAD) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "psiphon quic packet too long",
+            ));
+        }
+        let mut framed = [0u8; MAX_PACKET_SIZE];
+        loop {
+            getrandom::fill(&mut self.nonce).map_err(|_| io::Error::other("psiphon quic nonce"))?;
+            crate::psiphon_ssh::apply_seed_transform(
+                self.nonce_transform.as_deref().map(Vec::as_slice),
+                &mut self.nonce,
+            )
+            .map_err(io::Error::other)?;
+            let max_padding = PADDING_LIMIT
+                .saturating_sub(plain.len())
+                .min(
+                    self.limit
+                        .saturating_sub(OBFUSCATION_OVERHEAD + plain.len()),
+                )
+                .min(255);
+            let padding = bounded_random(max_padding + 1);
+            framed[..12].copy_from_slice(&self.nonce);
+            framed[12] = padding as u8;
+            let padding_end = 13 + padding;
+            getrandom::fill(&mut framed[13..padding_end])
+                .map_err(|_| io::Error::other("psiphon quic padding"))?;
+            framed[padding_end..padding_end + plain.len()].copy_from_slice(plain);
+            let end = padding_end + plain.len();
+            let mut cipher = ChaCha20::new(&self.key.into(), &self.nonce.into());
+            cipher.apply_keystream(&mut framed[12..end]);
+            if !looks_like_quic_initial(&framed[..end]) {
+                self.io.send(&framed[..end])?;
+                return Ok(plain.len());
+            }
+        }
+    }
+
+    fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let count = self.io.recv(buf)?;
+            if let Some(left) = self.decoy.as_mut() {
+                if *left > 0 && bounded_random(2) == 1 {
+                    *left -= 1;
+                    let length = 1 + bounded_random(PADDING_LIMIT);
+                    let mut decoy = [0u8; PADDING_LIMIT];
+                    getrandom::fill(&mut decoy[..length])
+                        .map_err(|_| io::Error::other("psiphon quic decoy"))?;
+                    let _ = self.io.send(&decoy[..length]);
+                }
+            }
+            if count < OBFUSCATION_OVERHEAD {
+                continue;
+            }
+            let mut nonce = [0u8; 12];
+            nonce.copy_from_slice(&buf[..12]);
+            {
+                let mut cipher = ChaCha20::new(&self.key.into(), &nonce.into());
+                cipher.apply_keystream(&mut buf[12..count]);
+            }
+            let padding = usize::from(buf[12]);
+            let start = OBFUSCATION_OVERHEAD + padding;
+            if start > count {
+                continue;
+            }
+            let length = count - start;
+            buf.copy_within(start..count, 0);
+            if length == 0 || buf[0] & 0x40 == 0 {
+                continue;
+            }
+            return Ok(length);
+        }
+    }
+}
+
+fn bounded_random(bound: usize) -> usize {
+    if bound <= 1 {
+        return 0;
+    }
+    let mut bytes = [0u8; 4];
+    crate::psiphon_ssh::dial_fill(&mut bytes);
+    let value = u64::from(u32::from_le_bytes(bytes));
+    ((value * bound as u64) >> 32) as usize
+}
+
+fn looks_like_quic_initial(packet: &[u8]) -> bool {
+    packet.len() >= 5 && packet[0] >> 4 == 0x0c && packet[1..5] == [0, 0, 0, 1]
+}
+
+fn packet_key(key: &str) -> Result<[u8; 32], String> {
+    let hkdf = Hkdf::<Sha256>::new(Some(b"quic-obfuscation-key"), key.as_bytes());
+    let mut derived = [0u8; 32];
+    hkdf.expand(&[], &mut derived)
+        .map_err(|error| format!("psiphon quic key: {error}"))?;
+    Ok(derived)
+}
+
+#[derive(Clone, Copy)]
+struct SentPacket {
+    pn: u64,
+    space: usize,
+    sent_at: Instant,
+    size: u64,
+    crypto: Option<(u64, u64)>,
+    stream: Option<(u64, u64)>,
+    window: bool,
+    early: bool,
+    probe: Option<usize>,
+}
+
+struct Engine {
+    tls: ClientConnection,
+    initial: Option<Keys>,
+    handshake: Option<Keys>,
+    one_rtt: Option<Keys>,
+    zero_rtt: Option<DirectionalKeys>,
+    next_secrets: Option<Secrets>,
+    session_name: String,
+    early_attempted: bool,
+    early_decided: bool,
+    disable_path_mtu: bool,
+    packet_limit: usize,
+    max_datagram: usize,
+    probe_target: Option<usize>,
+    probe_size: Option<usize>,
+    probe_inflight: bool,
+    probe_failed: bool,
+    probe_step: usize,
+    probe_losses: u8,
+    probe_retry_at: Option<Instant>,
+    key_phase: bool,
+    level: usize,
+    dcid: Vec<u8>,
+    scid: Vec<u8>,
+    dcid_locked: bool,
+    next_pn: [u64; 3],
+    largest: [u64; 3],
+    ack_seen: [Vec<u64>; 3],
+    ack_pending: [bool; 3],
+    crypto_send: [Vec<u8>; 3],
+    crypto_sent: [usize; 3],
+    crypto_recv: [BTreeMap<u64, Vec<u8>>; 3],
+    crypto_next: [u64; 3],
+    stream_id: u64,
+    stream_base: u64,
+    stream_data: Vec<u8>,
+    stream_sent: u64,
+    recv_map: BTreeMap<u64, Vec<u8>>,
+    recv_next: u64,
+    recv_delivered: u64,
+    recv_fin_at: u64,
+    recv_fin: bool,
+    recv_eof: bool,
+    max_data: u64,
+    max_stream: u64,
+    data: u64,
+    stream: u64,
+    bidi: u64,
+    initial_limits: (u64, u64, u64),
+    session_saved: bool,
+    peer_params: bool,
+    received: Vec<u8>,
+    sent: Vec<SentPacket>,
+    retx: VecDeque<(u64, u64)>,
+    srtt: Option<Duration>,
+    rttvar: Duration,
+    cwnd: u64,
+    bytes_in_flight: u64,
+    last_send: Instant,
+    opened: bool,
+    close_sent: bool,
+    window_update: bool,
+    path_response: Option<[u8; 8]>,
+    tx_scratch: Vec<u8>,
+}
+
+impl Engine {
+    /// Build an engine and its initial packet keys for one server.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::fn_params_excessive_bools
+    )]
+    fn new(
+        key: &str,
+        randomized: bool,
+        dial_early: bool,
+        disable_path_mtu: bool,
+        packet_limit: usize,
+        name: String,
+        resume: bool,
+        client_random: Option<[u8; 32]>,
+    ) -> Result<Self, String> {
+        let config = client_config(randomized, dial_early, resume)?;
+        let mut scid = vec![0u8; CID_LEN];
+        getrandom::fill(&mut scid).map_err(|error| format!("psiphon quic scid: {error}"))?;
+        let params = transport_params(&scid, randomized);
+        let server_name = ServerName::try_from(name.as_str())
+            .map_err(|error| format!("psiphon quic server name: {error}"))?
+            .to_owned();
+        let passthrough = match client_random {
+            Some(random) => random,
+            None => tls_passthrough(key)?,
+        };
+        let order_seed =
+            randomized.then(|| u16::from_be_bytes(crate::psiphon_ssh::dial_random::<2>()));
+        let tls = PENDING_RANDOM
+            .with(|slot| {
+                *slot.borrow_mut() = Some(passthrough);
+                PENDING_ORDER_SEED.with(|seed| *seed.borrow_mut() = order_seed);
+                let created =
+                    ClientConnection::new(Arc::new(config), Version::V1, server_name, params);
+                slot.borrow_mut().take();
+                PENDING_ORDER_SEED.with(|seed| seed.borrow_mut().take());
+                created
+            })
+            .map_err(|error| format!("psiphon quic tls: {error}"))?;
+        let remembered = if dial_early {
+            let guard = lock(sessions());
+            guard.get(&name).cloned()
+        } else {
+            None
+        };
+        let zero_rtt = if dial_early {
+            tls.zero_rtt_keys()
+        } else {
+            None
+        };
+        let early = zero_rtt.is_some() && remembered.is_some();
+        let mut dcid = vec![0u8; CID_LEN];
+        getrandom::fill(&mut dcid).map_err(|error| format!("psiphon quic dcid: {error}"))?;
+        let (data, stream, bidi) = if early {
+            remembered.as_ref().map_or((0, 0, 0), |remembered| {
+                (remembered.data, remembered.stream, remembered.bidi)
+            })
+        } else {
+            (0, 0, 0)
+        };
+        let suite = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .and_then(rustls::Tls13CipherSuite::quic_suite)
+            .ok_or_else(|| "psiphon quic initial suite".to_owned())?;
+        let initial = suite.keys(&dcid, Side::Client, Version::V1);
+        let mut engine = Self {
+            tls,
+            initial: Some(initial),
+            handshake: None,
+            one_rtt: None,
+            zero_rtt: if early { zero_rtt } else { None },
+            next_secrets: None,
+            session_name: name,
+            early_attempted: early,
+            early_decided: false,
+            disable_path_mtu,
+            packet_limit,
+            max_datagram: MIN_DATAGRAM.min(packet_limit),
+            probe_target: None,
+            probe_size: None,
+            probe_inflight: false,
+            probe_failed: false,
+            probe_step: PMTU_STEP,
+            probe_losses: 0,
+            probe_retry_at: None,
+            key_phase: false,
+            level: INITIAL,
+            dcid,
+            scid,
+            dcid_locked: false,
+            next_pn: [0; 3],
+            largest: [0; 3],
+            ack_seen: std::array::from_fn(|_| Vec::new()),
+            ack_pending: [false; 3],
+            crypto_send: std::array::from_fn(|_| Vec::new()),
+            crypto_sent: [0; 3],
+            crypto_recv: std::array::from_fn(|_| BTreeMap::new()),
+            crypto_next: [0; 3],
+            stream_id: 0,
+            stream_base: 0,
+            stream_data: Vec::new(),
+            stream_sent: 0,
+            recv_map: BTreeMap::new(),
+            recv_next: 0,
+            recv_delivered: 0,
+            recv_fin_at: 0,
+            recv_fin: false,
+            recv_eof: false,
+            max_data: INITIAL_WINDOW,
+            max_stream: STREAM_WINDOW,
+            data,
+            stream,
+            bidi,
+            initial_limits: (0, 0, 0),
+            session_saved: false,
+            peer_params: false,
+            received: Vec::new(),
+            sent: Vec::new(),
+            retx: VecDeque::new(),
+            srtt: None,
+            rttvar: Duration::ZERO,
+            cwnd: INITIAL_CWND,
+            bytes_in_flight: 0,
+            last_send: Instant::now(),
+            opened: false,
+            close_sent: false,
+            window_update: false,
+            path_response: None,
+            tx_scratch: Vec::new(),
+        };
+        engine.pump_tls()?;
+        Ok(engine)
+    }
+
+    fn keys(&self, space: usize) -> Option<&Keys> {
+        match space {
+            INITIAL => self.initial.as_ref(),
+            HANDSHAKE => self.handshake.as_ref(),
+            ONE_RTT => self.one_rtt.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.one_rtt.is_some() && !self.tls.is_handshaking() && self.peer_params
+    }
+
+    fn open_stream(&mut self) {
+        self.stream_id = 0;
+        self.opened = true;
+    }
+
+    /// Whether the first stream bytes can ride a 0-RTT packet.
+    fn early(&self) -> bool {
+        self.zero_rtt.is_some()
+    }
+
+    /// Open the stream before the handshake, using the previous connection's flow-control grant.
+    fn open_stream_early(&mut self) {
+        self.open_stream();
+    }
+
+    fn pump_tls(&mut self) -> Result<(), String> {
+        loop {
+            let mut bytes = Vec::new();
+            let change = self.tls.write_hs(&mut bytes);
+            if !bytes.is_empty() {
+                self.crypto_send[self.level].extend_from_slice(&bytes);
+            }
+            match change {
+                Some(KeyChange::Handshake { keys }) => {
+                    self.handshake = Some(keys);
+                    self.level = HANDSHAKE;
+                }
+                Some(KeyChange::OneRtt { keys, next }) => {
+                    self.one_rtt = Some(keys);
+                    self.next_secrets = Some(next);
+                    self.level = ONE_RTT;
+                }
+                None => break,
+            }
+        }
+        if !self.peer_params {
+            if let Some(params) = self.tls.quic_transport_parameters() {
+                let params = params.to_vec();
+                self.apply_peer_params(&params)?;
+            }
+        }
+        if self.early_attempted && !self.early_decided && !self.tls.is_handshaking() {
+            self.early_decided = true;
+            if self.tls.is_early_data_accepted() {
+                self.compact_stream();
+            } else {
+                self.rollback_early();
+            }
+        }
+        if self.ready() {
+            self.remember();
+        }
+        Ok(())
+    }
+
+    /// Drop a packet number space once the handshake has moved past it.
+    fn discard_space(&mut self, space: usize) {
+        match space {
+            INITIAL => self.initial = None,
+            HANDSHAKE => self.handshake = None,
+            ONE_RTT => self.one_rtt = None,
+            _ => return,
+        }
+        let mut kept = Vec::with_capacity(self.sent.len());
+        for packet in self.sent.drain(..) {
+            if packet.space == space {
+                self.bytes_in_flight = self.bytes_in_flight.saturating_sub(packet.size);
+            } else {
+                kept.push(packet);
+            }
+        }
+        self.sent = kept;
+        self.crypto_send[space].clear();
+        self.crypto_sent[space] = 0;
+        self.crypto_recv[space].clear();
+        self.ack_seen[space].clear();
+        self.ack_pending[space] = false;
+    }
+
+    /// Accept the server's source CID once; a later packet cannot redirect the connection.
+    fn accept_server_cid(&mut self, scid: &[u8]) {
+        if self.dcid_locked {
+            return;
+        }
+        self.dcid.clear();
+        self.dcid.extend_from_slice(scid);
+        self.dcid_locked = true;
+    }
+
+    /// Store the handshake's initial grants once for the next 0-RTT dial.
+    fn remember(&mut self) {
+        if self.session_saved || self.session_name.is_empty() || self.dcid.is_empty() {
+            return;
+        }
+        let (data, stream, bidi) = self.initial_limits;
+        lock(sessions()).insert(self.session_name.clone(), Remembered { data, stream, bidi });
+        self.session_saved = true;
+    }
+
+    /// Drop early packets and resend their stream prefix after rejection.
+    fn rollback_early(&mut self) {
+        let mut kept = Vec::with_capacity(self.sent.len());
+        for packet in self.sent.drain(..) {
+            if packet.early {
+                self.bytes_in_flight = self.bytes_in_flight.saturating_sub(packet.size);
+            } else {
+                kept.push(packet);
+            }
+        }
+        self.sent = kept;
+        self.retx.clear();
+        self.stream_sent = 0;
+        self.zero_rtt = None;
+    }
+
+    fn apply_peer_params(&mut self, params: &[u8]) -> Result<(), String> {
+        self.data = 0;
+        self.stream = 0;
+        self.bidi = 0;
+        let mut at = 0usize;
+        while at < params.len() {
+            let id = get_varint(params, &mut at)
+                .ok_or_else(|| "psiphon quic transport parameter".to_owned())?;
+            let len = get_varint(params, &mut at)
+                .ok_or_else(|| "psiphon quic transport parameter".to_owned())?;
+            let len =
+                usize::try_from(len).map_err(|_| "psiphon quic transport parameter".to_owned())?;
+            let end = at
+                .checked_add(len)
+                .filter(|end| *end <= params.len())
+                .ok_or_else(|| "psiphon quic transport parameter".to_owned())?;
+            match id {
+                0x04 => self.data = get_varint(params, &mut at).unwrap_or(0),
+                0x06 => self.stream = get_varint(params, &mut at).unwrap_or(0),
+                0x08 => self.bidi = get_varint(params, &mut at).unwrap_or(0),
+                _ => {}
+            }
+            at = end;
+        }
+        self.peer_params = true;
+        if self.bidi == 0 {
+            return Err("psiphon quic: peer refuses a stream".to_owned());
+        }
+        if self.stream == 0 {
+            return Err("psiphon quic: peer grants no stream credit".to_owned());
+        }
+        self.initial_limits = (self.data, self.stream, self.bidi);
+        Ok(())
+    }
+
+    /// The next timer this engine needs, from the oldest sent packet.
+    fn wait_timeout(&self, now: Instant) -> Duration {
+        let pto = self.pto();
+        let next = self
+            .sent
+            .first()
+            .map(|packet| packet.sent_at + pto)
+            .map_or(READ_WAIT, |at| at.saturating_duration_since(now));
+        next.min(READ_WAIT).max(Duration::from_millis(1))
+    }
+
+    fn pto(&self) -> Duration {
+        self.srtt
+            .map_or(Duration::from_millis(250), |srtt| {
+                srtt * 2 + self.rttvar * 4 + Duration::from_millis(25)
+            })
+            .max(Duration::from_millis(200))
+    }
+
+    fn flush(&mut self, udp: &mut Udp, now: Instant) -> Result<(), String> {
+        self.pump_tls()?;
+        self.expire(now);
+        for space in [INITIAL, HANDSHAKE] {
+            if self.ack_pending[space] || self.crypto_pending(space) {
+                self.send_space(space, udp, now)?;
+            }
+        }
+        if self.one_rtt.is_some() {
+            self.plan_probe(now);
+            for _ in 0..64 {
+                if !self.send_space(ONE_RTT, udp, now)? {
+                    break;
+                }
+            }
+        } else if self.zero_rtt.is_some() {
+            for _ in 0..64 {
+                if !self.send_early(udp, now)? {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Choose the next padded DPLPMTUD probe target after any backoff has elapsed.
+    fn plan_probe(&mut self, now: Instant) {
+        if self.disable_path_mtu
+            || self.probe_failed
+            || self.probe_inflight
+            || self.probe_target.is_some()
+            || self.max_datagram >= self.packet_limit
+            || self.probe_retry_at.is_some_and(|retry_at| now < retry_at)
+        {
+            return;
+        }
+        self.probe_target = Some(
+            self.max_datagram
+                .saturating_add(self.probe_step)
+                .min(self.packet_limit),
+        );
+    }
+
+    /// Back off from a lost or refused probe to a smaller increment, then stop on a black hole.
+    fn probe_lost(&mut self, now: Instant) {
+        let failed = self.probe_size.take();
+        self.probe_inflight = false;
+        self.probe_target = None;
+        self.probe_losses = self.probe_losses.saturating_add(1);
+        let previous_step = self.probe_step;
+        self.probe_step = (previous_step / 2).max(PMTU_MIN_STEP);
+        let clamped = failed == Some(self.packet_limit)
+            && self.max_datagram.saturating_add(self.probe_step) >= self.packet_limit;
+        if self.probe_losses >= PMTU_MAX_LOSSES || previous_step <= PMTU_MIN_STEP || clamped {
+            self.probe_failed = true;
+            self.probe_retry_at = None;
+            return;
+        }
+        let shift = u32::from(self.probe_losses.saturating_sub(1)).min(4);
+        self.probe_retry_at = Some(now + PMTU_BACKOFF * (1u32 << shift));
+    }
+
+    /// Accept a probe result and grow the increment back toward the full step.
+    fn probe_acked(&mut self) {
+        self.probe_size = None;
+        self.probe_inflight = false;
+        self.probe_losses = 0;
+        self.probe_retry_at = None;
+        if self.probe_step < PMTU_STEP {
+            self.probe_step = (self.probe_step * 2).min(PMTU_STEP);
+        }
+    }
+
+    /// Send queued stream bytes with the 0-RTT keys.
+    fn send_early(&mut self, udp: &mut Udp, now: Instant) -> Result<bool, String> {
+        if self.zero_rtt.is_none()
+            || !self.opened
+            || self.bidi == 0
+            || self.bytes_in_flight >= self.cwnd
+            || self.stream_sent >= self.stream_base + self.stream_data.len() as u64
+        {
+            return Ok(false);
+        }
+        let limit = self.stream.min(self.data).saturating_sub(self.stream_sent);
+        let available =
+            (self.stream_base + self.stream_data.len() as u64).saturating_sub(self.stream_sent);
+        let overhead = long_header_len(false, self.dcid.len(), self.scid.len(), 4) + 16;
+        let room = available
+            .min(limit)
+            .min(self.max_datagram.saturating_sub(overhead + 16) as u64);
+        if room == 0 {
+            return Ok(false);
+        }
+        let mut payload = Vec::with_capacity(self.max_datagram);
+        let Some((offset, len)) = self.write_stream_frame(&mut payload, self.stream_sent, room)
+        else {
+            return Ok(false);
+        };
+        let pn = self.next_pn[ONE_RTT];
+        let packet = {
+            let keys = self
+                .zero_rtt
+                .as_ref()
+                .ok_or_else(|| "psiphon quic 0-rtt keys".to_owned())?;
+            self.seal_with(1, keys, pn, &payload)?
+        };
+        self.stream_sent += len;
+        self.next_pn[ONE_RTT] += 1;
+        self.last_send = now;
+        let size = packet.len() as u64;
+        self.sent.push(SentPacket {
+            pn,
+            space: ONE_RTT,
+            sent_at: now,
+            size,
+            crypto: None,
+            stream: Some((offset, len)),
+            window: false,
+            early: true,
+            probe: None,
+        });
+        self.bytes_in_flight = self.bytes_in_flight.saturating_add(size);
+        udp.send(&packet)
+            .map_err(|error| format!("psiphon quic send failed: {error}"))?;
+        Ok(true)
+    }
+
+    fn crypto_pending(&self, space: usize) -> bool {
+        self.crypto_sent[space] < self.crypto_send[space].len()
+    }
+
+    /// Retransmit the expired prefix and reset the congestion window.
+    fn expire(&mut self, now: Instant) {
+        let pto = self.pto();
+        let mut at = 0;
+        let mut congested = false;
+        while at < self.sent.len() && now.saturating_duration_since(self.sent[at].sent_at) >= pto {
+            let packet = self.sent[at];
+            self.bytes_in_flight = self.bytes_in_flight.saturating_sub(packet.size);
+            if let Some((offset, _len)) = packet.crypto {
+                self.crypto_sent[packet.space] =
+                    self.crypto_sent[packet.space].min(offset as usize);
+            }
+            if let Some((offset, len)) = packet.stream {
+                self.retx.push_back((offset, len));
+            }
+            if packet.window {
+                self.window_update = true;
+            }
+            if packet.probe.is_some() {
+                self.probe_lost(now);
+            } else {
+                congested = true;
+            }
+            at += 1;
+        }
+        if at > 0 {
+            self.sent.drain(..at);
+            if congested {
+                self.cwnd = INITIAL_CWND;
+            }
+        }
+    }
+
+    /// Build, seal and send one packet in the space from ACKs, control frames and stream bytes.
+    #[allow(clippy::too_many_lines)]
+    fn send_space(&mut self, space: usize, udp: &mut Udp, now: Instant) -> Result<bool, String> {
+        if self.keys(space).is_none() {
+            return Ok(false);
+        }
+        let pn = self.next_pn[space];
+        let head = if space == ONE_RTT {
+            1 + self.dcid.len() + 4
+        } else {
+            0
+        };
+        let mut payload = std::mem::take(&mut self.tx_scratch);
+        payload.clear();
+        payload.reserve(head + self.max_datagram.max(MAX_PAYLOAD) + 64);
+        if head > 0 {
+            payload.resize(head, 0);
+        }
+        let mut crypto_frame = None;
+        let mut stream_frame = None;
+        let mut window_frame = false;
+        let mut ack_eliciting = false;
+        let probe = if space == ONE_RTT {
+            self.probe_target
+        } else {
+            None
+        };
+        if probe.is_none() && self.ack_pending[space] {
+            put_ack(&mut payload, &self.ack_seen[space]);
+            self.ack_pending[space] = false;
+            self.ack_seen[space].clear();
+        }
+        if space == ONE_RTT {
+            if probe.is_none() {
+                if let Some(token) = self.path_response.take() {
+                    payload.push(0x1b);
+                    payload.extend_from_slice(&token);
+                    ack_eliciting = true;
+                }
+                if self.window_update {
+                    put_varint(&mut payload, 0x10);
+                    put_varint(&mut payload, self.max_data);
+                    put_varint(&mut payload, 0x11);
+                    put_varint(&mut payload, self.stream_id);
+                    put_varint(&mut payload, self.max_stream);
+                    self.window_update = false;
+                    window_frame = true;
+                    ack_eliciting = true;
+                }
+                if let Some((offset, len)) = self.retx.pop_front() {
+                    if let Some(frame) = self.write_stream_frame(&mut payload, offset, len) {
+                        stream_frame = Some(frame);
+                        ack_eliciting = true;
+                    }
+                }
+                if stream_frame.is_none()
+                    && self.opened
+                    && self.stream_sent < self.stream_base + self.stream_data.len() as u64
+                    && self.bytes_in_flight < self.cwnd
+                {
+                    let available = (self.stream_base + self.stream_data.len() as u64)
+                        .saturating_sub(self.stream_sent);
+                    let limit = self.stream.min(self.data).saturating_sub(self.stream_sent);
+                    let room = available
+                        .min(limit)
+                        .min(self.max_payload_room(space, payload.len() - head) as u64);
+                    if room > 0 {
+                        if let Some(frame) =
+                            self.write_stream_frame(&mut payload, self.stream_sent, room)
+                        {
+                            self.stream_sent += frame.1;
+                            stream_frame = Some(frame);
+                            ack_eliciting = true;
+                        }
+                    }
+                }
+            }
+        } else if self.crypto_pending(space) {
+            let start = self.crypto_sent[space];
+            let len = (self.crypto_send[space].len() - start)
+                .min(self.max_payload_room(space, payload.len() - head));
+            if len > 0 {
+                let offset = start as u64;
+                payload.push(0x06);
+                put_varint(&mut payload, offset);
+                put_varint(&mut payload, len as u64);
+                payload.extend_from_slice(&self.crypto_send[space][start..start + len]);
+                self.crypto_sent[space] += len;
+                crypto_frame = Some((offset, len as u64));
+                ack_eliciting = true;
+            }
+        }
+        if payload.len() == head {
+            if probe.is_some()
+                || (space == ONE_RTT && now.saturating_duration_since(self.last_send) >= KEEPALIVE)
+            {
+                payload.push(0x01);
+                ack_eliciting = true;
+            } else {
+                self.tx_scratch = payload;
+                return Ok(false);
+            }
+        }
+        if probe.is_some() && !ack_eliciting {
+            payload.push(0x01);
+            ack_eliciting = true;
+        }
+        if let Some(target) = probe {
+            self.probe_size = Some(target);
+            let total = payload.len() + 16;
+            if target > total {
+                payload.resize(payload.len() + (target - total), 0);
+            }
+        }
+        if space == INITIAL {
+            self.pad_initial(&mut payload, pn);
+        }
+        if space == ONE_RTT {
+            self.seal_short(pn, &mut payload, head)?;
+            self.next_pn[space] += 1;
+            let size = payload.len() as u64;
+            if ack_eliciting {
+                self.sent.push(SentPacket {
+                    pn,
+                    space,
+                    sent_at: now,
+                    size,
+                    crypto: crypto_frame,
+                    stream: stream_frame,
+                    window: window_frame,
+                    early: false,
+                    probe: probe.map(|_| size as usize),
+                });
+                self.bytes_in_flight = self.bytes_in_flight.saturating_add(size);
+            }
+            if probe.is_some() {
+                self.probe_inflight = true;
+                self.probe_target = None;
+            }
+            self.last_send = now;
+            if let Err(error) = udp.send(&payload) {
+                if probe.is_some() {
+                    if ack_eliciting {
+                        self.sent.pop();
+                        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(size);
+                    }
+                    self.probe_lost(now);
+                    self.tx_scratch = payload;
+                    return Ok(false);
+                }
+                return Err(format!("psiphon quic send failed: {error}"));
+            }
+            self.tx_scratch = payload;
+            return Ok(true);
+        }
+        let packet = self.seal(space, pn, &payload)?;
+        self.tx_scratch = payload;
+        self.next_pn[space] += 1;
+        let size = packet.len() as u64;
+        if ack_eliciting {
+            self.sent.push(SentPacket {
+                pn,
+                space,
+                sent_at: now,
+                size,
+                crypto: crypto_frame,
+                stream: stream_frame,
+                window: window_frame,
+                early: false,
+                probe: None,
+            });
+            self.bytes_in_flight = self.bytes_in_flight.saturating_add(size);
+        }
+        self.last_send = now;
+        udp.send(&packet)
+            .map_err(|error| format!("psiphon quic send failed: {error}"))?;
+        if space == HANDSHAKE {
+            self.discard_space(INITIAL);
+        }
+        Ok(true)
+    }
+
+    /// Return the payload room left in a packet for this space.
+    fn max_payload_room(&self, space: usize, used: usize) -> usize {
+        if space == ONE_RTT {
+            self.max_datagram
+                .saturating_sub(1 + self.dcid.len() + 4 + 16 + used + 16)
+        } else {
+            let header = long_header_len(space == INITIAL, self.dcid.len(), self.scid.len(), 4);
+            self.max_datagram
+                .min(MAX_PAYLOAD)
+                .saturating_sub(header + 16 + used + 16)
+        }
+    }
+
+    fn pad_initial(&self, payload: &mut Vec<u8>, _pn: u64) {
+        let header = long_header_len(true, self.dcid.len(), self.scid.len(), 4);
+        let filled = header + payload.len() + 16;
+        let target = self.max_datagram.min(MAX_PAYLOAD);
+        if filled < target {
+            payload.resize(payload.len() + (target - filled), 0);
+        }
+    }
+
+    fn write_stream_frame(
+        &self,
+        payload: &mut Vec<u8>,
+        offset: u64,
+        len: u64,
+    ) -> Option<(u64, u64)> {
+        if offset < self.stream_base {
+            return None;
+        }
+        let start = usize::try_from(offset - self.stream_base).ok()?;
+        let len = usize::try_from(len).ok()?;
+        let end = start.checked_add(len)?.min(self.stream_data.len());
+        if end <= start {
+            return None;
+        }
+        let bytes = &self.stream_data[start..end];
+        payload.push(0x08 | if offset > 0 { 0x04 } else { 0 } | 0x02);
+        put_varint(payload, self.stream_id);
+        if offset > 0 {
+            put_varint(payload, offset);
+        }
+        put_varint(payload, bytes.len() as u64);
+        payload.extend_from_slice(bytes);
+        Some((offset, bytes.len() as u64))
+    }
+
+    /// Seal a long-header packet around the frames, returning the header-protected bytes.
+    fn seal(&self, space: usize, pn: u64, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let keys = self
+            .keys(space)
+            .ok_or_else(|| "psiphon quic keys".to_owned())?;
+        let packet_type = match space {
+            INITIAL => 0u8,
+            HANDSHAKE => 2u8,
+            _ => 3u8,
+        };
+        self.seal_with(packet_type, &keys.local, pn, payload)
+    }
+
+    /// Seal a packet with an explicit packet type and key set.
+    fn seal_with(
+        &self,
+        packet_type: u8,
+        local: &DirectionalKeys,
+        pn: u64,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let pn_len = 4usize;
+        let mut header = Vec::with_capacity(64);
+        header.push(0x80 | packet_type << 4 | (pn_len as u8 - 1));
+        header.extend_from_slice(&QUIC_VERSION.to_be_bytes());
+        header.push(u8::try_from(self.dcid.len()).unwrap_or(0));
+        header.extend_from_slice(&self.dcid);
+        header.push(u8::try_from(self.scid.len()).unwrap_or(0));
+        header.extend_from_slice(&self.scid);
+        if packet_type == 0 {
+            put_varint(&mut header, 0);
+        }
+        let length = pn_len as u64 + payload.len() as u64 + 16;
+        put_varint(&mut header, length);
+        let pn_offset = header.len();
+        header.extend_from_slice(&pn.to_be_bytes()[8 - pn_len..]);
+        let header_len = header.len();
+        let mut packet = header;
+        packet.extend_from_slice(payload);
+        let (head, body) = packet.split_at_mut(header_len);
+        let tag = local
+            .packet
+            .encrypt_in_place(pn, head, body)
+            .map_err(|error| format!("psiphon quic seal: {error}"))?;
+        packet.extend_from_slice(tag.as_ref());
+        let sample_len = local.header.sample_len();
+        let sample_at = pn_offset + 4;
+        if packet.len() < sample_at + sample_len {
+            return Err("psiphon quic short packet".to_owned());
+        }
+        let mut sample = [0u8; 16];
+        let sample = sample
+            .get_mut(..sample_len)
+            .ok_or_else(|| "psiphon quic short sample".to_owned())?;
+        sample.copy_from_slice(&packet[sample_at..sample_at + sample_len]);
+        let (first, rest) = packet.split_at_mut(1);
+        let pn_slice = &mut rest[pn_offset - 1..pn_offset + pn_len - 1];
+        local
+            .header
+            .encrypt_in_place(sample, &mut first[0], pn_slice)
+            .map_err(|error| format!("psiphon quic header: {error}"))?;
+        Ok(packet)
+    }
+
+    /// Sealing a one-RTT packet in the buffer its frames were built in: the header fills the prefix the caller reserved, the payload is encrypted where it lies, and the tag lands after it, so no plaintext is copied into a second allocation.
+    fn seal_short(&self, pn: u64, packet: &mut Vec<u8>, head: usize) -> Result<(), String> {
+        let keys = self
+            .one_rtt
+            .as_ref()
+            .ok_or_else(|| "psiphon quic keys".to_owned())?;
+        let pn_len = 4usize;
+        let pn_offset = 1 + self.dcid.len();
+        if packet.len() < head || head != pn_offset + pn_len {
+            return Err("psiphon quic short packet".to_owned());
+        }
+        packet[0] = 0x40 | (u8::from(self.key_phase) << 2) | (pn_len as u8 - 1);
+        packet[1..pn_offset].copy_from_slice(&self.dcid);
+        packet[pn_offset..head].copy_from_slice(&pn.to_be_bytes()[8 - pn_len..]);
+        let (header, body) = packet.split_at_mut(head);
+        let tag = keys
+            .local
+            .packet
+            .encrypt_in_place(pn, header, body)
+            .map_err(|error| format!("psiphon quic seal: {error}"))?;
+        packet.extend_from_slice(tag.as_ref());
+        let sample_len = keys.local.header.sample_len();
+        if packet.len() < head + sample_len {
+            return Err("psiphon quic short packet".to_owned());
+        }
+        let mut sample = [0u8; 16];
+        let sample = sample
+            .get_mut(..sample_len)
+            .ok_or_else(|| "psiphon quic short sample".to_owned())?;
+        sample.copy_from_slice(&packet[head..head + sample_len]);
+        let (first, rest) = packet.split_at_mut(1);
+        let pn_slice = &mut rest[pn_offset - 1..head - 1];
+        keys.local
+            .header
+            .encrypt_in_place(sample, &mut first[0], pn_slice)
+            .map_err(|error| format!("psiphon quic header: {error}"))?;
+        Ok(())
+    }
+
+    fn receive(&mut self, datagram: &mut [u8], now: Instant) -> Result<(), String> {
+        let mut at = 0usize;
+        while at < datagram.len() {
+            let first = datagram[at];
+            if first & 0x80 != 0 {
+                if at + 7 > datagram.len() {
+                    break;
+                }
+                let version = u32::from_be_bytes([
+                    datagram[at + 1],
+                    datagram[at + 2],
+                    datagram[at + 3],
+                    datagram[at + 4],
+                ]);
+                if version == 0 {
+                    return Err("psiphon quic header: version negotiation".to_owned());
+                }
+                if version != QUIC_VERSION {
+                    return Err(format!(
+                        "psiphon quic header: unsupported version {version}"
+                    ));
+                }
+                let dcid_len = usize::from(datagram[at + 5]);
+                let mut cursor = at + 6;
+                if cursor + dcid_len + 1 > datagram.len() {
+                    break;
+                }
+                cursor += dcid_len;
+                let scid_len = usize::from(datagram[cursor]);
+                cursor += 1;
+                if cursor + scid_len > datagram.len() {
+                    break;
+                }
+                let scid = datagram[cursor..cursor + scid_len].to_vec();
+                cursor += scid_len;
+                let packet_type = (first >> 4) & 0x03;
+                if packet_type == 3 {
+                    return Err("psiphon quic header: retry is not supported".to_owned());
+                }
+                if packet_type == 0 {
+                    let Some(token_len) = get_varint(datagram, &mut cursor) else {
+                        break;
+                    };
+                    let token_len = usize::try_from(token_len).unwrap_or(0);
+                    cursor = cursor.saturating_add(token_len);
+                }
+                if cursor >= datagram.len() {
+                    break;
+                }
+                let Some(length) = get_varint(datagram, &mut cursor) else {
+                    break;
+                };
+                let length = usize::try_from(length).unwrap_or(0);
+                let end = cursor.saturating_add(length).min(datagram.len());
+                if end <= cursor {
+                    break;
+                }
+                let space = match packet_type {
+                    0 => INITIAL,
+                    2 => HANDSHAKE,
+                    _ => break,
+                };
+                let pn_offset = cursor - at;
+                // Initial keys are public, so only a Handshake packet proves the CID is the server's.
+                if self.open(space, &mut datagram[at..end], pn_offset, now)? && space != INITIAL {
+                    self.accept_server_cid(&scid);
+                }
+                at = end;
+            } else {
+                let pn_offset = 1 + self.scid.len();
+                if at + pn_offset > datagram.len() {
+                    break;
+                }
+                self.open(ONE_RTT, &mut datagram[at..], pn_offset, now)?;
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Authenticate and decrypt a received packet, returning whether the header was accepted.
+    fn open(
+        &mut self,
+        space: usize,
+        packet: &mut [u8],
+        pn_offset: usize,
+        now: Instant,
+    ) -> Result<bool, String> {
+        let (pn, header_end, key_phase) = {
+            let Some(keys) = self.keys(space) else {
+                return Ok(false);
+            };
+            let sample_len = keys.remote.header.sample_len();
+            if packet.len() < pn_offset + 4 + sample_len {
+                return Ok(false);
+            }
+            let mut sample = [0u8; 16];
+            let sample = sample
+                .get_mut(..sample_len)
+                .ok_or_else(|| "psiphon quic short sample".to_owned())?;
+            sample.copy_from_slice(&packet[pn_offset + 4..pn_offset + 4 + sample_len]);
+            let mut first = packet[0];
+            let mut pnb = [
+                packet[pn_offset],
+                packet[pn_offset + 1],
+                packet[pn_offset + 2],
+                packet[pn_offset + 3],
+            ];
+            keys.remote
+                .header
+                .decrypt_in_place(sample, &mut first, &mut pnb)
+                .map_err(|error| format!("psiphon quic header: {error}"))?;
+            let pn_len = usize::from(first & 0x03) + 1;
+            let truncated = pnb[..pn_len]
+                .iter()
+                .fold(0u64, |value, byte| (value << 8) | u64::from(*byte));
+            let pn = decode_pn(truncated, (pn_len * 8) as u32, self.largest[space]);
+            packet[0] = first;
+            packet[pn_offset..pn_offset + pn_len].copy_from_slice(&pnb[..pn_len]);
+            let header_end = pn_offset + pn_len;
+            if packet.len() <= header_end + 16 {
+                return Ok(false);
+            }
+            (pn, header_end, space == ONE_RTT && first & 0x04 != 0)
+        };
+        let mut plain_len = None;
+        if key_phase != self.key_phase {
+            if let Some(mut secrets) = self.next_secrets.clone() {
+                let next = secrets.next_packet_keys();
+                let mut trial = packet.to_vec();
+                let (header, payload) = trial.split_at_mut(header_end);
+                if let Ok(plain) = next.remote.decrypt_in_place(pn, header, payload) {
+                    plain_len = Some(plain.len());
+                    if let Some(keys) = self.one_rtt.as_mut() {
+                        keys.local.packet = next.local;
+                        keys.remote.packet = next.remote;
+                    }
+                    self.next_secrets = Some(secrets);
+                    self.key_phase = key_phase;
+                    packet.copy_from_slice(&trial);
+                }
+            }
+        }
+        let plain_len = if let Some(plain_len) = plain_len {
+            plain_len
+        } else {
+            let Some(keys) = self.keys(space) else {
+                return Ok(false);
+            };
+            let (header, payload) = packet.split_at_mut(header_end);
+            keys.remote
+                .packet
+                .decrypt_in_place(pn, header, payload)
+                .map_err(|error| format!("psiphon quic decrypt: {error}"))?
+                .len()
+        };
+        self.largest[space] = self.largest[space].max(pn);
+        let seen = &mut self.ack_seen[space];
+        if let Err(at) = seen.binary_search(&pn) {
+            seen.insert(at, pn);
+        }
+        self.ack_pending[space] = true;
+        self.handle_frames(space, &packet[header_end..header_end + plain_len], now)?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_frames(&mut self, space: usize, payload: &[u8], now: Instant) -> Result<(), String> {
+        let mut at = 0usize;
+        while at < payload.len() {
+            let Some(kind) = get_varint(payload, &mut at) else {
+                break;
+            };
+            match kind {
+                0x00 | 0x01 => {}
+                0x1e if space == ONE_RTT => self.discard_space(HANDSHAKE),
+                0x02 | 0x03 => {
+                    let Some(largest) = get_varint(payload, &mut at) else {
+                        break;
+                    };
+                    let Some(_delay) = get_varint(payload, &mut at) else {
+                        break;
+                    };
+                    let Some(count) = get_varint(payload, &mut at) else {
+                        break;
+                    };
+                    let Some(first) = get_varint(payload, &mut at) else {
+                        break;
+                    };
+                    let mut acked = Vec::new();
+                    let mut low = largest.saturating_sub(first);
+                    acked.push((low, largest));
+                    for _ in 0..count {
+                        let Some(gap) = get_varint(payload, &mut at) else {
+                            break;
+                        };
+                        let Some(len) = get_varint(payload, &mut at) else {
+                            break;
+                        };
+                        let high = low.saturating_sub(gap + 2);
+                        low = high.saturating_sub(len);
+                        acked.push((low, high));
+                    }
+                    if kind == 0x03 {
+                        let _ = get_varint(payload, &mut at);
+                        let _ = get_varint(payload, &mut at);
+                        let _ = get_varint(payload, &mut at);
+                    }
+                    self.ack(space, &acked, now);
+                }
+                0x04 => {
+                    let Some(stream) = get_varint(payload, &mut at) else {
+                        break;
+                    };
+                    let _ = get_varint(payload, &mut at);
+                    let _ = get_varint(payload, &mut at);
+                    if stream == self.stream_id {
+                        return Err("psiphon quic: stream reset".to_owned());
+                    }
+                }
+                0x05 => {
+                    let _ = get_varint(payload, &mut at);
+                    let _ = get_varint(payload, &mut at);
+                }
+                0x06 => {
+                    let Some(offset) = get_varint(payload, &mut at) else {
+                        break;
+                    };
+                    let Some(len) = get_varint(payload, &mut at) else {
+                        break;
+                    };
+                    let len = usize::try_from(len).unwrap_or(0);
+                    let end = at.saturating_add(len).min(payload.len());
+                    self.feed_crypto(space, offset, &payload[at..end])?;
+                    at = end;
+                }
+                0x08..=0x0f => {
+                    let off_bit = kind & 0x04 != 0;
+                    let len_bit = kind & 0x02 != 0;
+                    let fin = kind & 0x01 != 0;
+                    let Some(stream) = get_varint(payload, &mut at) else {
+                        break;
+                    };
+                    let offset = if off_bit {
+                        match get_varint(payload, &mut at) {
+                            Some(offset) => offset,
+                            None => break,
+                        }
+                    } else {
+                        0
+                    };
+                    let len = if len_bit {
+                        match get_varint(payload, &mut at) {
+                            Some(len) => usize::try_from(len).unwrap_or(0),
+                            None => break,
+                        }
+                    } else {
+                        payload.len().saturating_sub(at)
+                    };
+                    let end = at.saturating_add(len).min(payload.len());
+                    if stream == self.stream_id {
+                        self.feed_stream(offset, &payload[at..end], fin)?;
+                    }
+                    at = end;
+                }
+                0x10 => {
+                    if let Some(value) = get_varint(payload, &mut at) {
+                        self.data = self.data.max(value);
+                    }
+                }
+                0x11 => {
+                    let Some(stream) = get_varint(payload, &mut at) else {
+                        break;
+                    };
+                    let Some(value) = get_varint(payload, &mut at) else {
+                        break;
+                    };
+                    if stream == self.stream_id {
+                        self.stream = self.stream.max(value);
+                    }
+                }
+                0x12 | 0x13 => {
+                    if let Some(value) = get_varint(payload, &mut at) {
+                        if kind == 0x12 {
+                            self.bidi = self.bidi.max(value);
+                        }
+                    }
+                }
+                0x14 => {
+                    let _ = get_varint(payload, &mut at);
+                    self.window_update = true;
+                }
+                0x15 => {
+                    let _ = get_varint(payload, &mut at);
+                    let _ = get_varint(payload, &mut at);
+                    self.window_update = true;
+                }
+                0x16 | 0x17 | 0x19 => {
+                    let _ = get_varint(payload, &mut at);
+                }
+                0x18 => {
+                    let _ = get_varint(payload, &mut at);
+                    let _ = get_varint(payload, &mut at);
+                    let Some(len) = get_varint(payload, &mut at) else {
+                        break;
+                    };
+                    at = at
+                        .saturating_add(usize::try_from(len).unwrap_or(0))
+                        .saturating_add(16);
+                }
+                0x1a => {
+                    if at + 8 > payload.len() {
+                        break;
+                    }
+                    let mut token = [0u8; 8];
+                    token.copy_from_slice(&payload[at..at + 8]);
+                    at += 8;
+                    self.path_response = Some(token);
+                }
+                0x1b => {
+                    at = at.saturating_add(8);
+                }
+                0x1c => {
+                    let code = get_varint(payload, &mut at).unwrap_or(0);
+                    let _ = get_varint(payload, &mut at);
+                    let _ = get_varint(payload, &mut at);
+                    return Err(format!("psiphon quic closed: {code}"));
+                }
+                0x1d => {
+                    let code = get_varint(payload, &mut at).unwrap_or(0);
+                    let _ = get_varint(payload, &mut at);
+                    return Err(format!("psiphon quic application closed: {code}"));
+                }
+                0x07 | 0x30 | 0x31 => {
+                    let Some(len) = get_varint(payload, &mut at) else {
+                        break;
+                    };
+                    at = at.saturating_add(usize::try_from(len).unwrap_or(0));
+                }
+                _ => return Err(format!("psiphon quic: unknown frame {kind:#x}")),
+            }
+        }
+        Ok(())
+    }
+
+    /// Process ACK ranges in one pass, keeping unacked packets in send order.
+    fn ack(&mut self, space: usize, ranges: &[(u64, u64)], now: Instant) {
+        let len = self.sent.len();
+        let mut write = 0usize;
+        let mut newest: Option<SentPacket> = None;
+        let mut acked_bytes = 0u64;
+        let mut read = 0usize;
+        while read < len {
+            let packet = self.sent[read];
+            if packet.space == space
+                && ranges
+                    .iter()
+                    .any(|(low, high)| packet.pn >= *low && packet.pn <= *high)
+            {
+                self.bytes_in_flight = self.bytes_in_flight.saturating_sub(packet.size);
+                acked_bytes += packet.size;
+                if let Some(candidate) = packet.probe {
+                    self.max_datagram = self.max_datagram.max(candidate);
+                    self.probe_acked();
+                }
+                if newest.is_none_or(|newest| packet.sent_at > newest.sent_at) {
+                    newest = Some(packet);
+                }
+            } else {
+                self.sent[write] = packet;
+                write += 1;
+            }
+            read += 1;
+        }
+        if write == len {
+            return;
+        }
+        self.sent.truncate(write);
+        if let Some(packet) = newest {
+            let sample = now.saturating_duration_since(packet.sent_at);
+            if let Some(srtt) = self.srtt {
+                let diff = sample.abs_diff(srtt);
+                self.rttvar = (self.rttvar * 3 + diff) / 4;
+                self.srtt = Some((srtt * 7 + sample) / 8);
+            } else {
+                self.srtt = Some(sample);
+                self.rttvar = sample / 2;
+            }
+        }
+        let growth = (MSS * acked_bytes / self.cwnd.max(1)).max(MSS);
+        self.cwnd = (self.cwnd + growth).min(MAX_CWND);
+        self.compact_stream();
+    }
+
+    fn compact_stream(&mut self) {
+        if self.early_attempted && !self.early_decided {
+            return;
+        }
+        let first = self
+            .sent
+            .iter()
+            .filter_map(|packet| packet.stream.map(|(offset, _)| offset))
+            .chain(self.retx.iter().map(|(offset, _)| *offset))
+            .min()
+            .unwrap_or(self.stream_sent)
+            .min(self.stream_sent);
+        if first > self.stream_base {
+            let advance = usize::try_from(first - self.stream_base).unwrap_or(usize::MAX);
+            let advance = advance.min(self.stream_data.len());
+            self.stream_data.drain(..advance);
+            self.stream_base = self.stream_base.saturating_add(advance as u64);
+        }
+    }
+
+    fn feed_crypto(&mut self, space: usize, offset: u64, data: &[u8]) -> Result<(), String> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.crypto_recv[space].insert(offset, data.to_vec());
+        loop {
+            let next = self.crypto_next[space];
+            let Some(offset) = self.crypto_recv[space].keys().next().copied() else {
+                break;
+            };
+            if offset > next {
+                break;
+            }
+            let Some(data) = self.crypto_recv[space].remove(&offset) else {
+                break;
+            };
+            let skip = usize::try_from(next.saturating_sub(offset)).unwrap_or(0);
+            if skip >= data.len() {
+                continue;
+            }
+            let chunk_len = data.len() - skip;
+            self.tls
+                .read_hs(&data[skip..])
+                .map_err(|error| format!("psiphon quic tls: {error}"))?;
+            self.crypto_next[space] = next.saturating_add(chunk_len as u64);
+            self.pump_tls()?;
+        }
+        Ok(())
+    }
+
+    /// Place one stream frame at its offset and drain whatever became contiguous.
+    fn feed_stream(&mut self, offset: u64, data: &[u8], fin: bool) -> Result<(), String> {
+        let end = offset.saturating_add(data.len() as u64);
+        if end > self.max_stream || end > self.max_data {
+            return Err("psiphon quic: stream flow control violated".to_owned());
+        }
+        if fin {
+            self.recv_fin = true;
+            self.recv_fin_at = end;
+        }
+        if data.is_empty() {
+            if self.recv_fin && self.recv_next >= self.recv_fin_at {
+                self.recv_eof = true;
+            }
+            return Ok(());
+        }
+        if self.recv_map.is_empty() && offset <= self.recv_next {
+            let skip = usize::try_from(self.recv_next - offset).unwrap_or(usize::MAX);
+            if skip < data.len() {
+                self.received.extend_from_slice(&data[skip..]);
+                self.recv_next = end;
+            }
+        } else if offset < self.recv_next {
+            let skip = usize::try_from(self.recv_next - offset).unwrap_or(usize::MAX);
+            if skip < data.len() {
+                self.recv_map
+                    .entry(self.recv_next)
+                    .or_insert_with(|| data[skip..].to_vec());
+            }
+        } else {
+            self.recv_map.entry(offset).or_insert_with(|| data.to_vec());
+        }
+        loop {
+            let next = self.recv_next;
+            let Some(offset) = self.recv_map.keys().next().copied() else {
+                break;
+            };
+            if offset > next {
+                break;
+            }
+            let Some(data) = self.recv_map.remove(&offset) else {
+                break;
+            };
+            let skip = usize::try_from(next.saturating_sub(offset)).unwrap_or(0);
+            if skip >= data.len() {
+                continue;
+            }
+            self.received.extend_from_slice(&data[skip..]);
+            self.recv_next = next.saturating_add((data.len() - skip) as u64);
+        }
+        if self.recv_fin && self.recv_next >= self.recv_fin_at && self.recv_map.is_empty() {
+            self.recv_eof = true;
+        }
+        Ok(())
+    }
+
+    fn release(&mut self, count: u64) {
+        self.recv_delivered = self.recv_delivered.saturating_add(count);
+        if self.recv_delivered + STREAM_WINDOW / 2 > self.max_stream {
+            self.max_stream = self.recv_delivered + STREAM_WINDOW;
+            self.max_data = self.recv_delivered + INITIAL_WINDOW;
+            self.window_update = true;
+        }
+    }
+
+    /// Move received bytes into the caller's buffer, swapping the whole window when it fits.
+    fn pull_received(&mut self, out: &mut Vec<u8>, limit: usize) -> usize {
+        if out.is_empty() && limit >= self.received.len() {
+            std::mem::swap(out, &mut self.received);
+            return out.len();
+        }
+        let count = self.received.len().min(limit);
+        out.extend_from_slice(&self.received[..count]);
+        self.received.drain(..count);
+        count
+    }
+
+    fn queue_stream(&mut self, data: &[u8]) -> usize {
+        if !self.opened {
+            return 0;
+        }
+        let queued_end = self.stream_base + self.stream_data.len() as u64;
+        let limit = self.stream.min(self.data);
+        let room = limit.saturating_sub(queued_end);
+        let count = usize::try_from(room.min(data.len() as u64)).unwrap_or(0);
+        self.stream_data.extend_from_slice(&data[..count]);
+        count
+    }
+}
+
+fn discardable(error: &str) -> bool {
+    error.starts_with("psiphon quic header:") || error.starts_with("psiphon quic decrypt:")
+}
+
+fn drive(shared: &Arc<Shared>, mut udp: Udp, mut engine: Engine) {
+    let mut datagram = vec![0u8; 65535];
+    loop {
+        let now = Instant::now();
+        {
+            let mut state = lock(&shared.state);
+            let mut wrote = false;
+            loop {
+                let (empty, count) = {
+                    let Some(front) = state.send.front_mut() else {
+                        break;
+                    };
+                    if front.is_empty() {
+                        (true, 0)
+                    } else {
+                        let count = engine.queue_stream(front);
+                        if count == 0 {
+                            break;
+                        }
+                        front.drain(..count);
+                        (front.is_empty(), count)
+                    }
+                };
+                if count > 0 {
+                    state.send_bytes = state.send_bytes.saturating_sub(count);
+                    wrote = true;
+                }
+                if empty {
+                    state.send.pop_front();
+                }
+            }
+            if wrote {
+                shared.writable.notify_all();
+            }
+        }
+
+        let mut pulled = 0u64;
+        {
+            let mut state = lock(&shared.state);
+            if state.read_at > 0 {
+                let read_at = state.read_at;
+                state.recv.drain(..read_at);
+                state.read_at = 0;
+            }
+            let room = MAX_RECV_QUEUE.saturating_sub(state.recv.len());
+            if room > 0 {
+                pulled = engine.pull_received(&mut state.recv, room) as u64;
+            }
+            if pulled > 0 {
+                shared.readable.notify_all();
+            }
+            if engine.recv_eof && engine.received.is_empty() {
+                state.eof = true;
+                shared.readable.notify_all();
+            }
+        }
+        if pulled > 0 {
+            engine.release(pulled);
+        }
+
+        let close = {
+            let mut state = lock(&shared.state);
+            if Arc::strong_count(shared) == 1 {
+                state.close_requested = true;
+            }
+            state.close_requested
+        };
+        if close {
+            if !engine.close_sent {
+                let now = Instant::now();
+                let _ = engine.send_close(&mut udp, now);
+                engine.close_sent = true;
+            }
+            return;
+        }
+
+        if let Err(error) = engine.flush(&mut udp, now) {
+            fail(shared, &mut engine, error);
+            return;
+        }
+
+        let wait = engine.wait_timeout(Instant::now());
+        udp.set_read_timeout(Some(wait));
+        match udp.recv(&mut datagram) {
+            Ok(count) => {
+                let now = Instant::now();
+                if let Err(error) = engine.receive(&mut datagram[..count], now) {
+                    if !discardable(&error) {
+                        fail(shared, &mut engine, error);
+                        return;
+                    }
+                }
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(error) => {
+                fail(
+                    shared,
+                    &mut engine,
+                    format!("psiphon quic receive failed: {error}"),
+                );
+                return;
+            }
+        }
+    }
+}
+
+impl Engine {
+    /// Send the `CONNECTION_CLOSE` frame in the narrowest space this engine has keys for.
+    fn send_close(&mut self, udp: &mut Udp, now: Instant) -> Result<(), String> {
+        let space = if self.one_rtt.is_some() {
+            ONE_RTT
+        } else if self.handshake.is_some() {
+            HANDSHAKE
+        } else {
+            INITIAL
+        };
+        let head = if space == ONE_RTT {
+            1 + self.dcid.len() + 4
+        } else {
+            0
+        };
+        let mut payload = Vec::with_capacity(head + 8);
+        if head > 0 {
+            payload.resize(head, 0);
+        }
+        put_varint(&mut payload, 0x1c);
+        put_varint(&mut payload, 0);
+        put_varint(&mut payload, 0);
+        put_varint(&mut payload, 0);
+        if space == INITIAL {
+            self.pad_initial(&mut payload, self.next_pn[space]);
+        }
+        let pn = self.next_pn[space];
+        let packet = if space == ONE_RTT {
+            self.seal_short(pn, &mut payload, head)?;
+            payload
+        } else {
+            self.seal(space, pn, &payload)?
+        };
+        self.next_pn[space] += 1;
+        let _ = now;
+        udp.send(&packet)
+            .map_err(|error| format!("psiphon quic close failed: {error}"))?;
+        Ok(())
+    }
+}
+
+fn fail(shared: &Shared, engine: &mut Engine, why: impl Into<String>) {
+    let mut state = lock(&shared.state);
+    engine.pull_received(&mut state.recv, usize::MAX);
+    state.fail(why);
+    drop(state);
+    shared.readable.notify_all();
+    shared.writable.notify_all();
+}
+
+/// Build the rustls client config shared by every QUIC dial.
+fn client_config(
+    randomized: bool,
+    early: bool,
+    resume: bool,
+) -> Result<rustls::ClientConfig, String> {
+    let mut provider = rustls::crypto::ring::default_provider();
+    if randomized {
+        randomize_cipher_suites(&mut provider);
+        randomize_kx_groups(&mut provider);
+    }
+    provider.secure_random = &PASSTHROUGH_RANDOM;
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|error| format!("psiphon quic tls: {error}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier())
+        .with_client_cert_resolver(client_auth());
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    tls.resumption = if resume {
+        resumption()
+    } else {
+        Resumption::disabled()
+    };
+    tls.enable_early_data = early;
+    Ok(tls)
+}
+
+#[derive(Debug)]
+struct PassthroughRandom;
+
+static PASSTHROUGH_RANDOM: PassthroughRandom = PassthroughRandom;
+
+impl SecureRandom for PassthroughRandom {
+    fn fill(&self, buf: &mut [u8]) -> Result<(), rustls::crypto::GetRandomFailed> {
+        if buf.len() == 32 {
+            if let Some(message) = PENDING_RANDOM.with(|slot| slot.borrow_mut().take()) {
+                buf.copy_from_slice(&message);
+                return Ok(());
+            }
+        }
+        if buf.len() == 2 {
+            if let Some(seed) = PENDING_ORDER_SEED.with(|slot| slot.borrow_mut().take()) {
+                buf.copy_from_slice(&seed.to_be_bytes());
+                return Ok(());
+            }
+        }
+        getrandom::fill(buf).map_err(|_| rustls::crypto::GetRandomFailed)
+    }
+}
+
+#[derive(Debug)]
+struct NoVerify {
+    schemes: Vec<SignatureScheme>,
+}
+
+impl ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.schemes.clone()
+    }
+}
+
+/// Derive a stable synthetic SNI from the server address and proof key.
+fn quic_server_name(remote: SocketAddr, proof_key: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(remote.to_string().as_bytes());
+    hash.update(proof_key.as_bytes());
+    let digest = hash.finalize();
+    let mut name = String::with_capacity(16 + 4);
+    for byte in &digest[..8] {
+        name.push(char::from(b"0123456789abcdef"[usize::from(byte >> 4)]));
+        name.push(char::from(b"0123456789abcdef"[usize::from(byte & 0x0f)]));
+    }
+    name.push_str(".com");
+    name
+}
+
+/// Draw one probability coin from the system entropy source.
+fn coin(probability: f64) -> bool {
+    if probability <= 0.0 {
+        return false;
+    }
+    if probability >= 1.0 {
+        return true;
+    }
+    let draw = u16::try_from(draw_below(65_536)).unwrap_or(u16::MAX);
+    f64::from(draw) / 65_536.0 < probability
+}
+
+fn transport_params(scid: &[u8], randomized: bool) -> Vec<u8> {
+    let mut params = vec![
+        (0x01, varint_bytes(60_000)),
+        (0x03, varint_bytes(MAX_UDP_PAYLOAD)),
+        (0x04, varint_bytes(INITIAL_WINDOW)),
+        (0x05, varint_bytes(STREAM_WINDOW)),
+        (0x06, varint_bytes(STREAM_WINDOW)),
+        (0x08, varint_bytes(1)),
+        (0x0e, varint_bytes(2)),
+        (0x0f, scid.to_vec()),
+    ];
+    if randomized {
+        let mut grease = [0u8; 16];
+        let length = draw_below(grease.len());
+        crate::psiphon_ssh::dial_fill(&mut grease[..length]);
+        params.push((27 + 31 * draw_below(100) as u64, grease[..length].to_vec()));
+        shuffle(&mut params);
+    }
+    let mut encoded = Vec::new();
+    for (id, value) in params {
+        put_parameter(&mut encoded, id, &value);
+    }
+    encoded
+}
+
+/// A uniform draw below `bound` from the replay scope, so a seed reproduces the hello.
+fn draw_below(bound: usize) -> usize {
+    if bound == 0 {
+        return 0;
+    }
+    let mut bytes = [0u8; 8];
+    crate::psiphon_ssh::dial_fill(&mut bytes);
+    (u64::from_le_bytes(bytes) % bound as u64) as usize
+}
+
+fn shuffle<T>(items: &mut [T]) {
+    for at in (1..items.len()).rev() {
+        let other = draw_below(at + 1);
+        items.swap(at, other);
+    }
+}
+
+fn randomize_kx_groups(provider: &mut rustls::crypto::CryptoProvider) {
+    let mut groups = std::mem::take(&mut provider.kx_groups);
+    let key_share = groups
+        .iter()
+        .position(|group| u16::from(group.name()) == 0x001d);
+    if let Some(at) = key_share {
+        let x25519 = groups.remove(at);
+        shuffle(&mut groups);
+        while !groups.is_empty() && draw_below(2) == 0 {
+            groups.pop();
+        }
+        groups.insert(0, x25519);
+    } else {
+        shuffle(&mut groups);
+    }
+    provider.kx_groups = groups;
+}
+
+fn randomize_cipher_suites(provider: &mut rustls::crypto::CryptoProvider) {
+    let mut suites: Vec<_> = provider
+        .cipher_suites
+        .iter()
+        .copied()
+        .filter(|suite| suite.tls13().is_some())
+        .collect();
+    if suites.is_empty() {
+        return;
+    }
+    shuffle(&mut suites);
+    while suites.len() > 1 && draw_below(2) == 0 {
+        suites.pop();
+    }
+    provider.cipher_suites = suites;
+}
+
+fn put_parameter(params: &mut Vec<u8>, id: u64, value: &[u8]) {
+    put_varint(params, id);
+    put_varint(params, value.len() as u64);
+    params.extend_from_slice(value);
+}
+
+fn varint_bytes(value: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    put_varint(&mut bytes, value);
+    bytes
+}
+
+fn put_varint(buf: &mut Vec<u8>, value: u64) {
+    if value < 1 << 6 {
+        buf.push(value as u8);
+    } else if value < 1 << 14 {
+        buf.extend_from_slice(&((value as u16) | 0x4000).to_be_bytes());
+    } else if value < 1 << 30 {
+        buf.extend_from_slice(&((value as u32) | 0x8000_0000).to_be_bytes());
+    } else {
+        buf.extend_from_slice(&(value | 0xC000_0000_0000_0000).to_be_bytes());
+    }
+}
+
+fn get_varint(buf: &[u8], at: &mut usize) -> Option<u64> {
+    let first = *buf.get(*at)?;
+    let len = 1usize << (first >> 6);
+    let end = at.checked_add(len)?;
+    if end > buf.len() {
+        return None;
+    }
+    // The four widths are one, two, four and eight octets, so eight bytes from the varint's start hold the whole field whenever they are in the buffer. One big-endian load, a shift past the octets this width does not use, and a mask past its two prefix bits give the value; the eight-octet width takes a zero shift through the same expression and masks only the prefix.
+    if let Some(word) = buf
+        .get(*at..)
+        .and_then(|rest| rest.get(..8))
+        .and_then(|word| <[u8; 8]>::try_from(word).ok())
+    {
+        let bits = len * 8 - 2;
+        *at = end;
+        return Some((u64::from_be_bytes(word) >> (64 - len * 8)) & ((1u64 << bits) - 1));
+    }
+    let mut value = u64::from(first & 0x3f);
+    for index in 1..len {
+        value = (value << 8) | u64::from(buf[*at + index]);
+    }
+    *at = end;
+    Some(value)
+}
+
+#[cfg(test)]
+fn get_varint_byte(buf: &[u8], at: &mut usize) -> Option<u64> {
+    let first = *buf.get(*at)?;
+    let len = 1usize << (first >> 6);
+    if *at + len > buf.len() {
+        return None;
+    }
+    let mut value = u64::from(first & 0x3f);
+    for index in 1..len {
+        value = (value << 8) | u64::from(buf[*at + index]);
+    }
+    *at += len;
+    Some(value)
+}
+
+/// Encode the received packet numbers as an ACK frame from a stack-backed range array.
+fn put_ack(buf: &mut Vec<u8>, seen: &[u64]) {
+    let mut iter = seen.iter().rev();
+    let Some(&largest) = iter.next() else {
+        return;
+    };
+    let mut ranges = [(0u64, 0u64); 32];
+    let mut count = 0usize;
+    let mut high = largest;
+    let mut low = largest;
+    for &pn in iter {
+        if pn + 1 == low {
+            low = pn;
+        } else if count >= 31 {
+            break;
+        } else {
+            ranges[count] = (low, high);
+            count += 1;
+            low = pn;
+            high = pn;
+        }
+    }
+    ranges[count] = (low, high);
+    count += 1;
+    buf.push(0x02);
+    put_varint(buf, ranges[0].1);
+    put_varint(buf, 0);
+    put_varint(buf, (count - 1) as u64);
+    put_varint(buf, ranges[0].1 - ranges[0].0);
+    for pair in ranges[..count].windows(2) {
+        let (previous, _) = pair[0];
+        let (low, high) = pair[1];
+        put_varint(buf, previous.saturating_sub(high).saturating_sub(2));
+        put_varint(buf, high - low);
+    }
+}
+
+fn decode_pn(truncated: u64, bits: u32, largest: u64) -> u64 {
+    let expected = largest.wrapping_add(1);
+    let window = 1u64 << bits;
+    let half = window / 2;
+    let mask = window - 1;
+    let candidate = (expected & !mask) | truncated;
+    if candidate + half <= expected {
+        candidate.wrapping_add(window)
+    } else if candidate > expected.wrapping_add(half) && candidate >= window {
+        candidate - window
+    } else {
+        candidate
+    }
+}
+
+fn long_header_len(initial: bool, dcid_len: usize, scid_len: usize, pn_len: usize) -> usize {
+    1 + 4 + 1 + dcid_len + 1 + scid_len + usize::from(initial) + 2 + pn_len
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        discardable, get_varint, get_varint_byte, lock, mint_obfuscated_sessions, noise_expand,
+        quic_server_name, randomize_cipher_suites, randomize_kx_groups, sessions, transport_params,
+        Engine, ObfuscatedUdp, PacketIo, QuicNoise, SentPacket, Udp, HANDSHAKE, INITIAL,
+        INITIAL_CWND, INPROXY_PACKET_ADJUSTMENT, MAX_PACKET_SIZE, MAX_PAYLOAD, MIN_DATAGRAM,
+        OBFUSCATION_OVERHEAD, ONE_RTT, PASSTHROUGH_RANDOM, PENDING_ORDER_SEED, PMTU_BACKOFF,
+        PMTU_MIN_STEP, PMTU_STEP,
+    };
+    use rustls::client::ClientSessionMemoryCache;
+    use rustls::crypto::SecureRandom as _;
+    use rustls::pki_types::ServerName;
+    use std::collections::VecDeque;
+    use std::io::Read as _;
+    use std::net::{SocketAddr, UdpSocket};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn test_engine() -> Engine {
+        Engine::new(
+            "test",
+            false,
+            false,
+            true,
+            MAX_PACKET_SIZE,
+            "test.psiphon".to_owned(),
+            false,
+            None,
+        )
+        .expect("engine")
+    }
+
+    fn client_keys(engine: &Engine) -> rustls::quic::Keys {
+        let suite = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .and_then(rustls::Tls13CipherSuite::quic_suite)
+            .expect("quic suite");
+        suite.keys(
+            &engine.dcid,
+            rustls::Side::Client,
+            rustls::quic::Version::V1,
+        )
+    }
+
+    fn ready_engine() -> Engine {
+        let mut engine = test_engine();
+        engine.one_rtt = Some(client_keys(&engine));
+        engine.opened = true;
+        engine.disable_path_mtu = false;
+        engine.max_datagram = 1200;
+        engine.packet_limit = MAX_PACKET_SIZE;
+        engine
+    }
+
+    #[test]
+    fn discarding_a_space_releases_its_keys_and_flight() {
+        let mut engine = ready_engine();
+        engine.initial = Some(client_keys(&engine));
+        engine.handshake = Some(client_keys(&engine));
+        engine.bytes_in_flight = 1500;
+        engine.sent.push(SentPacket {
+            pn: 1,
+            space: INITIAL,
+            sent_at: Instant::now(),
+            size: 1200,
+            crypto: None,
+            stream: None,
+            window: false,
+            early: false,
+            probe: None,
+        });
+        engine.sent.push(SentPacket {
+            pn: 2,
+            space: HANDSHAKE,
+            sent_at: Instant::now(),
+            size: 300,
+            crypto: None,
+            stream: None,
+            window: false,
+            early: false,
+            probe: None,
+        });
+        engine.crypto_send[INITIAL].extend_from_slice(b"unsent");
+        engine.crypto_recv[INITIAL].insert(0, b"seen".to_vec());
+        engine.ack_seen[INITIAL].push(1);
+        engine.ack_pending[INITIAL] = true;
+        engine.discard_space(INITIAL);
+        assert!(engine.initial.is_none());
+        assert!(engine.handshake.is_some());
+        assert_eq!(engine.bytes_in_flight, 300);
+        assert_eq!(engine.sent.len(), 1);
+        assert_eq!(engine.sent[0].space, HANDSHAKE);
+        assert_eq!(engine.crypto_send[INITIAL].len(), 0);
+        assert_eq!(engine.crypto_recv[INITIAL].len(), 0);
+        assert_eq!(engine.ack_seen[INITIAL].len(), 0);
+        assert!(!engine.ack_pending[INITIAL]);
+    }
+
+    #[test]
+    fn a_server_cid_is_accepted_once() {
+        let mut engine = test_engine();
+        engine.accept_server_cid(b"server");
+        assert_eq!(engine.dcid.as_slice(), &b"server"[..]);
+        engine.accept_server_cid(b"forged");
+        assert_eq!(engine.dcid.as_slice(), &b"server"[..]);
+        let mut empty = test_engine();
+        empty.accept_server_cid(b"");
+        assert_eq!(empty.dcid.len(), 0);
+    }
+
+    #[test]
+    fn an_unauthenticated_long_header_is_discardable() {
+        let mut engine = test_engine();
+        let mut version_negotiation = vec![0x80, 0, 0, 0, 0, 0, 0];
+        let error = engine
+            .receive(&mut version_negotiation, Instant::now())
+            .expect_err("version negotiation");
+        assert!(discardable(&error), "{error}");
+        let mut retry = vec![0xf0, 0, 0, 0, 1, 0, 0];
+        let error = engine
+            .receive(&mut retry, Instant::now())
+            .expect_err("retry");
+        assert!(discardable(&error), "{error}");
+    }
+
+    #[test]
+    fn handshake_done_discards_the_handshake_space() {
+        let mut engine = ready_engine();
+        engine.handshake = Some(client_keys(&engine));
+        engine
+            .handle_frames(ONE_RTT, &[0x1e], Instant::now())
+            .expect("handshake done");
+        assert!(engine.handshake.is_none());
+    }
+
+    #[test]
+    fn quic_noise_presets_match_the_reference() {
+        assert!(QuicNoise::lookup("").is_none());
+        assert!(QuicNoise::lookup("off").is_none());
+        let light = QuicNoise::lookup("light").expect("light");
+        assert_eq!(
+            (
+                light.before,
+                light.after_first,
+                light.junk_min,
+                light.junk_max
+            ),
+            (1, 0, 32, 96)
+        );
+        assert_eq!(light.first, "<b 0d0a0d0a><t><r 16>");
+        assert_eq!(light.second, "");
+        let gfw = QuicNoise::lookup("AGGRESSIVE").expect("gfw");
+        assert_eq!(
+            (gfw.before, gfw.after_first, gfw.junk_min, gfw.junk_max),
+            (2, 1, 64, 256)
+        );
+        assert_eq!(gfw.second, "<r 32>");
+        let firewall = QuicNoise::lookup("anything else").expect("firewall");
+        assert_eq!(
+            (
+                firewall.before,
+                firewall.after_first,
+                firewall.junk_min,
+                firewall.junk_max
+            ),
+            (2, 2, 48, 190)
+        );
+        assert_eq!(firewall.second, "<r 48>");
+    }
+
+    #[test]
+    fn quic_noise_expands_the_reference_spec() {
+        let first = noise_expand("<b 0d0a0d0a><t><r 16>");
+        assert_eq!(&first[..4], &[0x0d, 0x0a, 0x0d, 0x0a]);
+        assert_eq!(first.len(), 24);
+        assert_eq!(noise_expand("").len(), 0);
+        assert_eq!(noise_expand("<r 2000>").len(), 1024);
+        assert!(noise_expand("<rc 32>").iter().all(u8::is_ascii_alphabetic));
+        assert!(noise_expand("<rd 32>").iter().all(u8::is_ascii_digit));
+    }
+
+    #[test]
+    fn randomized_transport_parameters_replay_from_the_dial_seed() {
+        let scope = crate::psiphon_ssh::dial_seed_scope([7u8; 32]);
+        let first = transport_params(&[1u8; 16], true);
+        drop(scope);
+        let scope = crate::psiphon_ssh::dial_seed_scope([7u8; 32]);
+        let second = transport_params(&[1u8; 16], true);
+        drop(scope);
+        assert_eq!(first, second);
+    }
+
+    fn parameter_ids(encoded: &[u8]) -> Vec<u64> {
+        let mut ids = Vec::new();
+        let mut at = 0;
+        while at < encoded.len() {
+            let id = get_varint(encoded, &mut at).expect("parameter id");
+            let length = get_varint(encoded, &mut at).expect("parameter length");
+            at += usize::try_from(length).expect("parameter length");
+            ids.push(id);
+        }
+        ids
+    }
+
+    #[test]
+    fn the_word_read_is_the_byte_walk_at_every_width_and_buffer_end() {
+        for value in [
+            0,
+            1,
+            0x3f,
+            0x40,
+            0x3fff,
+            0x4000,
+            (1 << 30) - 1,
+            1 << 30,
+            (1 << 62) - 1,
+        ] {
+            let mut encoded = Vec::new();
+            super::put_varint(&mut encoded, value);
+            for pad in 0..12usize {
+                let mut buf = encoded.clone();
+                buf.resize(buf.len() + pad, 0);
+                let (mut word_at, mut byte_at) = (0usize, 0usize);
+                let word = get_varint(&buf, &mut word_at);
+                let byte = get_varint_byte(&buf, &mut byte_at);
+                assert_eq!(word, byte, "{value} with {pad} trailing octets");
+                assert_eq!(word_at, byte_at, "{value} with {pad} trailing octets");
+                assert_eq!(word, Some(value));
+            }
+            for cut in 0..encoded.len() {
+                let mut at = 0usize;
+                assert_eq!(
+                    get_varint(&encoded[..cut], &mut at),
+                    None,
+                    "{value} cut at {cut}"
+                );
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn word_varint_probe(buf: &[u8]) -> u64 {
+        let mut sum = 0u64;
+        for _ in 0..4096 {
+            let mut at = 0usize;
+            sum = sum
+                .wrapping_add(get_varint(std::hint::black_box(buf), &mut at).unwrap_or_default());
+        }
+        sum
+    }
+
+    #[inline(never)]
+    fn byte_varint_probe(buf: &[u8]) -> u64 {
+        let mut sum = 0u64;
+        for _ in 0..4096 {
+            let mut at = 0usize;
+            sum = sum.wrapping_add(
+                get_varint_byte(std::hint::black_box(buf), &mut at).unwrap_or_default(),
+            );
+        }
+        sum
+    }
+
+    #[test]
+    fn the_word_varint_read_costs_the_load_and_nothing_else() {
+        let mut encoded = Vec::new();
+        super::put_varint(&mut encoded, (1 << 62) - 1);
+        let mut buf = [0u8; 16];
+        buf[..8].copy_from_slice(&encoded);
+        buf[8..].copy_from_slice(&encoded);
+        assert_eq!(word_varint_probe(&buf), byte_varint_probe(&buf));
+    }
+
+    #[test]
+    fn the_byte_varint_walk_costs_the_same_answer() {
+        let mut encoded = Vec::new();
+        super::put_varint(&mut encoded, (1 << 62) - 1);
+        let mut buf = [0u8; 16];
+        buf[..8].copy_from_slice(&encoded);
+        buf[8..].copy_from_slice(&encoded);
+        assert_eq!(byte_varint_probe(&buf), word_varint_probe(&buf));
+    }
+
+    #[test]
+    fn randomized_transport_parameters_grease_and_shuffle_their_order() {
+        assert_eq!(
+            parameter_ids(&transport_params(&[7u8; 16], false)),
+            vec![0x01, 0x03, 0x04, 0x05, 0x06, 0x08, 0x0e, 0x0f]
+        );
+        let mut orders = std::collections::BTreeSet::new();
+        for _ in 0..8 {
+            let encoded = transport_params(&[7u8; 16], true);
+            let ids = parameter_ids(&encoded);
+            for wanted in [0x01, 0x03, 0x04, 0x05, 0x06, 0x08, 0x0e, 0x0f] {
+                assert!(ids.contains(&wanted), "missing {wanted:#x}");
+            }
+            assert!(ids
+                .iter()
+                .any(|id| *id >= 27 && *id <= 3096 && (*id - 27) % 31 == 0));
+            orders.insert(format!("{ids:?}"));
+        }
+        assert!(orders.len() > 1, "the order never moved");
+    }
+
+    #[test]
+    fn randomized_cipher_suites_stay_tls13() {
+        let mut provider = rustls::crypto::ring::default_provider();
+        randomize_cipher_suites(&mut provider);
+        let first = provider
+            .cipher_suites
+            .first()
+            .expect("a TLS 1.3 suite survives");
+        assert!(first.tls13().is_some());
+        assert!(provider
+            .cipher_suites
+            .iter()
+            .all(|suite| suite.tls13().is_some()));
+    }
+
+    #[test]
+    fn randomized_key_groups_keep_x25519_as_the_key_share() {
+        let mut provider = rustls::crypto::ring::default_provider();
+        randomize_kx_groups(&mut provider);
+        let first = provider.kx_groups.first().expect("a group");
+        assert_eq!(u16::from(first.name()), 0x001d);
+    }
+
+    #[test]
+    fn obfuscated_udp_round_trips_every_packet_length() {
+        let left = UdpSocket::bind(("127.0.0.1", 0)).expect("left socket");
+        let right = UdpSocket::bind(("127.0.0.1", 0)).expect("right socket");
+        left.connect(right.local_addr().expect("right address"))
+            .expect("left connect");
+        right
+            .connect(left.local_addr().expect("left address"))
+            .expect("right connect");
+        left.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("left timeout");
+        right
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("right timeout");
+        let key = [0x5au8; 32];
+        let mut sender = ObfuscatedUdp {
+            io: PacketIo::Socket(right),
+            key,
+            nonce: [0u8; 12],
+            nonce_transform: None,
+            decoy: None,
+            limit: MAX_PACKET_SIZE,
+        };
+        let mut receiver = ObfuscatedUdp {
+            io: PacketIo::Socket(left),
+            key,
+            nonce: [0u8; 12],
+            nonce_transform: None,
+            decoy: None,
+            limit: MAX_PACKET_SIZE,
+        };
+        for length in [1usize, 13, 64, 255, 1199, 1200, 1267] {
+            let plain: Vec<u8> = (0..length).map(|index| index as u8 | 0x40).collect();
+            sender.send(&plain).expect("send");
+            let mut buffer = vec![0u8; MAX_PACKET_SIZE];
+            let count = receiver.recv(&mut buffer).expect("receive");
+            assert_eq!(&buffer[..count], &plain[..], "length {length}");
+        }
+        assert!(sender
+            .send(&vec![0u8; MAX_PACKET_SIZE - OBFUSCATION_OVERHEAD + 1])
+            .is_err());
+    }
+
+    #[test]
+    fn in_order_stream_data_lands_without_a_staging_allocation() {
+        let mut engine = test_engine();
+        engine.received.reserve(4096);
+        engine.feed_stream(0, &[7u8; 1200], false).expect("first");
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            engine
+                .feed_stream(1200, &[9u8; 1200], false)
+                .expect("second");
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "the in-order path appends into the receive window"
+        );
+        assert_eq!(engine.recv_next, 2400);
+        assert_eq!(&engine.received[1200..], &[9u8; 1200][..]);
+    }
+
+    #[test]
+    fn a_gap_is_filled_by_the_packet_before_it() {
+        let mut engine = test_engine();
+        engine.feed_stream(4, b"efgh", false).expect("tail");
+        engine.feed_stream(0, b"abcd", false).expect("head");
+        assert_eq!(engine.received.as_slice(), b"abcdefgh");
+        assert_eq!(engine.recv_next, 8);
+    }
+
+    #[test]
+    fn pull_received_hands_the_buffer_over_without_copying() {
+        let mut engine = test_engine();
+        engine.feed_stream(0, b"hello", false).expect("data");
+        let mut out = Vec::new();
+        let (count, counts) =
+            ferrox_core::alloc_count::measure(|| engine.pull_received(&mut out, 8));
+        assert_eq!(count, 5);
+        assert_eq!(out.as_slice(), b"hello");
+        assert_eq!(counts.allocs, 0, "the window is swapped, not copied");
+        assert!(engine.received.is_empty(), "the window was handed over");
+    }
+
+    #[test]
+    fn expire_retransmits_the_old_prefix_and_drops_it() {
+        let mut engine = test_engine();
+        engine.cwnd = INITIAL_CWND * 2;
+        engine.stream_sent = 400;
+        engine.stream_data = vec![0u8; 400];
+        engine.bytes_in_flight = 400;
+        let base = Instant::now();
+        engine.sent = (0..4)
+            .map(|index| SentPacket {
+                pn: index,
+                space: ONE_RTT,
+                sent_at: base + Duration::from_millis(index * 10),
+                size: 100,
+                crypto: None,
+                stream: Some((index * 100, 100)),
+                window: false,
+                early: false,
+                probe: None,
+            })
+            .collect();
+        engine.expire(base + Duration::from_millis(1000));
+        assert!(engine.sent.is_empty(), "the expired prefix is gone");
+        assert_eq!(engine.bytes_in_flight, 0);
+        assert_eq!(
+            engine.retx.iter().copied().collect::<Vec<_>>(),
+            vec![(0, 100), (100, 100), (200, 100), (300, 100)]
+        );
+        assert_eq!(engine.cwnd, INITIAL_CWND);
+    }
+
+    #[test]
+    fn ack_keeps_unacked_packets_in_order() {
+        let mut engine = test_engine();
+        engine.bytes_in_flight = 500;
+        let base = Instant::now();
+        engine.sent = (0..5)
+            .map(|index| SentPacket {
+                pn: index,
+                space: ONE_RTT,
+                sent_at: base + Duration::from_millis(index * 10),
+                size: 100,
+                crypto: None,
+                stream: None,
+                window: false,
+                early: false,
+                probe: None,
+            })
+            .collect();
+        engine.ack(ONE_RTT, &[(1, 1), (3, 3)], base + Duration::from_millis(50));
+        let left: Vec<u64> = engine.sent.iter().map(|packet| packet.pn).collect();
+        assert_eq!(left, vec![0, 2, 4]);
+        assert_eq!(engine.bytes_in_flight, 300);
+    }
+
+    #[test]
+    fn an_inproxy_initial_fits_the_media_payload() {
+        let mut engine = test_engine();
+        engine.packet_limit = MIN_DATAGRAM - INPROXY_PACKET_ADJUSTMENT;
+        engine.max_datagram = engine.packet_limit;
+        let mut payload = Vec::new();
+        engine.pad_initial(&mut payload, 0);
+        let packet = engine.seal(INITIAL, 0, &payload).expect("initial");
+        assert!(packet.len() <= engine.packet_limit);
+    }
+
+    #[test]
+    fn a_direct_quic_initial_reaches_the_minimum_datagram_size() {
+        let mut engine = test_engine();
+        engine.packet_limit = MAX_PACKET_SIZE;
+        engine.max_datagram = 1200;
+        let mut payload = Vec::new();
+        engine.pad_initial(&mut payload, 0);
+        let packet = engine.seal(INITIAL, 0, &payload).expect("initial");
+        assert_eq!(packet.len(), 1200);
+    }
+
+    #[test]
+    fn a_path_mtu_probe_commits_only_on_ack() {
+        let mut engine = test_engine();
+        engine.max_datagram = 1200;
+        engine.packet_limit = MAX_PACKET_SIZE;
+        engine.probe_inflight = true;
+        engine.probe_step = 50;
+        engine.probe_losses = 2;
+        engine.probe_retry_at = Some(Instant::now());
+        engine.sent.push(SentPacket {
+            pn: 7,
+            space: ONE_RTT,
+            sent_at: Instant::now(),
+            size: 1300,
+            crypto: None,
+            stream: None,
+            window: false,
+            early: false,
+            probe: Some(1300),
+        });
+        engine.ack(ONE_RTT, &[(7, 7)], Instant::now());
+        assert_eq!(engine.max_datagram, 1300);
+        assert_eq!(engine.probe_step, PMTU_STEP);
+        assert_eq!(engine.probe_losses, 0);
+        assert!(engine.probe_retry_at.is_none());
+        assert!(engine.probe_size.is_none());
+        assert!(engine.probe_target.is_none());
+        assert!(!engine.probe_inflight);
+    }
+
+    #[test]
+    fn a_lost_path_mtu_probe_backs_off_before_stopping() {
+        let mut engine = ready_engine();
+        let sent_at = Instant::now();
+        engine.cwnd = INITIAL_CWND * 2;
+        engine.probe_inflight = true;
+        engine.probe_size = Some(1300);
+        engine.sent.push(SentPacket {
+            pn: 7,
+            space: ONE_RTT,
+            sent_at,
+            size: 1300,
+            crypto: None,
+            stream: None,
+            window: false,
+            early: false,
+            probe: Some(1300),
+        });
+        engine.expire(sent_at + Duration::from_secs(10));
+        assert!(!engine.probe_failed);
+        assert!(!engine.probe_inflight);
+        assert_eq!(engine.probe_step, 50);
+        assert_eq!(engine.probe_losses, 1);
+        assert_eq!(
+            engine.cwnd,
+            INITIAL_CWND * 2,
+            "a probe loss is not congestion"
+        );
+        engine.plan_probe(sent_at + Duration::from_secs(10));
+        assert!(engine.probe_target.is_none());
+        engine.plan_probe(sent_at + Duration::from_secs(10) + PMTU_BACKOFF);
+        assert_eq!(engine.probe_target, Some(engine.max_datagram + 50));
+        engine.probe_lost(sent_at);
+        engine.probe_lost(sent_at);
+        assert_eq!(engine.probe_step, PMTU_MIN_STEP);
+        assert!(!engine.probe_failed);
+        engine.probe_lost(sent_at);
+        assert!(engine.probe_failed);
+        assert!(engine.probe_retry_at.is_none());
+    }
+
+    #[test]
+    fn a_clamped_probe_that_fails_stops_instead_of_repeating_itself() {
+        let mut engine = ready_engine();
+        engine.max_datagram = engine.packet_limit - 10;
+        engine.probe_size = Some(engine.packet_limit);
+        engine.probe_lost(Instant::now());
+        assert!(engine.probe_failed);
+        assert!(engine.probe_target.is_none());
+        assert!(engine.probe_retry_at.is_none());
+    }
+
+    #[test]
+    fn a_packet_limit_probe_retries_a_smaller_size_when_one_fits() {
+        let mut engine = ready_engine();
+        engine.max_datagram = engine.packet_limit - 100;
+        engine.probe_size = Some(engine.packet_limit);
+        let now = Instant::now();
+        engine.probe_lost(now);
+        assert!(!engine.probe_failed);
+        assert_eq!(engine.probe_step, 50);
+        engine.plan_probe(now + PMTU_BACKOFF);
+        assert_eq!(engine.probe_target, Some(engine.packet_limit - 50));
+    }
+
+    #[test]
+    fn a_path_mtu_probe_carries_no_stream_bytes() {
+        let mut engine = ready_engine();
+        engine.stream_data = vec![0u8; 4000];
+        engine.data = 4000;
+        engine.stream = 4000;
+        engine.bidi = 1;
+        engine.probe_target = Some((engine.max_datagram + PMTU_STEP).min(engine.packet_limit));
+        let target = engine.probe_target.expect("probe target");
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("timeout");
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("socket");
+        socket
+            .connect(receiver.local_addr().expect("receiver address"))
+            .expect("connect");
+        let mut udp = Udp::Plain(PacketIo::Socket(socket));
+        assert!(engine
+            .send_space(ONE_RTT, &mut udp, Instant::now())
+            .expect("probe"));
+        let mut datagram = [0u8; MAX_PACKET_SIZE + 64];
+        assert_eq!(
+            receiver.recv(&mut datagram).expect("probe datagram"),
+            target
+        );
+        assert_eq!(engine.stream_sent, 0, "the probe carried stream bytes");
+        assert_eq!(engine.sent.last().expect("probe packet").stream, None);
+        assert!(engine.probe_inflight);
+        assert!(engine
+            .send_space(ONE_RTT, &mut udp, Instant::now())
+            .expect("data"));
+        assert!(
+            engine.stream_sent > 0,
+            "the stream did not follow the probe"
+        );
+    }
+
+    #[test]
+    fn a_crypto_frame_advances_its_send_cursor() {
+        let mut engine = test_engine();
+        engine.crypto_send[INITIAL] = vec![0xab; 3000];
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("timeout");
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("socket");
+        socket
+            .connect(receiver.local_addr().expect("receiver address"))
+            .expect("connect");
+        let mut udp = Udp::Plain(PacketIo::Socket(socket));
+        assert!(engine
+            .send_space(INITIAL, &mut udp, Instant::now())
+            .expect("first crypto frame"));
+        let first = engine.crypto_sent[INITIAL];
+        assert!(first > 0, "the first crypto frame sent nothing");
+        assert!(engine
+            .send_space(INITIAL, &mut udp, Instant::now())
+            .expect("second crypto frame"));
+        assert!(
+            engine.crypto_sent[INITIAL] > first,
+            "the crypto cursor did not advance, so a multi-packet handshake stalls"
+        );
+        let mut datagram = [0u8; MAX_PACKET_SIZE + 64];
+        let target = engine.max_datagram.min(MAX_PAYLOAD);
+        let first_len = receiver.recv(&mut datagram).expect("first datagram");
+        assert!(first_len <= target, "{first_len} > {target}");
+        let second_len = receiver.recv(&mut datagram).expect("second datagram");
+        assert!(second_len <= target, "{second_len} > {target}");
+    }
+
+    #[test]
+    fn a_failed_path_mtu_probe_send_backs_off() {
+        let mut engine = ready_engine();
+        engine.probe_target = Some((engine.max_datagram + PMTU_STEP).min(engine.packet_limit));
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("socket");
+        let mut udp = Udp::Plain(PacketIo::Socket(socket));
+        assert!(!engine
+            .send_space(ONE_RTT, &mut udp, Instant::now())
+            .expect("the probe send is contained"));
+        assert!(!engine.probe_failed);
+        assert!(!engine.probe_inflight);
+        assert_eq!(engine.probe_step, 50);
+        assert_eq!(engine.probe_losses, 1);
+        assert!(engine.probe_retry_at.is_some());
+        assert!(engine.probe_target.is_none());
+        assert!(engine.sent.is_empty());
+        assert_eq!(engine.bytes_in_flight, 0);
+    }
+
+    #[test]
+    fn an_early_rollback_restores_the_stream_prefix() {
+        let mut engine = test_engine();
+        engine.early_attempted = true;
+        engine.opened = true;
+        engine.stream_data = b"hello".to_vec();
+        engine.stream_sent = 5;
+        engine.bytes_in_flight = 1200;
+        engine.sent.push(SentPacket {
+            pn: 0,
+            space: ONE_RTT,
+            sent_at: Instant::now(),
+            size: 1200,
+            crypto: None,
+            stream: Some((0, 5)),
+            window: false,
+            early: true,
+            probe: None,
+        });
+        engine.rollback_early();
+        assert_eq!(engine.stream_sent, 0);
+        assert_eq!(engine.stream_data, b"hello");
+        assert_eq!(engine.bytes_in_flight, 0);
+        assert!(engine.sent.is_empty());
+    }
+
+    #[test]
+    fn the_next_two_byte_draw_is_the_extension_order_seed() {
+        PENDING_ORDER_SEED.with(|slot| *slot.borrow_mut() = Some(0x1234));
+        let mut buf = [0u8; 2];
+        PASSTHROUGH_RANDOM.fill(&mut buf).expect("fills");
+        assert_eq!(buf, [0x12, 0x34]);
+        assert!(PENDING_ORDER_SEED.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn a_quic_obfuscated_psk_is_minted_into_a_fresh_store() {
+        use rustls::client::ClientSessionStore;
+        let name = "minted.example";
+        let store: Arc<dyn ClientSessionStore> = Arc::new(ClientSessionMemoryCache::new(8));
+        mint_obfuscated_sessions(name, [7u8; 32], &store, 1).expect("mints");
+        let server_name = ServerName::try_from(name).expect("name").to_owned();
+        assert!(store.take_tls13_ticket(&server_name).is_some());
+    }
+
+    #[test]
+    fn a_quic_session_name_is_stable_per_server_and_key() {
+        let remote = SocketAddr::from(([192, 0, 2, 1], 443));
+        assert_eq!(
+            quic_server_name(remote, "key"),
+            quic_server_name(remote, "key")
+        );
+        assert_ne!(
+            quic_server_name(remote, "key"),
+            quic_server_name(remote, "other")
+        );
+    }
+
+    #[test]
+    fn a_terminal_failure_keeps_the_received_window() {
+        let mut engine = test_engine();
+        engine.received.extend_from_slice(b"late");
+        let shared = Arc::new(super::Shared {
+            state: Mutex::new(super::State {
+                send: VecDeque::new(),
+                send_bytes: 0,
+                recv: Vec::new(),
+                read_at: 0,
+                error: None,
+                eof: false,
+                write_closed: false,
+                close_requested: false,
+                timeout: None,
+                write_timeout: None,
+            }),
+            readable: Condvar::new(),
+            writable: Condvar::new(),
+        });
+        super::fail(&shared, &mut engine, "boom");
+        assert_eq!(engine.received.as_slice(), b"");
+        let mut stream = super::QuicStream { shared };
+        let mut out = [0u8; 8];
+        assert_eq!(stream.read(&mut out).expect("buffered"), 4);
+        assert_eq!(&out[..4], b"late");
+        assert!(stream.read(&mut out).is_err());
+    }
+
+    #[test]
+    fn omitted_fresh_grants_do_not_keep_remembered_credit() {
+        let mut engine = test_engine();
+        engine.data = 100;
+        engine.stream = 200;
+        engine.bidi = 300;
+        let mut params = Vec::new();
+        super::put_parameter(&mut params, 0x08, &super::varint_bytes(1));
+        let error = engine
+            .apply_peer_params(&params)
+            .expect_err("stream grant omitted");
+        assert!(error.contains("stream credit"));
+        assert_eq!((engine.data, engine.stream, engine.bidi), (0, 0, 1));
+    }
+
+    #[test]
+    fn remembered_limits_stay_at_the_handshake_grant() {
+        let mut engine = test_engine();
+        engine.session_name = "remembered-limits".to_owned();
+        engine.initial_limits = (10, 20, 30);
+        engine.data = 100;
+        engine.stream = 200;
+        engine.bidi = 300;
+        engine.remember();
+        let guard = lock(sessions());
+        let remembered = guard.get("remembered-limits").unwrap();
+        assert_eq!(
+            (remembered.data, remembered.stream, remembered.bidi),
+            (10, 20, 30)
+        );
+    }
+}
