@@ -1,0 +1,1588 @@
+//! The `sudoku` TCP mask: every plaintext byte becomes four disguised hint bytes, drawn from a
+//! per-password table of 4x4 grids, and the packed direction carries three plaintext bytes in four.
+//! The two directions are asymmetric in the reference: a client writes the pure stream and reads the
+//! packed one, a server the reverse, so the mask needs a reader where `fragment` needed only a writer.
+//!
+//! The table is derived, not stored: 288 grids in deterministic DFS order, 1820 four-cell clue sets,
+//! and a Go `math/rand` v1 shuffle seeded by the password's first eight SHA-256 octets put grid `b`
+//! at table slot `b`. That shuffle is the wire contract — a peer running the pinned reference derives
+//! the same table only if the draw is byte-identical — so [`go_rand`](super::go_rand) reproduces it.
+
+use std::fmt;
+use std::io::{self, Read, Write};
+use std::mem;
+use std::sync::Arc;
+
+use sha2::{Digest, Sha256};
+
+use super::go_rand::GoRand;
+use super::MaskRole;
+
+/// One read asks for this many wire octets at a time; the reference's own reader buffer.
+const READ_CHUNK: usize = 32 * 1024;
+
+/// The number of nondecreasing four-tuples of six-bit groups: `C(67, 4)`.
+const RANK_SPACE: usize = 766_480;
+const RANK_WORDS: usize = RANK_SPACE.div_ceil(64);
+
+/// The 4x4 Latin-square grids the table is drawn from.
+const GRID_COUNT: usize = 288;
+
+/// The derived grids and their one-grid clue sets, written by `build.rs`: a count, the grids, one
+/// two-byte offset per list plus its end, then each list's sorted four-byte clue sets.
+const PATTERN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sudoku_patterns.bin"));
+const GRIDS_AT: usize = 4;
+const OFFSETS_AT: usize = GRIDS_AT + GRID_COUNT * 16;
+const ENTRIES_AT: usize = OFFSETS_AT + (GRID_COUNT + 1) * 2;
+
+/// The 24 orderings of four hint bytes, in the reference's order.
+const PERM4: [[u8; 4]; 24] = [
+    [0, 1, 2, 3],
+    [0, 1, 3, 2],
+    [0, 2, 1, 3],
+    [0, 2, 3, 1],
+    [0, 3, 1, 2],
+    [0, 3, 2, 1],
+    [1, 0, 2, 3],
+    [1, 0, 3, 2],
+    [1, 2, 0, 3],
+    [1, 2, 3, 0],
+    [1, 3, 0, 2],
+    [1, 3, 2, 0],
+    [2, 0, 1, 3],
+    [2, 0, 3, 1],
+    [2, 1, 0, 3],
+    [2, 1, 3, 0],
+    [2, 3, 0, 1],
+    [2, 3, 1, 0],
+    [3, 0, 1, 2],
+    [3, 0, 2, 1],
+    [3, 1, 0, 2],
+    [3, 1, 2, 0],
+    [3, 2, 0, 1],
+    [3, 2, 1, 0],
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Entropy,
+    Ascii,
+    Custom,
+}
+
+/// One layout's byte arithmetic: how a six-bit group becomes a wire octet, which octets are hints,
+/// and which padding octets never decode as one.
+struct Layout {
+    mode: Mode,
+    hint_mask: u8,
+    hint_value: u8,
+    pad_marker: u8,
+    padding: Vec<u8>,
+    x_mask: u8,
+    p_bits: [u8; 2],
+    v_bits: [u8; 4],
+    hint_group: [u8; 256],
+    wire_group: [u8; 64],
+}
+
+impl fmt::Debug for Layout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Layout")
+            .field("mode", &self.mode)
+            .field("pad_marker", &self.pad_marker)
+            .field("padding", &self.padding.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Layout {
+    fn entropy() -> Self {
+        let mut padding = Vec::with_capacity(16);
+        for i in 0..8u8 {
+            padding.push(0x80 + i);
+            padding.push(0x10 + i);
+        }
+        let layout = Self {
+            mode: Mode::Entropy,
+            hint_mask: 0x90,
+            hint_value: 0,
+            pad_marker: 0x80,
+            padding,
+            x_mask: 0,
+            p_bits: [0; 2],
+            v_bits: [0; 4],
+            hint_group: [0; 256],
+            wire_group: [0; 64],
+        };
+        layout.with_hint_groups()
+    }
+
+    fn ascii() -> Self {
+        let layout = Self {
+            mode: Mode::Ascii,
+            hint_mask: 0x40,
+            hint_value: 0x40,
+            pad_marker: 0x3f,
+            padding: (0x20..0x40).collect(),
+            x_mask: 0,
+            p_bits: [0; 2],
+            v_bits: [0; 4],
+            hint_group: [0; 256],
+            wire_group: [0; 64],
+        };
+        layout.with_hint_groups()
+    }
+
+    fn custom(pattern: &str) -> Option<Self> {
+        let mut x_bits = [0u8; 2];
+        let mut p_bits = [0u8; 2];
+        let mut v_bits = [0u8; 4];
+        let (mut x, mut p, mut v) = (0usize, 0usize, 0usize);
+        for (index, byte) in pattern.bytes().enumerate() {
+            let bit = 7 - index as u8;
+            match byte {
+                b'x' => {
+                    *x_bits.get_mut(x)? = bit;
+                    x += 1;
+                }
+                b'p' => {
+                    *p_bits.get_mut(p)? = bit;
+                    p += 1;
+                }
+                b'v' => {
+                    *v_bits.get_mut(v)? = bit;
+                    v += 1;
+                }
+                _ => return None,
+            }
+        }
+        if (x, p, v) != (2, 2, 4) {
+            return None;
+        }
+        let x_mask: u8 = (1 << x_bits[0]) | (1 << x_bits[1]);
+        let mut padding = [0u8; 128];
+        let mut len = 0usize;
+        for &drop_bit in &x_bits {
+            for val in 0..4u8 {
+                for pos in 0..16u8 {
+                    let mut out = x_mask;
+                    out &= !(1 << drop_bit);
+                    out |= if val & 0x02 != 0 { 1 << p_bits[0] } else { 0 };
+                    out |= if val & 0x01 != 0 { 1 << p_bits[1] } else { 0 };
+                    for (i, bit) in v_bits.iter().enumerate() {
+                        if (pos >> (3 - i as u8)) & 1 == 1 {
+                            out |= 1 << bit;
+                        }
+                    }
+                    if out.count_ones() >= 5 && !padding[..len].contains(&out) {
+                        padding[len] = out;
+                        len += 1;
+                    }
+                }
+            }
+        }
+        let mut padding = padding[..len].to_vec();
+        padding.sort_unstable();
+        let pad_marker = *padding.first()?;
+        Some(
+            Self {
+                mode: Mode::Custom,
+                hint_mask: x_mask,
+                hint_value: x_mask,
+                pad_marker,
+                padding,
+                x_mask,
+                p_bits,
+                v_bits,
+                hint_group: [0; 256],
+                wire_group: [0; 64],
+            }
+            .with_hint_groups(),
+        )
+    }
+
+    fn with_hint_groups(mut self) -> Self {
+        for group in 0..64u8 {
+            self.wire_group[group as usize] = self.encode_group(group);
+        }
+        for byte in 0..=255u8 {
+            if self.is_hint(byte) {
+                self.hint_group[byte as usize] =
+                    self.decode_group(byte).expect("a hint has a group");
+            } else {
+                self.hint_group[byte as usize] = u8::MAX;
+            }
+        }
+        self
+    }
+
+    fn is_hint(&self, byte: u8) -> bool {
+        (byte & self.hint_mask) == self.hint_value || (self.mode == Mode::Ascii && byte == b'\n')
+    }
+
+    fn encode_group(&self, group: u8) -> u8 {
+        match self.mode {
+            Mode::Entropy => {
+                let value = group & 0x3f;
+                ((value & 0x30) << 1) | (value & 0x0f)
+            }
+            Mode::Ascii => {
+                let byte = 0x40 | (group & 0x3f);
+                if byte == 0x7f {
+                    b'\n'
+                } else {
+                    byte
+                }
+            }
+            Mode::Custom => {
+                let mut out = self.x_mask;
+                let value = (group >> 4) & 0x03;
+                let pos = group & 0x0f;
+                if value & 0x02 != 0 {
+                    out |= 1 << self.p_bits[0];
+                }
+                if value & 0x01 != 0 {
+                    out |= 1 << self.p_bits[1];
+                }
+                for (i, bit) in self.v_bits.iter().enumerate() {
+                    if (pos >> (3 - i as u8)) & 1 == 1 {
+                        out |= 1 << bit;
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    fn decode_group(&self, byte: u8) -> Option<u8> {
+        match self.mode {
+            Mode::Entropy => ((byte & 0x90) == 0).then_some(((byte >> 1) & 0x30) | (byte & 0x0f)),
+            Mode::Ascii => {
+                if byte == b'\n' {
+                    Some(0x3f)
+                } else if byte & 0x40 == 0 {
+                    None
+                } else {
+                    Some(byte & 0x3f)
+                }
+            }
+            Mode::Custom => {
+                if byte & self.x_mask != self.x_mask {
+                    return None;
+                }
+                let mut value = 0u8;
+                if byte & (1 << self.p_bits[0]) != 0 {
+                    value |= 0x02;
+                }
+                if byte & (1 << self.p_bits[1]) != 0 {
+                    value |= 0x01;
+                }
+                let mut pos = 0u8;
+                for (i, bit) in self.v_bits.iter().enumerate() {
+                    if byte & (1 << bit) != 0 {
+                        pos |= 1 << (3 - i as u8);
+                    }
+                }
+                Some((value << 4) | (pos & 0x0f))
+            }
+        }
+    }
+
+    /// A pure-direction padding octet: any pool byte, the marker included, because the pure decoder
+    /// drops every octet that is not a hint and a marker is never one.
+    fn pure_padding(&self, rng: &mut SudokuRng) -> io::Result<u8> {
+        let index = rng.int_n(self.padding.len())?;
+        Ok(self.padding[index])
+    }
+
+    /// A packed-direction padding octet: never the marker, because the marker resets the bit stream
+    /// and spreading one through a payload would cut it.
+    fn packed_padding(&self, rng: &mut SudokuRng) -> io::Result<u8> {
+        if let [only] = self.padding.as_slice() {
+            return Ok(*only);
+        }
+        loop {
+            let index = rng.int_n(self.padding.len())?;
+            let byte = self.padding[index];
+            if byte != self.pad_marker {
+                return Ok(byte);
+            }
+        }
+    }
+}
+
+/// The table slot `byte` carries: the four hint values for that plaintext octet in every accepted
+/// clue set of the grid, and the reverse key -> octet map.
+struct Table {
+    encode: Vec<Vec<[u8; 4]>>,
+    decode_value: Vec<u8>,
+    decode_rank: Vec<u16>,
+    decode_present: Vec<u64>,
+    layout: Layout,
+}
+
+impl fmt::Debug for Table {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Table")
+            .field("entries", &self.encode.len())
+            .field("layout", &self.layout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Table {
+    fn decode_byte(&self, rank: usize) -> Option<u8> {
+        let bit = 1u64 << (rank & 63);
+        let bits = self.decode_present[rank >> 6];
+        if bits & bit == 0 {
+            return None;
+        }
+        let index =
+            usize::from(self.decode_rank[rank >> 6]) + (bits & (bit - 1)).count_ones() as usize;
+        Some(self.decode_value[index])
+    }
+}
+
+/// The draws one `getrandom` serves: two per pure octet means a refill every 128 octets instead of
+/// every second one, and the words are the same stream at either width.
+const ENTROPY_DRAWS: usize = 256;
+
+/// A `getrandom` supply shaped like the reference's `rand/v2` draws: a pool of 64-bit words and
+/// Lemire's multiply-and-reject for the bounded draw.
+struct SudokuRng {
+    cache: Box<[u64; ENTROPY_DRAWS]>,
+    at: usize,
+    #[cfg(test)]
+    refills: usize,
+}
+
+impl SudokuRng {
+    fn new() -> Self {
+        Self {
+            cache: Box::new([0; ENTROPY_DRAWS]),
+            at: ENTROPY_DRAWS,
+            #[cfg(test)]
+            refills: 0,
+        }
+    }
+
+    fn draw(&mut self) -> io::Result<u64> {
+        if self.at == ENTROPY_DRAWS {
+            let mut raw = [0u8; ENTROPY_DRAWS * 8];
+            getrandom::fill(&mut raw).map_err(|_| io::Error::other("sudoku entropy"))?;
+            for (slot, word) in self.cache.iter_mut().zip(raw.as_chunks::<8>().0) {
+                *slot = u64::from_le_bytes(*word);
+            }
+            self.at = 0;
+            #[cfg(test)]
+            {
+                self.refills += 1;
+            }
+        }
+        let draw = self.cache[self.at];
+        self.at += 1;
+        Ok(draw)
+    }
+
+    fn int_n(&mut self, n: usize) -> io::Result<usize> {
+        let n = n as u64;
+        let mut value = self.draw()?;
+        let mut product = u128::from(value) * u128::from(n);
+        let mut low = product as u64;
+        if low < n {
+            let threshold = n.wrapping_neg() % n;
+            while low < threshold {
+                value = self.draw()?;
+                product = u128::from(value) * u128::from(n);
+                low = product as u64;
+            }
+        }
+        Ok((product >> 64) as usize)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterKind {
+    Pure,
+    Packed,
+}
+
+struct Encoder {
+    tables: Arc<[Table]>,
+    kind: WriterKind,
+    rng: SudokuRng,
+    padding_min: u32,
+    padding_max: u32,
+    chance: Option<u32>,
+    table_index: usize,
+    group_index: usize,
+    out: Vec<u8>,
+    written: usize,
+}
+
+impl Encoder {
+    fn new(tables: Arc<[Table]>, padding_min: u32, padding_max: u32, kind: WriterKind) -> Self {
+        Self {
+            tables,
+            kind,
+            rng: SudokuRng::new(),
+            padding_min,
+            padding_max,
+            chance: None,
+            table_index: 0,
+            group_index: 0,
+            out: Vec::new(),
+            written: 0,
+        }
+    }
+
+    fn encode(&mut self, p: &[u8]) -> io::Result<&[u8]> {
+        self.out.clear();
+        self.written = 0;
+        if p.is_empty() {
+            return Ok(&self.out);
+        }
+        match self.kind {
+            WriterKind::Pure => self.encode_pure(p)?,
+            WriterKind::Packed => self.encode_packed(p)?,
+        }
+        Ok(&self.out)
+    }
+
+    /// Put the rest of the last encoding on the wire; a refused write keeps the position so the
+    /// cipher's table advance is not replayed on a retry.
+    fn flush<W: Write>(&mut self, raw: &mut W) -> io::Result<()> {
+        while self.written < self.out.len() {
+            match raw.write(&self.out[self.written..]) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(taken) => self.written += taken,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn encode_pure(&mut self, p: &[u8]) -> io::Result<()> {
+        self.out
+            .reserve(p.len().saturating_mul(9).saturating_add(8));
+        let mut out = mem::take(&mut self.out);
+        let tables = &self.tables;
+        let len = tables.len();
+        let (padding_min, padding_max) = (self.padding_min, self.padding_max);
+        let pad = padding_max != 0;
+        let rng = &mut self.rng;
+        let chance = &mut self.chance;
+        for &byte in p {
+            let table = &tables[self.table_index];
+            if pad && should_pad(rng, chance, padding_min, padding_max)? {
+                push_pure_pad(rng, &mut out, &table.layout)?;
+            }
+            let choices = table
+                .encode
+                .get(byte as usize)
+                .filter(|list| !list.is_empty());
+            let Some(choices) = choices else {
+                self.out = out;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sudoku table missing an entry",
+                ));
+            };
+            let hints = choices[rng.int_n(choices.len())?];
+            let perm = PERM4[rng.int_n(PERM4.len())?];
+            for index in perm {
+                if pad && should_pad(rng, chance, padding_min, padding_max)? {
+                    push_pure_pad(rng, &mut out, &table.layout)?;
+                }
+                out.push(hints[index as usize]);
+            }
+            self.table_index = next_slot(self.table_index, len);
+        }
+        let table = &tables[self.table_index];
+        if pad && should_pad(rng, chance, padding_min, padding_max)? {
+            push_pure_pad(rng, &mut out, &table.layout)?;
+        }
+        self.out = out;
+        Ok(())
+    }
+
+    fn encode_packed(&mut self, p: &[u8]) -> io::Result<()> {
+        self.out
+            .reserve(p.len().saturating_mul(3).saturating_add(8));
+        let mut out = mem::take(&mut self.out);
+        let tables = &self.tables;
+        let len = tables.len();
+        let (padding_min, padding_max) = (self.padding_min, self.padding_max);
+        let pad = padding_max != 0;
+        let rng = &mut self.rng;
+        let chance = &mut self.chance;
+        let (chunks, rest) = p.as_chunks::<3>();
+        for chunk in chunks {
+            let word =
+                (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
+            for shift in [18, 12, 6, 0] {
+                let layout = &tables[self.group_index].layout;
+                if pad && should_pad(rng, chance, padding_min, padding_max)? {
+                    push_packed_pad(rng, &mut out, layout)?;
+                }
+                out.push(layout.wire_group[((word >> shift) as u8 & 0x3f) as usize]);
+                self.group_index = next_slot(self.group_index, len);
+            }
+        }
+        let mut bit_buf = 0u64;
+        let mut bit_count = 0u32;
+        for &byte in rest {
+            bit_buf = (bit_buf << 8) | u64::from(byte);
+            bit_count += 8;
+            while bit_count >= 6 {
+                bit_count -= 6;
+                let layout = &tables[self.group_index].layout;
+                if pad && should_pad(rng, chance, padding_min, padding_max)? {
+                    push_packed_pad(rng, &mut out, layout)?;
+                }
+                out.push(layout.wire_group[((bit_buf >> bit_count) as u8 & 0x3f) as usize]);
+                self.group_index = next_slot(self.group_index, len);
+                bit_buf = if bit_count > 0 {
+                    bit_buf & ((1u64 << bit_count) - 1)
+                } else {
+                    0
+                };
+            }
+        }
+        if bit_count > 0 {
+            let layout = &tables[self.group_index].layout;
+            if pad && should_pad(rng, chance, padding_min, padding_max)? {
+                push_packed_pad(rng, &mut out, layout)?;
+            }
+            let group = ((bit_buf << (6 - bit_count)) & 0x3f) as u8;
+            out.push(layout.wire_group[group as usize]);
+            self.group_index = next_slot(self.group_index, len);
+            let next = &tables[self.group_index].layout;
+            out.push(next.pad_marker);
+        }
+        let layout = &tables[self.group_index].layout;
+        if pad && should_pad(rng, chance, padding_min, padding_max)? {
+            push_packed_pad(rng, &mut out, layout)?;
+        }
+        self.out = out;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderKind {
+    Pure,
+    Packed,
+}
+
+struct Reader {
+    tables: Arc<[Table]>,
+    kind: ReaderKind,
+    table_index: usize,
+    hint: [u8; 4],
+    hint_len: usize,
+    group_index: usize,
+    bit_buf: u64,
+    bit_count: u32,
+    raw: Vec<u8>,
+    pending: Vec<u8>,
+    at: usize,
+}
+
+impl Reader {
+    fn new(tables: Arc<[Table]>, kind: ReaderKind) -> Self {
+        Self {
+            tables,
+            kind,
+            table_index: 0,
+            hint: [0; 4],
+            hint_len: 0,
+            group_index: 0,
+            bit_buf: 0,
+            bit_count: 0,
+            raw: Vec::new(),
+            pending: Vec::with_capacity(READ_CHUNK),
+            at: 0,
+        }
+    }
+
+    fn read<R: Read>(&mut self, inner: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if let Some(n) = self.take(buf) {
+                return Ok(n);
+            }
+            if !self.fill(inner)? {
+                return Ok(0);
+            }
+        }
+    }
+
+    fn peek<R: Read>(&mut self, inner: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.pending.len() > self.at {
+                let n = (self.pending.len() - self.at).min(buf.len());
+                buf[..n].copy_from_slice(&self.pending[self.at..self.at + n]);
+                return Ok(n);
+            }
+            self.pending.clear();
+            self.at = 0;
+            if !self.fill(inner)? {
+                return Ok(0);
+            }
+        }
+    }
+
+    fn take(&mut self, buf: &mut [u8]) -> Option<usize> {
+        if self.pending.len() <= self.at {
+            self.pending.clear();
+            self.at = 0;
+            return None;
+        }
+        let n = (self.pending.len() - self.at).min(buf.len());
+        buf[..n].copy_from_slice(&self.pending[self.at..self.at + n]);
+        self.at += n;
+        if self.at == self.pending.len() {
+            self.pending.clear();
+            self.at = 0;
+        }
+        Some(n)
+    }
+
+    fn fill<R: Read>(&mut self, inner: &mut R) -> io::Result<bool> {
+        if self.raw.is_empty() {
+            self.raw.resize(READ_CHUNK, 0);
+        }
+        let mut raw = mem::take(&mut self.raw);
+        let read = inner.read(&mut raw);
+        let decoded = match read {
+            Ok(0) => Ok(false),
+            Ok(n) => self.decode_chunk(&raw[..n]).map(|()| true),
+            Err(error) => Err(error),
+        };
+        self.raw = raw;
+        decoded
+    }
+
+    fn decode_chunk(&mut self, chunk: &[u8]) -> io::Result<()> {
+        match self.kind {
+            ReaderKind::Pure => self.decode_pure(chunk),
+            ReaderKind::Packed => {
+                self.decode_packed(chunk);
+                Ok(())
+            }
+        }
+    }
+
+    fn decode_pure(&mut self, chunk: &[u8]) -> io::Result<()> {
+        let mut at = 0;
+        while at < chunk.len() {
+            if self.hint_len == 0 && at + self.hint.len() <= chunk.len() {
+                let table = &self.tables[self.table_index];
+                let hint_group = &table.layout.hint_group;
+                let hints = [
+                    hint_group[chunk[at] as usize],
+                    hint_group[chunk[at + 1] as usize],
+                    hint_group[chunk[at + 2] as usize],
+                    hint_group[chunk[at + 3] as usize],
+                ];
+                if hints.iter().all(|&hint| hint != u8::MAX) {
+                    let rank = rank4(sort4(hints));
+                    let Some(plain) = table.decode_byte(rank) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid sudoku hint tuple",
+                        ));
+                    };
+                    self.pending.push(plain);
+                    self.table_index = next_slot(self.table_index, self.tables.len());
+                    at += self.hint.len();
+                    continue;
+                }
+            }
+            let byte = chunk[at];
+            let table = &self.tables[self.table_index];
+            let group = table.layout.hint_group[byte as usize];
+            at += 1;
+            if group == u8::MAX {
+                continue;
+            }
+            self.hint[self.hint_len] = group;
+            self.hint_len += 1;
+            if self.hint_len < self.hint.len() {
+                continue;
+            }
+            let rank = rank4(sort4(self.hint));
+            let Some(plain) = table.decode_byte(rank) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid sudoku hint tuple",
+                ));
+            };
+            self.pending.push(plain);
+            self.hint_len = 0;
+            self.table_index = next_slot(self.table_index, self.tables.len());
+        }
+        Ok(())
+    }
+
+    fn decode_packed(&mut self, chunk: &[u8]) {
+        for &byte in chunk {
+            let layout = &self.tables[self.group_index].layout;
+            let group = layout.hint_group[byte as usize];
+            if group == u8::MAX {
+                if byte == layout.pad_marker {
+                    self.bit_buf = 0;
+                    self.bit_count = 0;
+                }
+                continue;
+            }
+            self.group_index = next_slot(self.group_index, self.tables.len());
+            self.bit_buf = (self.bit_buf << 6) | u64::from(group);
+            self.bit_count += 6;
+            while self.bit_count >= 8 {
+                self.bit_count -= 8;
+                self.pending.push((self.bit_buf >> self.bit_count) as u8);
+                self.bit_buf = if self.bit_count > 0 {
+                    self.bit_buf & ((1u64 << self.bit_count) - 1)
+                } else {
+                    0
+                };
+            }
+        }
+    }
+}
+
+/// The configured `sudoku` stage. One instance is the config's template; every connection opens a
+/// writer, a reader, or both from it, so the derived table is shared and the stream state is not.
+pub struct Sudoku {
+    tables: Arc<[Table]>,
+    padding_min: u32,
+    padding_max: u32,
+    role: MaskRole,
+    writer: Option<Encoder>,
+    reader: Option<Reader>,
+}
+
+impl fmt::Debug for Sudoku {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sudoku")
+            .field("tables", &self.tables.len())
+            .field("padding_min", &self.padding_min)
+            .field("padding_max", &self.padding_max)
+            .field("role", &self.role)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for Sudoku {
+    fn clone(&self) -> Self {
+        self.template()
+    }
+}
+
+impl Sudoku {
+    /// A stage the config can drive: the mode and every custom pattern must normalise, and every
+    /// derived table must be collision-free. `None` refuses the carrier rather than arming a stage
+    /// whose bytes no peer derives.
+    pub fn new(
+        password: &str,
+        ascii: &str,
+        custom_table: &str,
+        custom_tables: &[String],
+        padding_min: u32,
+        padding_max: u32,
+    ) -> Option<Self> {
+        let mode = normalize_ascii(ascii)?;
+        let patterns = patterns(mode, custom_table, custom_tables)?;
+        let mut tables = Vec::with_capacity(patterns.len());
+        for pattern in &patterns {
+            let layout = match mode {
+                Mode::Ascii => Layout::ascii(),
+                Mode::Entropy if pattern.is_empty() => Layout::entropy(),
+                Mode::Custom | Mode::Entropy => Layout::custom(pattern)?,
+            };
+            tables.push(build_table(password, layout)?);
+        }
+        if tables.is_empty() {
+            return None;
+        }
+        let templates = Self {
+            tables: tables.into(),
+            padding_min: padding_min.min(100),
+            padding_max: padding_max.min(100),
+            role: MaskRole::Client,
+            writer: None,
+            reader: None,
+        };
+        Some(Self {
+            padding_max: templates.padding_max.max(templates.padding_min),
+            ..templates
+        })
+    }
+
+    fn template(&self) -> Self {
+        Self {
+            tables: Arc::clone(&self.tables),
+            padding_min: self.padding_min,
+            padding_max: self.padding_max,
+            role: MaskRole::Client,
+            writer: None,
+            reader: None,
+        }
+    }
+
+    /// The writer this connection needs: a client writes the pure direction and a server the packed
+    /// one.
+    #[must_use]
+    pub fn open_write(&self, role: MaskRole) -> Self {
+        let kind = match role {
+            MaskRole::Client => WriterKind::Pure,
+            MaskRole::Server => WriterKind::Packed,
+        };
+        Self {
+            writer: Some(Encoder::new(
+                Arc::clone(&self.tables),
+                self.padding_min,
+                self.padding_max,
+                kind,
+            )),
+            ..self.template()
+        }
+    }
+
+    /// The reader this connection needs: it reads the direction the peer wrote, the reverse of its
+    /// own writer.
+    #[must_use]
+    pub fn open_read(&self, role: MaskRole) -> Self {
+        let kind = match role {
+            MaskRole::Client => ReaderKind::Packed,
+            MaskRole::Server => ReaderKind::Pure,
+        };
+        Self {
+            reader: Some(Reader::new(Arc::clone(&self.tables), kind)),
+            ..self.template()
+        }
+    }
+
+    /// Encode one plaintext write and put all of it on the wire. The answer is the plaintext length;
+    /// an encoded stream has no partial-write count the caller could advance by.
+    pub fn write<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
+        let Some(writer) = self.writer.as_mut() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sudoku stage is not open for writing",
+            ));
+        };
+        if p.is_empty() {
+            writer.flush(raw)?;
+            return Ok(0);
+        }
+        if writer.written < writer.out.len() {
+            writer.flush(raw)?;
+        }
+        writer.encode(p)?;
+        let _ = writer.flush(raw);
+        Ok(p.len())
+    }
+
+    /// Put the last encoding's retained bytes on the wire without a new plaintext write.
+    pub fn flush<W: Write>(&mut self, raw: &mut W) -> io::Result<()> {
+        match self.writer.as_mut() {
+            Some(writer) => writer.flush(raw),
+            None => Ok(()),
+        }
+    }
+
+    pub fn read_from<R: Read>(&mut self, inner: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+        match self.reader.as_mut() {
+            Some(reader) => reader.read(inner, buf),
+            None => inner.read(buf),
+        }
+    }
+
+    pub fn peek_from<R: Read>(&mut self, inner: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+        match self.reader.as_mut() {
+            Some(reader) => reader.peek(inner, buf),
+            None => inner.read(buf),
+        }
+    }
+}
+
+#[inline]
+fn next_slot(slot: usize, len: usize) -> usize {
+    debug_assert!(slot < len);
+    if slot + 1 == len {
+        0
+    } else {
+        slot + 1
+    }
+}
+
+fn should_pad(
+    rng: &mut SudokuRng,
+    chance: &mut Option<u32>,
+    padding_min: u32,
+    padding_max: u32,
+) -> io::Result<bool> {
+    let drawn = if let Some(drawn) = *chance {
+        drawn
+    } else {
+        let drawn = if padding_min == padding_max {
+            padding_min
+        } else {
+            let span = (padding_max - padding_min + 1) as usize;
+            padding_min + rng.int_n(span)? as u32
+        };
+        *chance = Some(drawn);
+        drawn
+    };
+    if drawn == 0 {
+        return Ok(false);
+    }
+    if drawn >= 100 {
+        return Ok(true);
+    }
+    Ok((rng.int_n(100)? as u32) < drawn)
+}
+
+fn push_pure_pad(rng: &mut SudokuRng, out: &mut Vec<u8>, layout: &Layout) -> io::Result<()> {
+    out.push(layout.pure_padding(rng)?);
+    Ok(())
+}
+
+fn push_packed_pad(rng: &mut SudokuRng, out: &mut Vec<u8>, layout: &Layout) -> io::Result<()> {
+    out.push(layout.packed_padding(rng)?);
+    Ok(())
+}
+
+fn normalize_ascii(mode: &str) -> Option<Mode> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "" | "entropy" | "prefer_entropy" => Some(Mode::Entropy),
+        "ascii" | "prefer_ascii" => Some(Mode::Ascii),
+        _ => None,
+    }
+}
+
+fn normalize_custom(pattern: &str) -> Option<String> {
+    let cleaned: String = pattern
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| *c != ' ')
+        .collect();
+    if cleaned.len() != 8 || !cleaned.is_ascii() {
+        return None;
+    }
+    let (mut x, mut p, mut v) = (0usize, 0usize, 0usize);
+    for byte in cleaned.bytes() {
+        match byte {
+            b'x' => x += 1,
+            b'p' => p += 1,
+            b'v' => v += 1,
+            _ => return None,
+        }
+    }
+    ((x, p, v) == (2, 2, 4)).then_some(cleaned)
+}
+
+fn patterns(mode: Mode, custom_table: &str, custom_tables: &[String]) -> Option<Vec<String>> {
+    if mode == Mode::Ascii {
+        return Some(vec![String::new()]);
+    }
+    let raw: Vec<&str> = if custom_tables.is_empty() {
+        vec![custom_table]
+    } else {
+        custom_tables.iter().map(String::as_str).collect()
+    };
+    let mut patterns: Vec<String> = Vec::with_capacity(raw.len());
+    for raw in raw {
+        let trimmed = raw.trim();
+        let pattern = if trimmed.is_empty() {
+            String::new()
+        } else {
+            normalize_custom(trimmed)?
+        };
+        if !patterns.contains(&pattern) {
+            patterns.push(pattern);
+        }
+    }
+    if patterns.is_empty() {
+        patterns.push(String::new());
+    }
+    Some(patterns)
+}
+
+fn build_table(password: &str, layout: Layout) -> Option<Table> {
+    let mut order: Vec<usize> = (0..GRID_COUNT).collect();
+    let digest = Sha256::digest(password.as_bytes());
+    let seed = i64::from_be_bytes(digest[..8].try_into().ok()?);
+    GoRand::new(seed).shuffle(&mut order);
+
+    let mut decode = vec![0u8; RANK_SPACE];
+    let mut decode_present = vec![0u64; RANK_WORDS];
+    let mut encode: Vec<Vec<[u8; 4]>> = vec![Vec::new(); 256];
+    for byte in 0..256usize {
+        let list = base_pattern(order[byte]);
+        if list.is_empty() {
+            return None;
+        }
+        let mut choices = Vec::with_capacity(list.len() / 4);
+        for groups in list.as_chunks::<4>().0 {
+            let groups = *groups;
+            let hints = [
+                layout.wire_group[groups[0] as usize],
+                layout.wire_group[groups[1] as usize],
+                layout.wire_group[groups[2] as usize],
+                layout.wire_group[groups[3] as usize],
+            ];
+            let rank = rank4(groups);
+            let bit = 1u64 << (rank & 63);
+            let word = rank >> 6;
+            if decode_present[word] & bit != 0 {
+                if decode[rank] != byte as u8 {
+                    return None;
+                }
+            } else {
+                decode_present[word] |= bit;
+                decode[rank] = byte as u8;
+            }
+            choices.push(hints);
+        }
+        encode[byte] = choices;
+    }
+    let entries: usize = decode_present
+        .iter()
+        .map(|bits| bits.count_ones() as usize)
+        .sum();
+    if entries > usize::from(u16::MAX) {
+        return None;
+    }
+    let mut decode_value = Vec::with_capacity(entries);
+    let mut decode_rank = Vec::with_capacity(RANK_WORDS);
+    for (word, &bits) in decode_present.iter().enumerate() {
+        decode_rank.push(decode_value.len() as u16);
+        let mut live = bits;
+        while live != 0 {
+            let bit = live.trailing_zeros() as usize;
+            decode_value.push(decode[word * 64 + bit]);
+            live &= live - 1;
+        }
+    }
+    Some(Table {
+        encode,
+        decode_value,
+        decode_rank,
+        decode_present,
+        layout,
+    })
+}
+
+fn base_pattern(index: usize) -> &'static [u8] {
+    let offset = |at: usize| {
+        let at = OFFSETS_AT + at * 2;
+        usize::from(u16::from_le_bytes([PATTERN_BLOB[at], PATTERN_BLOB[at + 1]]))
+    };
+    let start = offset(index);
+    let end = offset(index + 1);
+    &PATTERN_BLOB[ENTRIES_AT + start * 4..ENTRIES_AT + end * 4]
+}
+
+#[cfg(test)]
+fn grid(index: usize) -> [u8; 16] {
+    let at = GRIDS_AT + index * 16;
+    PATTERN_BLOB[at..at + 16]
+        .try_into()
+        .expect("a grid is sixteen bytes")
+}
+
+#[cfg(test)]
+fn hint_positions() -> Vec<[u8; 4]> {
+    let mut positions = Vec::with_capacity(1820);
+    for a in 0..13u8 {
+        for b in a + 1..14 {
+            for c in b + 1..15 {
+                for d in c + 1..16 {
+                    positions.push([a, b, c, d]);
+                }
+            }
+        }
+    }
+    positions
+}
+
+fn sort4(v: [u8; 4]) -> [u8; 4] {
+    // A five-comparator network sorts four octets without the branchy insertion the standard sort uses.
+    let (a0, a1) = (v[0].min(v[1]), v[0].max(v[1]));
+    let (a2, a3) = (v[2].min(v[3]), v[2].max(v[3]));
+    let (b0, b2) = (a0.min(a2), a0.max(a2));
+    let (b1, b3) = (a1.min(a3), a1.max(a3));
+    let (c1, c2) = (b1.min(b2), b1.max(b2));
+    [b0, c1, c2, b3]
+}
+
+const fn rank_terms() -> [[u32; 64]; 4] {
+    let mut terms = [[0u32; 64]; 4];
+    let mut value = 0usize;
+    while value < 64 {
+        terms[0][value] = value as u32;
+        terms[1][value] = ((value + 1) * value / 2) as u32;
+        terms[2][value] = ((value + 2) * (value + 1) * value / 6) as u32;
+        terms[3][value] = ((value + 3) * (value + 2) * (value + 1) * value / 24) as u32;
+        value += 1;
+    }
+    terms
+}
+
+static RANK_TERMS: [[u32; 64]; 4] = rank_terms();
+
+fn rank4(v: [u8; 4]) -> usize {
+    (RANK_TERMS[0][v[0] as usize]
+        + RANK_TERMS[1][v[1] as usize]
+        + RANK_TERMS[2][v[2] as usize]
+        + RANK_TERMS[3][v[3] as usize]) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stage(password: &str, ascii: &str, custom: &[&str]) -> Sudoku {
+        let custom: Vec<String> = custom.iter().map(|s| (*s).to_owned()).collect();
+        Sudoku::new(password, ascii, "", &custom, 0, 0).expect("a driveable stage")
+    }
+
+    fn round_trip(role: MaskRole, config: &Sudoku, plain: &[u8]) {
+        let reader_role = match role {
+            MaskRole::Client => MaskRole::Server,
+            MaskRole::Server => MaskRole::Client,
+        };
+        let mut writer = config.open_write(role);
+        let mut reader = config.open_read(reader_role);
+        let mut wire = Vec::new();
+        writer.write(&mut wire, plain).expect("encodes");
+        assert_ne!(wire, plain, "the mask changes the bytes on the wire");
+        let mut input = wire.as_slice();
+        let mut decoded = vec![0u8; plain.len()];
+        let mut got = 0usize;
+        while got < decoded.len() {
+            let n = reader
+                .read_from(&mut input, &mut decoded[got..])
+                .expect("decodes");
+            assert_ne!(n, 0, "the wire carries every plaintext octet");
+            got += n;
+        }
+        assert_eq!(decoded, plain);
+    }
+
+    #[test]
+    fn a_blocked_frame_resumes_without_advancing_the_tables_again() {
+        struct Stalling {
+            bytes: Vec<u8>,
+            calls: usize,
+            limit: usize,
+        }
+
+        impl Write for Stalling {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                match self.calls {
+                    1 => {
+                        let take = buf.len().min(self.limit);
+                        self.bytes.extend_from_slice(&buf[..take]);
+                        Ok(take)
+                    }
+                    2 => Err(std::io::ErrorKind::WouldBlock.into()),
+                    _ => {
+                        self.bytes.extend_from_slice(buf);
+                        Ok(buf.len())
+                    }
+                }
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let config = stage("retry", "", &["", "xpxpvvvv"]);
+        let plain = vec![0x5au8; 64];
+        let mut writer = config.open_write(MaskRole::Client);
+        let mut sink = Stalling {
+            bytes: Vec::new(),
+            calls: 0,
+            limit: 3,
+        };
+        assert_eq!(
+            writer.write(&mut sink, &plain).expect("accepts"),
+            plain.len()
+        );
+        let first = writer.writer.as_ref().expect("encoder").out.clone();
+        let next = vec![0x33u8; 16];
+        assert_eq!(writer.write(&mut sink, &next).expect("resumes"), next.len());
+        let second = writer.writer.as_ref().expect("encoder").out.clone();
+        assert_eq!(
+            sink.bytes,
+            [first, second].concat(),
+            "the retry finishes the first frame before encoding the next"
+        );
+    }
+
+    #[test]
+    fn the_grids_and_positions_are_the_reference_sets() {
+        assert_eq!(hint_positions().len(), 1820);
+        assert_eq!(grid(0), [1, 2, 3, 4, 3, 4, 1, 2, 2, 1, 4, 3, 4, 3, 2, 1]);
+        assert_eq!(grid(287), [4, 3, 2, 1, 2, 1, 4, 3, 3, 4, 1, 2, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn every_grid_has_a_unique_clue_set() {
+        for index in 0..GRID_COUNT {
+            assert!(
+                !base_pattern(index).is_empty(),
+                "grid {index} has no clue set"
+            );
+        }
+    }
+
+    #[test]
+    fn the_four_hint_sort_is_the_arrays_own_order() {
+        for a in 0..4u8 {
+            for b in 0..4u8 {
+                for c in 0..4u8 {
+                    for d in 0..4u8 {
+                        let mut want = [a, b, c, d];
+                        want.sort_unstable();
+                        assert_eq!(sort4([a, b, c, d]), want, "{:?}", [a, b, c, d]);
+                    }
+                }
+            }
+        }
+    }
+
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    #[test]
+    fn the_reference_wire_decodes_to_its_plaintext() {
+        let fixture = include_str!("../../../../scripts/sudoku-oracle/wire.txt");
+        let mut cases = 0;
+        for line in fixture.lines() {
+            let mut fields = line.split_whitespace();
+            match fields.next().expect("a fixture line") {
+                "GRIDS" => {
+                    assert_eq!(fields.next(), Some("288"));
+                    assert_eq!(
+                        hex(fields.next().expect("first grid")).as_slice(),
+                        &grid(0)[..]
+                    );
+                    assert_eq!(
+                        hex(fields.next().expect("last grid")).as_slice(),
+                        &grid(287)[..]
+                    );
+                }
+                direction @ ("PURE" | "PACKED") => {
+                    let name = fields.next().expect("a case name");
+                    let plain = hex(fields.next().expect("plaintext"));
+                    let wire = hex(fields.next().expect("wire"));
+                    let config = match name {
+                        "entropy" | "all-bytes" => stage("hunter2", "", &[]),
+                        "ascii" => stage("hunter2", "ascii", &[]),
+                        "custom" | "padded" => stage("hunter2", "", &["xpxpvvvv"]),
+                        "multi" => stage("hunter2", "", &["xpxpvvvv", "vxpvxpvv"]),
+                        other => panic!("unknown fixture {other}"),
+                    };
+                    let role = if direction == "PURE" {
+                        MaskRole::Server
+                    } else {
+                        MaskRole::Client
+                    };
+                    let mut reader = config.open_read(role);
+                    let mut decoded = vec![0u8; plain.len()];
+                    let mut input = wire.as_slice();
+                    let mut got = 0usize;
+                    while got < decoded.len() {
+                        let n = reader
+                            .read_from(&mut input, &mut decoded[got..])
+                            .unwrap_or_else(|error| panic!("{direction} {name}: {error}"));
+                        assert_ne!(n, 0, "the wire carries every plaintext octet");
+                        got += n;
+                    }
+                    assert_eq!(decoded, plain, "{direction} {name}");
+                    cases += 1;
+                }
+                other => panic!("unknown fixture record {other}"),
+            }
+        }
+        assert_eq!(cases, 12, "every reference direction ran");
+    }
+
+    #[test]
+    fn a_plain_stream_round_trips_in_both_directions() {
+        let plain: Vec<u8> = (0..=255u8).collect();
+        for role in [MaskRole::Client, MaskRole::Server] {
+            round_trip(role, &stage("hunter2", "", &[]), &plain);
+        }
+    }
+
+    #[test]
+    fn a_long_plain_stream_round_trips_in_both_directions() {
+        let plain: Vec<u8> = (0..=255u8).cycle().take(1024).collect();
+        for role in [MaskRole::Client, MaskRole::Server] {
+            round_trip(role, &stage("hunter2", "", &[]), &plain);
+        }
+    }
+
+    #[test]
+    fn packed_tails_keep_every_group() {
+        let config = stage("hunter2", "", &[]);
+        for len in [1usize, 2, 3, 4, 5, 998, 999, 1000, 1001, 1023, 1024, 1025] {
+            let plain: Vec<u8> = (0..len).map(|at| (at * 7) as u8).collect();
+            round_trip(MaskRole::Server, &config, &plain);
+        }
+    }
+
+    #[test]
+    fn ascii_and_custom_layouts_round_trip() {
+        let plain: Vec<u8> = (0..=255u8).collect();
+        round_trip(MaskRole::Client, &stage("x", "ascii", &[]), &plain);
+        round_trip(MaskRole::Server, &stage("x", "prefer_ascii", &[]), &plain);
+        round_trip(MaskRole::Client, &stage("x", "", &["xpxpvvvv"]), &plain);
+        round_trip(MaskRole::Server, &stage("x", "", &["vvvvppxx"]), &plain);
+        round_trip(
+            MaskRole::Client,
+            &stage("x", "", &["xpxpvvvv", "vxpvxpvv"]),
+            &plain,
+        );
+    }
+
+    #[test]
+    fn every_padding_level_round_trips() {
+        let plain: Vec<u8> = (0..=255u8).collect();
+        for (min, max) in [(0, 0), (0, 100), (100, 100), (40, 40)] {
+            for role in [MaskRole::Client, MaskRole::Server] {
+                let custom: Vec<String> = Vec::new();
+                let config =
+                    Sudoku::new("pad", "", "", &custom, min, max).expect("a driveable stage");
+                round_trip(role, &config, &plain);
+            }
+        }
+    }
+
+    #[test]
+    fn a_decoder_keeps_its_state_across_short_reads() {
+        struct Dribble<'a> {
+            wire: &'a [u8],
+            at: usize,
+        }
+        impl Read for Dribble<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let take = (self.wire.len() - self.at).min(buf.len().min(3));
+                buf[..take].copy_from_slice(&self.wire[self.at..self.at + take]);
+                self.at += take;
+                Ok(take)
+            }
+        }
+        let config = stage("hunter2", "", &["xpxpvvvv"]);
+        let plain: Vec<u8> = (0..=255u8).collect();
+        let mut writer = config.open_write(MaskRole::Client);
+        let mut wire = Vec::new();
+        writer.write(&mut wire, &plain).expect("encodes");
+        let mut reader = config.open_read(MaskRole::Server);
+        let mut source = Dribble { wire: &wire, at: 0 };
+        let mut decoded = vec![0u8; plain.len()];
+        let mut got = 0usize;
+        while got < decoded.len() {
+            let n = reader
+                .read_from(&mut source, &mut decoded[got..])
+                .expect("decodes");
+            assert_ne!(n, 0);
+            got += n;
+        }
+        assert_eq!(decoded, plain);
+    }
+
+    #[test]
+    fn a_peek_does_not_consume_the_plaintext() {
+        let config = stage("hunter2", "", &[]);
+        let plain: Vec<u8> = (0..32).collect();
+        let mut writer = config.open_write(MaskRole::Client);
+        let mut wire = Vec::new();
+        writer.write(&mut wire, &plain).expect("encodes");
+        let mut source = wire.as_slice();
+        let mut reader = config.open_read(MaskRole::Server);
+        let mut ahead = [0u8; 16];
+        assert_eq!(
+            reader.peek_from(&mut source, &mut ahead).expect("peeks"),
+            16
+        );
+        assert_eq!(ahead, plain[..16]);
+        let mut whole = vec![0u8; plain.len()];
+        let mut got = 0usize;
+        while got < whole.len() {
+            got += reader
+                .read_from(&mut source, &mut whole[got..])
+                .expect("reads");
+        }
+        assert_eq!(whole, plain, "the peek left every octet for the read");
+    }
+
+    #[test]
+    fn an_invalid_custom_table_is_refused() {
+        let none: Vec<String> = Vec::new();
+        assert!(Sudoku::new("x", "", "xpxpvvv", &none, 0, 0).is_none());
+        assert!(Sudoku::new("x", "", "xxxxvvvv", &none, 0, 0).is_none());
+        assert!(Sudoku::new("x", "", "xpxpvvvz", &none, 0, 0).is_none());
+        assert!(Sudoku::new("x", "", "xpxpvvvv", &none, 0, 0).is_some());
+        assert!(
+            Sudoku::new("x", "unknown", "", &none, 0, 0).is_none(),
+            "an unknown ascii mode is refused"
+        );
+    }
+
+    #[test]
+    fn padding_is_clamped_like_the_reference() {
+        let none: Vec<String> = Vec::new();
+        let config = Sudoku::new("x", "", "", &none, 200, 20).expect("a driveable stage");
+        assert_eq!(config.padding_min, 100);
+        assert_eq!(config.padding_max, 100);
+    }
+
+    #[test]
+    fn the_wire_ratio_is_the_reference_shape() {
+        let config = stage("hunter2", "", &[]);
+        let plain = vec![7u8; 300];
+        let mut pure = Vec::new();
+        config
+            .open_write(MaskRole::Client)
+            .write(&mut pure, &plain)
+            .expect("encodes the pure direction");
+        assert_eq!(
+            pure.len(),
+            plain.len() * 4,
+            "a pure write is four hints per octet"
+        );
+        let mut packed = Vec::new();
+        config
+            .open_write(MaskRole::Server)
+            .write(&mut packed, &plain)
+            .expect("encodes the packed direction");
+        assert_eq!(
+            packed.len(),
+            plain.len() * 4 / 3,
+            "a packed write is four octets per three plaintext octets"
+        );
+    }
+
+    const PROBE_PLAINTEXT: usize = 4096;
+    const PROBE_ROUNDS: usize = 16;
+
+    /// Counts what the mask actually put on the wire, so the probe's upper bound is the encoded
+    /// length rather than the plaintext length the writer returns by construction.
+    struct Count(usize);
+
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[inline(never)]
+    fn encode_probe() -> (usize, usize) {
+        let config = stage("probe", "", &[]);
+        let mut writer = config.open_write(MaskRole::Client);
+        let plain: Vec<u8> = (0..PROBE_PLAINTEXT).map(|at| at as u8).collect();
+        let mut sink = Count(0);
+        let mut total = 0;
+        for _ in 0..PROBE_ROUNDS {
+            total += writer.write(&mut sink, &plain).expect("encodes");
+        }
+        std::hint::black_box((total, sink.0))
+    }
+
+    #[inline(never)]
+    fn decode_probe() -> usize {
+        let config = stage("probe", "", &[]);
+        let plain: Vec<u8> = (0..PROBE_PLAINTEXT).map(|at| at as u8).collect();
+        let mut wire = Vec::new();
+        let mut writer = config.open_write(MaskRole::Client);
+        for _ in 0..PROBE_ROUNDS {
+            writer.write(&mut wire, &plain).expect("encodes");
+        }
+        let mut reader = config.open_read(MaskRole::Server);
+        let mut input = wire.as_slice();
+        let mut decoded = vec![0u8; PROBE_PLAINTEXT];
+        let mut total = 0;
+        loop {
+            let got = reader.read_from(&mut input, &mut decoded).expect("decodes");
+            if got == 0 {
+                break;
+            }
+            total += got;
+        }
+        std::hint::black_box(total)
+    }
+
+    #[test]
+    fn the_sudoku_wire_costs_the_bytes_and_nothing_else() {
+        let (consumed, wire) = encode_probe();
+        assert_eq!(consumed, PROBE_PLAINTEXT * PROBE_ROUNDS);
+        assert!(
+            wire >= consumed * 4,
+            "a pure write is four hint bytes per plaintext octet"
+        );
+        assert!(
+            wire <= consumed * 4 + PROBE_ROUNDS * 64,
+            "one framing head per write, not one per byte"
+        );
+        assert_eq!(decode_probe(), PROBE_PLAINTEXT * PROBE_ROUNDS);
+    }
+
+    #[test]
+    fn the_entropy_supply_serves_a_pure_encode() {
+        let config = stage("probe", "", &[]);
+        let mut writer = config.open_write(MaskRole::Client);
+        let plain = vec![0u8; PROBE_PLAINTEXT];
+        let mut sink = std::io::sink();
+        for _ in 0..PROBE_ROUNDS {
+            writer.write(&mut sink, &plain).expect("encodes");
+        }
+        let refills = writer.writer.as_ref().expect("a writer").rng.refills;
+        assert!(
+            refills == 512 || refills == 513,
+            "the pure encode should ask the OS 512 times, or 513 after a rejected draw: {refills}"
+        );
+    }
+
+    #[test]
+    fn the_encoder_buffer_holds_its_capacity() {
+        let config = stage("hunter2", "", &[]);
+        let mut writer = config.open_write(MaskRole::Client);
+        let mut sink = Vec::new();
+        writer.write(&mut sink, &[0u8; 4096]).expect("encodes");
+        let capacity = writer.writer.as_ref().expect("open").out.capacity();
+        for len in [0usize, 1, 4096, 64, 2048] {
+            writer.write(&mut sink, &vec![7u8; len]).expect("encodes");
+            assert_eq!(
+                writer.writer.as_ref().expect("open").out.capacity(),
+                capacity,
+                "the encode buffer does not grow again"
+            );
+        }
+    }
+}
