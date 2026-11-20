@@ -2071,4 +2071,250 @@ struct SocksAccount {
 }
 
 impl SocksAccounts {
-    /// Whether the front wants the credential exchange, which i
+    /// Whether the front wants the credential exchange, which is what decides the
+    /// method the greeting must offer.
+    fn wants_credential(&self) -> bool {
+        self.password
+    }
+
+    /// The account the credential names, if this front knows it.
+    fn account(&self, user: &[u8], pass: &[u8]) -> Option<&SocksAccount> {
+        self.pairs
+            .iter()
+            .find(|account| account.user.as_bytes() == user && account.pass.as_bytes() == pass)
+    }
+
+    /// Whether the front has an account at all, which is what xray's HTTP side gates its 407 on.
+    fn names_accounts(&self) -> bool {
+        !self.pairs.is_empty()
+    }
+}
+
+/// The no-authentication front: the account list a config that names none carries.
+fn no_accounts() -> SocksAccounts {
+    SocksAccounts::default()
+}
+
+/// The accounts a SOCKS front accepts, read from the inbound's own settings.
+///
+/// The shape is xray's: an `auth` of `password` and a list of `accounts` (or its `users` alias), each a `user` and a `pass`. A front that names no `auth` asks for no authentication.
+fn socks_accounts(inbound: &Json) -> SocksAccounts {
+    let settings = inbound.get("settings");
+    let auth = settings
+        .and_then(|s| s.get("auth"))
+        .and_then(Json::as_str)
+        .unwrap_or("");
+    if !auth.eq_ignore_ascii_case("password") {
+        return SocksAccounts::default();
+    }
+    let empty = Vec::new();
+    let accounts = settings
+        .and_then(|s| s.get("accounts").or_else(|| s.get("users")))
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    let mut pairs = Vec::new();
+    for account in accounts {
+        let Some(user) = account.get("user").and_then(Json::as_str) else {
+            continue;
+        };
+        let Some(pass) = account.get("pass").and_then(Json::as_str) else {
+            continue;
+        };
+        pairs.push(SocksAccount {
+            user: user.to_owned(),
+            pass: pass.to_owned(),
+            email: account
+                .get("email")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            level: account.get("level").and_then(Json::as_u32).unwrap_or(0),
+        });
+    }
+    SocksAccounts {
+        password: true,
+        pairs,
+    }
+}
+
+/// The accounts an HTTP front accepts: xray reads `accounts` when the key is there, else `users`, and asks for a credential only when the list names one.
+fn http_accounts(inbound: &Json) -> SocksAccounts {
+    let listed = inbound
+        .get("settings")
+        .and_then(|settings| settings.get("accounts").or_else(|| settings.get("users")))
+        .and_then(Json::as_arr)
+        .unwrap_or(&[]);
+    let pairs = listed
+        .iter()
+        .map(|account| SocksAccount {
+            user: account
+                .get("user")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            pass: account
+                .get("pass")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            email: account
+                .get("email")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            level: account.get("level").and_then(Json::as_u32).unwrap_or(0),
+        })
+        .collect::<Vec<_>>();
+    SocksAccounts {
+        password: !pairs.is_empty(),
+        pairs,
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Role {
+    Vless {
+        users: VlessUsers,
+        carrier: Carrier,
+        freedom: bool,
+        fallbacks: Option<Arc<[Fallback]>>,
+        decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+    },
+    VlessTls {
+        users: VlessUsers,
+        freedom: bool,
+        carrier: Carrier,
+        server: Arc<ferrox_core::tls::TlsServerConfig>,
+        fallbacks: Option<Arc<[Fallback]>>,
+        decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+    },
+    VlessReality {
+        users: VlessUsers,
+        freedom: bool,
+        carrier: Carrier,
+        server: Arc<ferrox_core::tls::RealityServerConfig>,
+        fallbacks: Option<Arc<[Fallback]>>,
+        decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+    },
+    Trojan {
+        keys: std::sync::Arc<[[u8; 56]]>,
+        carrier: Carrier,
+        freedom: bool,
+        account: InboundAccount,
+    },
+    TrojanTls {
+        keys: std::sync::Arc<[[u8; 56]]>,
+        carrier: Carrier,
+        freedom: bool,
+        server: Arc<ferrox_core::tls::TlsServerConfig>,
+        fallbacks: Option<Arc<[Fallback]>>,
+        account: InboundAccount,
+    },
+    TrojanReality {
+        keys: std::sync::Arc<[[u8; 56]]>,
+        carrier: Carrier,
+        freedom: bool,
+        server: Arc<ferrox_core::tls::RealityServerConfig>,
+        fallbacks: Option<Arc<[Fallback]>>,
+        account: InboundAccount,
+    },
+    Vmess {
+        users: crate::vmess::UsersRef,
+        carrier: Carrier,
+        freedom: bool,
+        account: InboundAccount,
+    },
+    VmessTls {
+        users: crate::vmess::UsersRef,
+        carrier: Carrier,
+        freedom: bool,
+        server: Arc<ferrox_core::tls::TlsServerConfig>,
+        account: InboundAccount,
+    },
+    VmessReality {
+        users: crate::vmess::UsersRef,
+        carrier: Carrier,
+        freedom: bool,
+        server: Arc<ferrox_core::tls::RealityServerConfig>,
+        account: InboundAccount,
+    },
+    Shadowsocks {
+        accounts: Arc<crate::shadowsocks::SsAccounts>,
+        carrier: Carrier,
+        freedom: bool,
+        tls: Option<Arc<ferrox_core::tls::TlsServerConfig>>,
+    },
+    Socks {
+        out: Outbound,
+        accounts: Arc<SocksAccounts>,
+    },
+    Http {
+        out: Outbound,
+        accounts: Arc<SocksAccounts>,
+    },
+    Mixed {
+        out: Outbound,
+        accounts: Arc<SocksAccounts>,
+    },
+    /// dokodemo-door: a raw stream to the address its config rewrites every flow to,
+    /// where a `portMap` entry for the flow's own port replaces the address. A
+    /// `followRedirect` flow asks the kernel where it was really going instead.
+    Dokodemo {
+        out: Outbound,
+        dest: DokodemoRewrite,
+        port_map: HashMap<String, DokodemoPortMapEntry>,
+        follow_redirect: bool,
+        receive_original_destination: bool,
+        transparent: Option<crate::sockopt::Tproxy>,
+        mask: Option<ferrox_core::finalmask::Chain>,
+        listen: Option<SocketAddr>,
+        account: Box<InboundAccount>,
+    },
+    /// The role's first bytes are a PROXY protocol header, read before the carrier handshake.
+    Proxied(Box<Role>),
+}
+
+impl Role {
+    /// The post-TLS write chain an accepted stream of this role carries, from its tcp carrier.
+    fn tcp_mask(&self) -> Option<&ferrox_core::finalmask::Chain> {
+        match self {
+            Role::Vless { carrier, .. }
+            | Role::VlessTls { carrier, .. }
+            | Role::VlessReality { carrier, .. }
+            | Role::Trojan { carrier, .. }
+            | Role::TrojanTls { carrier, .. }
+            | Role::TrojanReality { carrier, .. }
+            | Role::Vmess { carrier, .. }
+            | Role::VmessTls { carrier, .. }
+            | Role::VmessReality { carrier, .. }
+            | Role::Shadowsocks { carrier, .. } => carrier.tcp_mask(),
+            Role::Dokodemo { mask, .. } => mask.as_ref(),
+            // A front with no tcp carrier has nowhere to arm a chain, so its inbound refuses one.
+            Role::Socks { .. } | Role::Http { .. } | Role::Mixed { .. } => None,
+            Role::Proxied(inner) => inner.tcp_mask(),
+        }
+    }
+
+    /// The source-address filters an accepted stream of this role carries, from its tcp carrier.
+    fn tcp_filter(&self) -> Option<&[ferrox_core::finalmask::SourceFilter]> {
+        match self {
+            Role::Vless { carrier, .. }
+            | Role::VlessTls { carrier, .. }
+            | Role::VlessReality { carrier, .. }
+            | Role::Trojan { carrier, .. }
+            | Role::TrojanTls { carrier, .. }
+            | Role::TrojanReality { carrier, .. }
+            | Role::Vmess { carrier, .. }
+            | Role::VmessTls { carrier, .. }
+            | Role::VmessReality { carrier, .. }
+            | Role::Shadowsocks { carrier, .. } => carrier.tcp_filter(),
+            Role::Dokodemo { mask, .. } => mask.as_ref().and_then(|chain| {
+                let filters = chain.filters();
+                (!filters.is_empty()).then_some(filters)
+            }),
+            Role::Socks { .. } | Role::Http { .. } | Role::Mixed { .. } => None,
+            Role::Proxied(inner) => inner.tcp_filter(),
+        }
+    }
+
+    /// The transparent spelling an accepted c
