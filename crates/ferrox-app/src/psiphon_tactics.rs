@@ -1,0 +1,713 @@
+//! The untunneled Psiphon tactics request: a NaCl-boxed, obfuscated JSON
+//! round trip through a fronted-meek entry, and the broker specs it carries.
+
+use crate::json::{self, Json};
+use crate::psiphon_meek::{self, Meek};
+use crate::psiphon_ssh::{derive_key, random, Identity, Proxy, Rc4, MAGIC, SEED_LENGTH};
+use crypto_box::aead::{Aead, OsRng};
+use crypto_box::{PublicKey, SalsaBox, SecretKey};
+use std::time::Duration;
+
+const MAX_PADDING: usize = 256;
+const MIN_PADDING: usize = SEED_LENGTH;
+const REQUEST_NONCE: u8 = 1;
+const RESPONSE_NONCE: u8 = 2;
+
+/// The keys and front a server entry needs to answer a tactics request.
+#[derive(Debug, Clone)]
+pub(crate) struct Keys {
+    pub(crate) public_key: String,
+    pub(crate) obfuscated_key: String,
+    pub(crate) meek: Meek,
+}
+
+/// One fronting address a broker spec names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Fronting {
+    pub(crate) host: String,
+    pub(crate) addresses: Vec<String>,
+    pub(crate) disable_sni: bool,
+    pub(crate) provider_id: Option<String>,
+}
+
+/// One in-proxy broker a tactics payload names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Broker {
+    pub(crate) public_key: String,
+    pub(crate) root_secret: String,
+    pub(crate) fronts: Vec<Fronting>,
+}
+
+/// The STUN servers a tactics payload names, split by the exchange they answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StunServers {
+    pub(crate) basic: Vec<String>,
+    pub(crate) rfc5780: Vec<String>,
+}
+
+/// The parts of a tactics payload this lane reads.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Tactics {
+    pub(crate) tag: String,
+    pub(crate) ttl: String,
+    pub(crate) brokers: Vec<Broker>,
+    pub(crate) compartments: Vec<String>,
+    pub(crate) stun_servers: StunServers,
+    pub(crate) parameters: Option<Json>,
+}
+
+impl Tactics {
+    /// Read the payload the handshake or a tactics fetch returned.
+    pub(crate) fn from_json(payload: &Json) -> Self {
+        tactics_from_json(payload)
+    }
+
+    /// Fetch tactics through one entry that advertises a tactics capability.
+    pub(crate) fn fetch(
+        server: &crate::psiphon_ssh::Server,
+        identity: &Identity<'_>,
+        timeout: Duration,
+        proxy: Option<&Proxy>,
+        dns: &crate::psiphon_dns::Config,
+        compress_tactics: bool,
+    ) -> Result<Self, String> {
+        let keys = server
+            .tactics
+            .as_ref()
+            .ok_or_else(|| "psiphon tactics: the entry has no tactics capability".to_owned())?;
+        let keyword = ferrox_core::b64::decode(keys.obfuscated_key.as_bytes())
+            .ok_or_else(|| "psiphon tactics: obfuscation key is not base64".to_owned())?;
+        let request = api_params(identity, compress_tactics);
+        let mut obfuscator = Obfuscator::new(&keyword, MAX_PADDING)?;
+        let (mut boxed, ephemeral) = seal(&keys.public_key, request.as_bytes(), REQUEST_NONCE)?;
+        obfuscator.obfuscate(&mut boxed);
+        let mut body = obfuscator.preamble.clone();
+        body.extend_from_slice(&boxed);
+        let mut reply =
+            psiphon_meek::post(&keys.meek, "/", Some("tactics"), &body, timeout, proxy, dns)?;
+        let boxed = open_preamble(&keyword, &mut reply)?;
+        let plain = open(
+            &keys.public_key,
+            &ephemeral,
+            &reply[boxed..],
+            RESPONSE_NONCE,
+        )?;
+        parse_payload(&plain)
+    }
+}
+
+/// A client-side obfuscator seed message, with the RC4 stream it starts.
+struct Obfuscator {
+    preamble: Vec<u8>,
+    client: Rc4,
+}
+
+impl Obfuscator {
+    fn new(keyword: &[u8], max_padding: usize) -> Result<Self, String> {
+        if keyword.is_empty() {
+            return Err("psiphon tactics: missing obfuscation key".to_owned());
+        }
+        let seed = random::<SEED_LENGTH>();
+        let mut client = Rc4::new(&derive_key(&seed, keyword, b"client_to_server"));
+        let span = max_padding.saturating_sub(MIN_PADDING) + 1;
+        let padding_len = MIN_PADDING + usize::from(u16::from_be_bytes(random::<2>())) % span;
+        let mut preamble = Vec::with_capacity(SEED_LENGTH + 8 + padding_len);
+        preamble.extend_from_slice(&seed);
+        preamble.extend_from_slice(&MAGIC.to_be_bytes());
+        preamble.extend_from_slice(&u32::try_from(padding_len).unwrap_or(0).to_be_bytes());
+        let mut padding = vec![0u8; padding_len];
+        getrandom::fill(&mut padding)
+            .map_err(|error| format!("psiphon tactics entropy: {error}"))?;
+        preamble.extend_from_slice(&padding);
+        client.apply(&mut preamble[SEED_LENGTH..]);
+        Ok(Self { preamble, client })
+    }
+
+    fn obfuscate(&mut self, bytes: &mut [u8]) {
+        self.client.apply(bytes);
+    }
+}
+
+/// Strip the server's seed message and decrypt the boxed payload behind it, in place: the box
+/// starts at the returned offset.
+fn open_preamble(keyword: &[u8], reply: &mut [u8]) -> Result<usize, String> {
+    let header_len = SEED_LENGTH + 8;
+    if reply.len() < header_len {
+        return Err("psiphon tactics: response is too short".to_owned());
+    }
+    let seed: [u8; SEED_LENGTH] = reply[..SEED_LENGTH]
+        .try_into()
+        .map_err(|_| "psiphon tactics: response seed".to_owned())?;
+    let mut stream = Rc4::new(&derive_key(&seed, keyword, b"client_to_server"));
+    let mut header = [0u8; 8];
+    header.copy_from_slice(&reply[SEED_LENGTH..header_len]);
+    stream.apply(&mut header);
+    if header[..4] != MAGIC.to_be_bytes()[..] {
+        return Err("psiphon tactics: response magic".to_owned());
+    }
+    let padding = u32::from_be_bytes(header[4..8].try_into().unwrap_or([0; 4])) as usize;
+    let body = header_len
+        .checked_add(padding)
+        .filter(|start| *start <= reply.len())
+        .ok_or_else(|| "psiphon tactics: response padding".to_owned())?;
+    reply[SEED_LENGTH..header_len].copy_from_slice(&header);
+    stream.apply(&mut reply[header_len..body]);
+    stream.apply(&mut reply[body..]);
+    Ok(body)
+}
+
+/// Box the request with the server's tactics public key, prepending the
+/// ephemeral public key the response is sealed to.
+fn seal(
+    public_key: &str,
+    plaintext: &[u8],
+    nonce_byte: u8,
+) -> Result<(Vec<u8>, SecretKey), String> {
+    let key = ferrox_core::b64::decode(public_key.as_bytes())
+        .ok_or_else(|| "psiphon tactics: request key is not base64".to_owned())?;
+    let key = PublicKey::from_slice(&key)
+        .map_err(|_| "psiphon tactics: request key is not 32 bytes".to_owned())?;
+    let mut rng = OsRng;
+    let secret = SecretKey::generate(&mut rng);
+    let ephemeral = secret.public_key();
+    let boxed = SalsaBox::new(&key, &secret);
+    let nonce = nonce(nonce_byte);
+    let cipher = boxed
+        .encrypt(
+            crypto_box::aead::Nonce::<SalsaBox>::from_slice(&nonce),
+            plaintext,
+        )
+        .map_err(|_| "psiphon tactics: request encryption".to_owned())?;
+    let mut payload = Vec::with_capacity(ephemeral.as_bytes().len() + cipher.len());
+    payload.extend_from_slice(ephemeral.as_bytes());
+    payload.extend_from_slice(&cipher);
+    Ok((payload, secret))
+}
+
+/// Open the response with the request key and the ephemeral key that sealed
+/// the request.
+fn open(
+    public_key: &str,
+    ephemeral: &SecretKey,
+    ciphertext: &[u8],
+    nonce_byte: u8,
+) -> Result<Vec<u8>, String> {
+    let key = ferrox_core::b64::decode(public_key.as_bytes())
+        .ok_or_else(|| "psiphon tactics: request key is not base64".to_owned())?;
+    let key = PublicKey::from_slice(&key)
+        .map_err(|_| "psiphon tactics: request key is not 32 bytes".to_owned())?;
+    let boxed = SalsaBox::new(&key, ephemeral);
+    let nonce = nonce(nonce_byte);
+    boxed
+        .decrypt(
+            crypto_box::aead::Nonce::<SalsaBox>::from_slice(&nonce),
+            ciphertext,
+        )
+        .map_err(|_| "psiphon tactics: response encryption".to_owned())
+}
+
+fn nonce(byte: u8) -> [u8; 24] {
+    let mut bytes = [0u8; 24];
+    bytes[0] = byte;
+    bytes
+}
+
+fn api_params(identity: &Identity<'_>, compress_tactics: bool) -> String {
+    let mut body = format!(
+        r#"{{"session_id":"{}","propagation_channel_id":"{}","sponsor_id":"{}","client_version":"{}","client_platform":"{}","relay_protocol":"FRONTED-MEEK-OSSH","network_type":"unknown","stored_tactics_tag":"","speed_test_samples":[]"#,
+        json_escape(identity.session_id),
+        json_escape(identity.propagation),
+        json_escape(identity.sponsor),
+        json_escape(identity.version),
+        json_escape(identity.platform)
+    );
+    if !identity.authorizations.is_empty() {
+        body.push_str(r#","authorizations":["#);
+        for (index, authorization) in identity.authorizations.iter().enumerate() {
+            if index > 0 {
+                body.push(',');
+            }
+            body.push('"');
+            body.push_str(&json_escape(authorization));
+            body.push('"');
+        }
+        body.push(']');
+    }
+    if !identity.client_features.is_empty() {
+        body.push_str(r#","client_features":["#);
+        for (index, feature) in identity.client_features.iter().enumerate() {
+            if index > 0 {
+                body.push(',');
+            }
+            body.push('"');
+            body.push_str(&json_escape(feature));
+            body.push('"');
+        }
+        body.push(']');
+    }
+    if let Some(region) = identity
+        .egress_region
+        .filter(|region| region.len() == 2 && region.bytes().all(|byte| byte.is_ascii_uppercase()))
+    {
+        body.push_str(r#","egress_region":"#);
+        body.push('"');
+        body.push_str(&json_escape(region));
+        body.push('"');
+    }
+    if let Some(region) = identity.device_region {
+        body.push_str(r#","device_region":"#);
+        body.push('"');
+        body.push_str(&json_escape(region));
+        body.push('"');
+    }
+    if compress_tactics {
+        body.push_str(r#","psiphon_api_response_version":"1""#);
+    }
+    body.push('}');
+    body
+}
+
+/// Parse a tactics response, sending binary CBOR straight to the CBOR decoder.
+fn parse_payload(payload: &[u8]) -> Result<Tactics, String> {
+    let payload = if payload.first().is_some_and(|byte| *byte >= 0x80) {
+        crate::psiphon_broker::cbor_tactics_to_json(payload)
+            .ok_or_else(|| "psiphon tactics: response is not a payload".to_owned())?
+    } else {
+        let text = String::from_utf8_lossy(payload);
+        match json::parse(&text) {
+            Ok(payload) => payload,
+            Err(_) => crate::psiphon_broker::cbor_tactics_to_json(payload)
+                .ok_or_else(|| "psiphon tactics: response is not a payload".to_owned())?,
+        }
+    };
+    Ok(tactics_from_json(&payload))
+}
+
+/// Read the `Tactics` value from the JSON view of a tactics response.
+fn tactics_from_json(payload: &Json) -> Tactics {
+    let tag = payload
+        .get("Tag")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let Some(tactics) = payload.get("Tactics") else {
+        return Tactics {
+            tag,
+            ttl: String::new(),
+            brokers: Vec::new(),
+            compartments: Vec::new(),
+            stun_servers: StunServers::default(),
+            parameters: None,
+        };
+    };
+    let ttl = tactics
+        .get("TTL")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let parameters = tactics.get("Parameters");
+    let brokers =
+        brokers_from(parameters.and_then(|parameters| parameters.get("InproxyBrokerSpecs")));
+    let compartments = compartments_from(
+        parameters.and_then(|parameters| parameters.get("InproxyCommonCompartmentIDs")),
+    );
+    let stun_servers = StunServers {
+        basic: stun_list(
+            parameters,
+            "InproxyClientSTUNServerAddresses",
+            "InproxySTUNServerAddresses",
+        ),
+        rfc5780: stun_list(
+            parameters,
+            "InproxyClientSTUNServerAddressesRFC5780",
+            "InproxySTUNServerAddressesRFC5780",
+        ),
+    };
+    Tactics {
+        tag,
+        ttl,
+        brokers,
+        compartments,
+        stun_servers,
+        parameters: parameters.cloned(),
+    }
+}
+
+/// The client-specific list wins over the generic one, as in the reference.
+fn stun_list(parameters: Option<&Json>, client: &str, generic: &str) -> Vec<String> {
+    for key in [client, generic] {
+        let Some(addresses) = parameters
+            .and_then(|parameters| parameters.get(key))
+            .and_then(Json::as_arr)
+        else {
+            continue;
+        };
+        let addresses: Vec<String> = addresses
+            .iter()
+            .filter_map(Json::as_str)
+            .map(str::to_owned)
+            .collect();
+        if !addresses.is_empty() {
+            return addresses;
+        }
+    }
+    Vec::new()
+}
+
+/// Parse a configured `InproxyBrokerSpecs` value, with the same validation as tactics.
+pub(crate) fn brokers_from(specs: Option<&Json>) -> Vec<Broker> {
+    specs
+        .and_then(Json::as_arr)
+        .map(|specs| specs.iter().filter_map(broker).collect())
+        .unwrap_or_default()
+}
+
+/// Parse a configured `InproxyCommonCompartmentIDs` value, with the same validation as tactics.
+pub(crate) fn compartments_from(ids: Option<&Json>) -> Vec<String> {
+    ids.and_then(Json::as_arr)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Json::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn broker(spec: &Json) -> Option<Broker> {
+    let public_key = spec
+        .get("BrokerPublicKey")
+        .and_then(Json::as_str)
+        .filter(|key| !key.is_empty())?
+        .to_owned();
+    let root_secret = spec
+        .get("BrokerRootObfuscationSecret")
+        .and_then(Json::as_str)
+        .filter(|secret| !secret.is_empty())?
+        .to_owned();
+    let fronts: Vec<Fronting> = spec
+        .get("BrokerFrontingSpecs")
+        .and_then(Json::as_arr)
+        .map(|specs| specs.iter().filter_map(fronting).collect())
+        .unwrap_or_default();
+    if fronts.is_empty() {
+        return None;
+    }
+    Some(Broker {
+        public_key,
+        root_secret,
+        fronts,
+    })
+}
+
+fn fronting(spec: &Json) -> Option<Fronting> {
+    let host = spec.get("Host").and_then(Json::as_str)?.to_owned();
+    let addresses = spec
+        .get("Addresses")
+        .and_then(Json::as_arr)
+        .map(|addresses| {
+            addresses
+                .iter()
+                .filter_map(Json::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let disable_sni = spec
+        .get("DisableSNI")
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    let provider_id = spec
+        .get("FrontingProviderID")
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+    Some(Fronting {
+        host,
+        addresses,
+        disable_sni,
+        provider_id,
+    })
+}
+
+fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch < ' ' => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", u32::from(ch));
+            }
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    /// SSH authorizations reach the tactics API request.
+    fn authorizations_reach_the_api_request() {
+        let authorizations = vec!["a\"b".to_owned()];
+        let identity = Identity {
+            session_id: "00",
+            authorizations: &authorizations,
+            sponsor: "sponsor",
+            propagation: "propagation",
+            platform: "Android",
+            version: "453",
+            egress_region: None,
+            device_region: None,
+            device_location: None,
+            client_features: &[],
+            split_tunnel: false,
+            split_tunnel_regions: &[],
+            api_encoding: crate::psiphon_ssh::ApiEncoding::Json,
+            api_protocol: crate::psiphon_ssh::ApiProtocol::Ssh,
+            compress_tactics: false,
+            disable_api: false,
+            ssh_algorithms: None,
+        };
+        assert!(api_params(&identity, false).contains(r#""authorizations":["a\"b"]"#));
+        assert!(api_params(&identity, true).contains(r#""psiphon_api_response_version":"1""#));
+    }
+
+    #[test]
+    fn a_preamble_encrypts_the_magic_and_padding() {
+        let mut obfuscator = Obfuscator::new(b"key", MAX_PADDING).expect("obfuscator");
+        let preamble = obfuscator.preamble.clone();
+        let seed = &preamble[..SEED_LENGTH];
+        let mut rest = preamble[SEED_LENGTH..].to_vec();
+        let mut stream = Rc4::new(&derive_key(seed, b"key", b"client_to_server"));
+        stream.apply(&mut rest);
+        assert_eq!(&rest[..4], &MAGIC.to_be_bytes());
+        let padding = u32::from_be_bytes(rest[4..8].try_into().expect("padding")) as usize;
+        assert!((MIN_PADDING..=MAX_PADDING).contains(&padding));
+        assert_eq!(rest.len(), 8 + padding);
+        let mut body = b"body".to_vec();
+        obfuscator.obfuscate(&mut body);
+        stream.apply(&mut body);
+        assert_eq!(body, b"body");
+    }
+
+    #[test]
+    fn a_boxed_request_opens_into_a_boxed_response() {
+        let mut rng = OsRng;
+        let server_secret = SecretKey::generate(&mut rng);
+        let server_public = ferrox_core::b64::encode(server_secret.public_key().as_bytes());
+        let (request, client_secret) = seal(&server_public, b"hello", REQUEST_NONCE).expect("seal");
+        let client_public = PublicKey::from_slice(&request[..32]).expect("ephemeral");
+        let server_box = SalsaBox::new(&client_public, &server_secret);
+        let plain = server_box
+            .decrypt(
+                crypto_box::aead::Nonce::<SalsaBox>::from_slice(&nonce(REQUEST_NONCE)),
+                &request[32..],
+            )
+            .expect("request opens");
+        assert_eq!(plain, b"hello");
+        let response = server_box
+            .encrypt(
+                crypto_box::aead::Nonce::<SalsaBox>::from_slice(&nonce(RESPONSE_NONCE)),
+                &b"world"[..],
+            )
+            .expect("response seals");
+        assert_eq!(
+            open(&server_public, &client_secret, &response, RESPONSE_NONCE).expect("open"),
+            b"world"
+        );
+    }
+
+    #[test]
+    fn a_server_preamble_is_stripped_before_the_box() {
+        let keyword = b"key";
+        let mut client = Obfuscator::new(keyword, MAX_PADDING).expect("obfuscator");
+        let mut body = b"box".to_vec();
+        client.obfuscate(&mut body);
+        let mut reply = client.preamble.clone();
+        reply.extend_from_slice(&body);
+        let (at, counts) = ferrox_core::alloc_count::measure(|| open_preamble(keyword, &mut reply));
+        assert_eq!(&reply[at.expect("preamble")..], b"box");
+        assert_eq!(counts.allocs, 0, "the reply is decrypted where it lies");
+    }
+
+    #[test]
+    fn a_rejected_preamble_leaves_the_reply_untouched() {
+        let keyword = b"key";
+        let client = Obfuscator::new(keyword, MAX_PADDING).expect("obfuscator");
+        let mut forged = client.preamble.clone();
+        forged.extend_from_slice(b"box");
+        forged[SEED_LENGTH] ^= 0xFF;
+        let before = forged.clone();
+        assert!(open_preamble(keyword, &mut forged).is_err());
+        assert_eq!(forged, before, "a bad magic leaves the reply as it was");
+
+        let seed = [0u8; SEED_LENGTH];
+        let mut stream = Rc4::new(&derive_key(&seed, keyword, b"client_to_server"));
+        let mut header = [0u8; 8];
+        header[..4].copy_from_slice(&MAGIC.to_be_bytes());
+        header[4..].copy_from_slice(&u32::MAX.to_be_bytes());
+        stream.apply(&mut header);
+        let mut overlong = seed.to_vec();
+        overlong.extend_from_slice(&[0u8; 32]);
+        overlong[SEED_LENGTH..SEED_LENGTH + 8].copy_from_slice(&header);
+        let before = overlong.clone();
+        assert!(open_preamble(keyword, &mut overlong).is_err());
+        assert_eq!(overlong, before, "bad padding leaves the reply as it was");
+    }
+
+    #[test]
+    fn a_payload_names_the_brokers_and_compartments() {
+        let text = br#"{"Tag":"tag","Tactics":{"TTL":"1h","Parameters":{"InproxyBrokerSpecs":[{"BrokerPublicKey":"pk","BrokerRootObfuscationSecret":"rs","BrokerFrontingSpecs":[{"Host":"broker.example"}]}],"InproxyCommonCompartmentIDs":["c1","c2"],"InproxyClientSTUNServerAddresses":["192.0.2.10"]}}}"#;
+        let tactics = parse_payload(text).expect("payload");
+        assert_eq!(tactics.tag, "tag");
+        assert_eq!(tactics.ttl, "1h");
+        assert_eq!(
+            tactics.brokers,
+            vec![Broker {
+                public_key: "pk".to_owned(),
+                root_secret: "rs".to_owned(),
+                fronts: vec![Fronting {
+                    host: "broker.example".to_owned(),
+                    addresses: Vec::new(),
+                    disable_sni: false,
+                    provider_id: None,
+                }],
+            }]
+        );
+        assert_eq!(tactics.compartments, vec!["c1".to_owned(), "c2".to_owned()]);
+        assert_eq!(
+            tactics.stun_servers,
+            StunServers {
+                basic: vec!["192.0.2.10".to_owned()],
+                rfc5780: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_broker_without_a_fronting_entry_is_skipped() {
+        let text = br#"{"Tag":"tag","Tactics":{"Parameters":{"InproxyBrokerSpecs":[{"BrokerPublicKey":"pk","BrokerRootObfuscationSecret":"rs","BrokerFrontingSpecs":[]},{"BrokerPublicKey":"ok","BrokerRootObfuscationSecret":"rs2","BrokerFrontingSpecs":[{"Host":"broker.example"}]}]}}}"#;
+        let tactics = parse_payload(text).expect("payload");
+        assert_eq!(tactics.brokers.len(), 1);
+        assert_eq!(tactics.brokers[0].public_key, "ok");
+    }
+
+    #[test]
+    fn a_client_stun_list_wins_over_the_generic_one() {
+        let text = br#"{"Tag":"tag","Tactics":{"Parameters":{"InproxySTUNServerAddresses":["generic.example"],"InproxySTUNServerAddressesRFC5780":["generic-rfc.example"],"InproxyClientSTUNServerAddresses":["client.example"],"InproxyClientSTUNServerAddressesRFC5780":["client-rfc.example"]}}}"#;
+        let tactics = parse_payload(text).expect("payload");
+        assert_eq!(
+            tactics.stun_servers,
+            StunServers {
+                basic: vec!["client.example".to_owned()],
+                rfc5780: vec!["client-rfc.example".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    fn an_unchanged_payload_has_no_tactics() {
+        let tactics = parse_payload(br#"{"Tag":"same"}"#).expect("payload");
+        assert_eq!(tactics.tag, "same");
+        assert_eq!(tactics.brokers, Vec::new());
+    }
+
+    #[test]
+    fn a_text_payload_keeps_the_json_path_for_non_ascii() {
+        let tactics = parse_payload(r#"{"Tag":"é"}"#.as_bytes()).expect("payload");
+        assert_eq!(tactics.tag, "é");
+    }
+
+    fn parse_payload_json_first(payload: &[u8]) -> Result<Tactics, String> {
+        let text = String::from_utf8_lossy(payload);
+        let payload = match crate::json::parse(&text) {
+            Ok(payload) => payload,
+            Err(_) => crate::psiphon_broker::cbor_tactics_to_json(payload)
+                .ok_or_else(|| "psiphon tactics: response is not a payload".to_owned())?,
+        };
+        Ok(tactics_from_json(&payload))
+    }
+
+    #[test]
+    fn a_binary_cbor_payload_skips_the_lossy_text_copy() {
+        let payload = [0xa1, 0x63, b'T', b'a', b'g', 0x64, b's', b'a', b'm', b'e'];
+        let (new, new_counts) = ferrox_core::alloc_count::measure(|| parse_payload(&payload));
+        let (old, old_counts) =
+            ferrox_core::alloc_count::measure(|| parse_payload_json_first(&payload));
+        assert_eq!(new.expect("new"), old.expect("old"));
+        assert!(
+            old_counts.allocs > new_counts.allocs,
+            "the old path copied the binary payload through a lossy string: {new_counts:?} vs {old_counts:?}"
+        );
+        assert!(old_counts.bytes > new_counts.bytes);
+    }
+
+    #[test]
+    fn a_cbor_payload_names_the_same_tag() {
+        let payload = [0xa1, 0x63, b'T', b'a', b'g', 0x64, b's', b'a', b'm', b'e'];
+        let tactics = parse_payload(&payload).expect("payload");
+        assert_eq!(tactics.tag, "same");
+        assert_eq!(tactics.brokers, Vec::new());
+    }
+
+    #[test]
+    fn a_cbor_payload_reads_integer_keys_and_decompresses_the_tactics() {
+        use std::io::Write as _;
+
+        fn text(out: &mut Vec<u8>, text: &str) {
+            assert!(text.len() < 24);
+            out.push(0x60 | text.len() as u8);
+            out.extend_from_slice(text.as_bytes());
+        }
+        fn bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+            if bytes.len() < 24 {
+                out.push(0x40 | bytes.len() as u8);
+            } else if let Ok(len) = u8::try_from(bytes.len()) {
+                out.extend_from_slice(&[0x58, len]);
+            } else {
+                let len = u16::try_from(bytes.len()).expect("test payload fits");
+                out.push(0x59);
+                out.extend_from_slice(&len.to_be_bytes());
+            }
+            out.extend_from_slice(bytes);
+        }
+
+        let json = br#"{"TTL":"2h","Parameters":{"InproxyCommonCompartmentIDs":["c1"]}}"#;
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(json).expect("compresses");
+        let compressed = encoder.finish().expect("finishes");
+
+        let mut payload = vec![0xa3];
+        payload.push(1);
+        text(&mut payload, "tag");
+        payload.push(2);
+        bytes(&mut payload, &compressed);
+        payload.push(3);
+        payload.push(1);
+
+        let tactics = parse_payload(&payload).expect("payload");
+        assert_eq!(tactics.tag, "tag");
+        assert_eq!(tactics.ttl, "2h");
+        assert_eq!(tactics.compartments, vec!["c1".to_owned()]);
+    }
+
+    #[test]
+    fn a_fronting_spec_keeps_its_provider_id() {
+        let text = br#"{"Tag":"tag","Tactics":{"Parameters":{"InproxyBrokerSpecs":[{"BrokerPublicKey":"pk","BrokerRootObfuscationSecret":"rs","BrokerFrontingSpecs":[{"Host":"broker.example","FrontingProviderID":"provider"}]}]}}}"#;
+        let tactics = parse_payload(text).expect("payload");
+        assert_eq!(
+            tactics.brokers[0].fronts[0].provider_id.as_deref(),
+            Some("provider")
+        );
+    }
+}
