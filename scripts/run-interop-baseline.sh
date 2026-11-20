@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+filter="${1:-${BASELINE_SUITES:-all}}"
+if [[ "$filter" != "all" && "$filter" != "zeronet" && "$filter" != "xray-rust" ]]; then
+  echo "::error::unknown suite '$filter'; want all|zeronet|xray-rust"
+  exit 1
+fi
+pins_file="upstream/pins.toml"
+out_dir="target/interop-baseline"
+report="$PWD/$out_dir/interop-baseline-summary.md"
+mkdir -p "$out_dir"
+
+parse_pins() {
+  awk '
+    function f(v) { return v == "" ? "-" : v }
+    /^\[sources\./ {
+      if (name != "") print name "\t" repo "\t" rev "\t" enabled "\t" f(suite) "\t" f(binary) "\t" f(seam) "\t" f(path) "\t" f(diag)
+      name = $0; sub(/^\[sources\./, "", name); sub(/\]$/, "", name)
+      repo = ""; rev = ""; enabled = ""; suite = ""; binary = ""; seam = ""; path = ""; diag = ""
+      next
+    }
+    /^repo[[:space:]]*=/ { repo = $0; sub(/^[^=]*=[[:space:]]*"/, "", repo); sub(/"[[:space:]]*$/, "", repo); next }
+    /^rev[[:space:]]*=/ { rev = $0; sub(/^[^=]*=[[:space:]]*"/, "", rev); sub(/"[[:space:]]*$/, "", rev); next }
+    /^test_enabled[[:space:]]*=/ { enabled = $0; sub(/^[^=]*=[[:space:]]*/, "", enabled); next }
+    /^suite[[:space:]]*=/ { suite = $0; sub(/^[^=]*=[[:space:]]*"/, "", suite); sub(/"[[:space:]]*$/, "", suite); next }
+    /^ferrox_binary[[:space:]]*=/ { binary = $0; sub(/^[^=]*=[[:space:]]*"/, "", binary); sub(/"[[:space:]]*$/, "", binary); next }
+    /^seam[[:space:]]*=/ { seam = $0; sub(/^[^=]*=[[:space:]]*"/, "", seam); sub(/"[[:space:]]*$/, "", seam); next }
+    /^path[[:space:]]*=/ { path = $0; sub(/^[^=]*=[[:space:]]*"/, "", path); sub(/"[[:space:]]*$/, "", path); next }
+    /^baseline_env[[:space:]]*=/ { diag = $0; sub(/^[^=]*=[[:space:]]*"/, "", diag); sub(/"[[:space:]]*$/, "", diag); next }
+    END { if (name != "") print name "\t" repo "\t" rev "\t" enabled "\t" f(suite) "\t" f(binary) "\t" f(seam) "\t" f(path) "\t" f(diag) }
+  ' "$pins_file"
+}
+
+pin_field() {
+  parse_pins | awk -F'\t' -v n="$1" -v c="$2" '$1 == n { print $c }'
+}
+
+{
+  echo "# interop baseline (upstream suites against ferrox-app)"
+  echo
+  echo "The suites this change reaches, whole, pass or fail, against this workspace's ferrox-app: the plan decides which suites are reached, and a suite with no test of the touched methods is skipped. A suite that stays runs every test it has, because this is the baseline and not the conformance subset. Informational: failures never fail this job; infra failures (bad pin, no toolchain, unbuilt binary) do."
+  echo
+} >"$report"
+
+if ! cargo build --locked -q -p ferrox-app 2>/dev/null; then
+  echo "::error::ferrox-app does not build in this workspace"
+  exit 1
+fi
+
+workspace="$PWD"
+for name in zeronet xray-rust; do
+  if [[ "$filter" != "all" && "$filter" != "$name" ]]; then
+    continue
+  fi
+  repo="$(pin_field "$name" 2)"
+  rev="$(pin_field "$name" 3)"
+  suite="$(pin_field "$name" 5)"
+  binary="$(pin_field "$name" 6)"
+  seam="$(pin_field "$name" 7)"
+  diag="$(pin_field "$name" 9)"
+  if [[ -z "$repo" || -z "$rev" || -z "$suite" || -z "$binary" || -z "$seam" ]]; then
+    echo "::error::$name pin is missing repo/rev/suite/binary/seam"
+    exit 1
+  fi
+  # The plan says whether this suite is reached at all: a suite whose tests none of
+  # the touched methods names is skipped, and one that stays runs whole below.
+  scoped="$(python3 scripts/ci-scope.py suite "$name")"
+  if [[ -z "$scoped" ]]; then
+    echo "OUT OF SCOPE: $name — no test of its suite measures this change"
+    continue
+  fi
+  suite="$scoped"
+  full="${suite%% --test-threads=1*} --test-threads=1"
+  if [[ "$full" == "$suite" ]]; then
+    echo "::error::$name suite carries no --test-threads=1 filter names to strip; refusing to rerun the conformance subset as a baseline"
+    exit 1
+  fi
+  dir="$(mktemp -d)"
+  # One commit, the pinned one: the suite reads the tree, never its history, and a
+  # full clone of the reference costs a minute the pin cannot pay back.
+  if ! git init --quiet "$dir" >/dev/null 2>&1 \
+    || ! git -C "$dir" remote add origin "$repo" >/dev/null 2>&1 \
+    || ! git -C "$dir" fetch --quiet --no-tags --depth 1 origin "$rev" >/dev/null 2>&1 \
+    || ! git -C "$dir" checkout --quiet FETCH_HEAD 2>/dev/null; then
+    echo "::error::$name rev $rev does not resolve on $repo"
+    rm -rf "$dir"
+    exit 1
+  fi
+  if [[ "$(git -C "$dir" rev-parse HEAD)" != "$rev" ]]; then
+    echo "::error::$name checkout is not at its pin $rev"
+    rm -rf "$dir"
+    exit 1
+  fi
+  if ! git -C "$dir" grep -qI -e "$seam" -- . 2>/dev/null; then
+    echo "::error::$name declares seam $seam but $rev never reads it"
+    rm -rf "$dir"
+    exit 1
+  fi
+  log="$PWD/$out_dir/$name.log"
+  echo "baseline: $name @ ${rev:0:7}, every test its suite has (the plan reached it) against $workspace/target/debug/$binary via $seam"
+  # A pin's `baseline_env` names hooks its harness reads to say what it was waiting on; without them a hang is only a timeout.
+  # A pin's rev is immutable, so its build is worth keeping: a pin bump is a new directory.
+  build_dir="$HOME/.cache/ferrox-upstream/$name-${rev:0:12}"
+  mkdir -p "$build_dir"
+  run_env=("CARGO_TARGET_DIR=$build_dir" "$seam=$workspace/target/debug/$binary")
+  if [[ "$diag" != "-" ]]; then
+    read -r -a diag_args <<<"$diag"
+    run_env+=("${diag_args[@]}")
+  fi
+  set +e
+  (cd "$dir" && env "${run_env[@]}" bash -c "$full" >"$log" 2>&1)
+  test_rc=$?
+  set -e
+  rm -rf "$dir"
+  ran="$(sed -n 's/^running \([0-9][0-9]*\) tests\{0,1\}$/\1/p' "$log" | head -1)"; ran="${ran:-0}"
+  # The oracle can split a per-test `... ok`; the summary line is printed once and cannot split.
+  passed="$(sed -n 's/^test result:.* \([0-9][0-9]*\) passed;.*/\1/p' "$log" | tail -1)"; passed="${passed:-0}"
+  failed="$(sed -n 's/^test result:.* \([0-9][0-9]*\) failed;.*/\1/p' "$log" | tail -1)"; failed="${failed:-0}"
+  completed="$(grep -c '^test result:' "$log" || true)"; completed="${completed:-0}"
+  all_names="$(grep -E '^test .* \.\.\. ' "$log" | sed -E 's/^test (.*) \.\.\..*/\1/' | sort -u)"
+  failed_names="$(awk '
+    /^failures:$/ { section = 1; next }
+    /^---- / { section = 0; next }
+    section && /^    [^ ]/ { print $1; next }
+    /^test result:/ { section = 0 }
+  ' "$log" | sort -u)"
+  passed_names="$(comm -23 \
+    <(printf '%s\n' "$all_names" | sed '/^$/d') \
+    <(printf '%s\n' "$failed_names" | sed '/^$/d'))"
+  if ((test_rc != 0)) && ((completed == 0)); then
+    echo "::error::$name suite never reached a test result (exit $test_rc); a build or startup failure is not a recorded baseline"
+    tail -n 40 "$log" >&2 || true
+    exit 1
+  fi
+  if ((passed + failed == 0)); then
+    echo "::error::$name ran no tests (libtest running $ran); a baseline that executed nothing proves nothing"
+    tail -n 40 "$log" >&2 || true
+    exit 1
+  fi
+  {
+    echo "## $name @ \`${rev:0:7}\` (go exit $test_rc; libtest running $ran; $passed passed, $failed failed)"
+    echo
+    if ((failed > 0)); then
+      echo "### failed"
+      echo
+      echo '```'
+      printf '%s\n' "$failed_names" | sed '/^$/d'
+      echo '```'
+      echo
+      echo "### failure output (each block in full, or its head and tail when a harness floods the middle)"
+      echo
+      echo '```'
+      awk '
+        function emit(  i) {
+          if (!open) return
+          print header
+          if (n <= 44) for (i = 1; i <= n; i++) print body[i]
+          else {
+            for (i = 1; i <= 8; i++) print body[i]
+            print "... " n - 36 " lines elided ..."
+            for (i = n - 27; i <= n; i++) print body[i]
+          }
+          print ""
+          open = 0; n = 0; delete body
+        }
+        /^---- .* stdout ----$/ { emit(); open = 1; header = $0; next }
+        open && /^failures:$/ { emit(); next }
+        open { body[++n] = $0 }
+        END { emit() }
+      ' "$log" || true
+      echo '```'
+      echo
+    fi
+    echo "### passed"
+    echo
+    echo '```'
+    printf '%s\n' "$passed_names" | sed '/^$/d'
+    echo '```'
+    echo
+  } >>"$report"
+  if ((failed > 0)) || ((test_rc != 0)); then
+    echo "::warning::$name baseline: $passed passed, $failed failed; recorded, job stays green"
+  else
+    echo "$name baseline: all green ($passed passed)"
+  fi
+done
+
+cat "$report"
+exit 0
