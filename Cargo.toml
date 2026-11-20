@@ -1,0 +1,68 @@
+[workspace]
+resolver = "3"
+exclude = ["upstream"]
+members = [
+  "crates/ferrox-core",
+  "crates/ferrox-bench",
+  "crates/ferrox-prompt",
+  "crates/ferrox-app",
+  "crates/ferrox-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/FerroxCo/ferrox"
+description = "A from-scratch proxy core, proven bit-identical to the implementations it replaces and not slower at any measured length"
+publish = false
+
+[workspace.dependencies]
+ferrox-core = { version = "0.0.1", path = "crates/ferrox-core" }
+
+rustls = { version = "0.23", default-features = false }
+
+[workspace.lints.rust]
+missing_docs = "allow"
+missing_debug_implementations = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+mismatched_lifetime_syntaxes = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "allow"
+missing_safety_doc = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+cast_possible_truncation = "allow"
+cast_lossless = "allow"
+cast_sign_loss = "allow"
+
+[profile.dev]
+# The seed every worktree clones is a test build, not a debugging session:
+# symbols and line tables cost gigabytes and move no test result. A panic still
+# prints its own file and line, and `RUST_BACKTRACE=1` still names the frames.
+debug = 0
+# A full test build is the unit here; incremental state was a gigabyte per
+# branch and bought seconds. Cargo's own fingerprints still skip unchanged
+# crates across builds.
+incremental = false
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
