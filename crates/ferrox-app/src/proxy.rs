@@ -355,3 +355,170 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
             &portals,
             observatory.clone(),
             api.as_ref(),
+            configured.as_ref(),
+            geodata.as_ref().map(crate::geodata::Config::outbound),
+        )
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
+    });
+    if let Some(observatory) = &observatory {
+        crate::observatory::spawn(root, observatory, route.as_ref())
+            .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    }
+    if let Some(api) = api.as_ref() {
+        wire_api(
+            api,
+            observatory,
+            Runtime::new(
+                outbound.clone(),
+                route.clone(),
+                freedom,
+                Arc::clone(&portals),
+            ),
+            test,
+        )
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    }
+    if !test {
+        if let Some(geodata) = geodata {
+            crate::geodata::start(geodata, route.clone(), outbound.clone(), root.clone());
+        }
+        install_dns_route(route.clone(), outbound.as_ref());
+        start_bridges(root, outbound.as_ref(), route.as_ref());
+    }
+    let inbounds = serve_inbounds_counted(
+        label,
+        root,
+        outbound.as_ref(),
+        route.as_ref(),
+        true,
+        freedom,
+        &portals,
+        api.as_deref(),
+        seed,
+        test,
+        false,
+    );
+    if inbounds == 0 {
+        match refused.as_deref().unwrap_or(&[]).first() {
+            Some(reason) => exit(&format!("bad config {label}: {reason}")),
+            None => exit(&format!("no servable inbound in {label}")),
+        }
+    }
+    if test {
+        println!("Configuration OK.");
+        std::process::exit(0);
+    }
+    if ["XRAY_VLESS_FULL_BINARY", "XRAY_HYSTERIA_BINARY"]
+        .iter()
+        .any(|seam| std::env::var_os(seam).is_some())
+    {
+        // The startup record both pinned interop harnesses scan the server log for; not this binary's name.
+        println!("ferrox-app serving; harness readiness token: core: Xray 26.11.9 started");
+    }
+    loop {
+        thread::park();
+        report_dial_failures();
+    }
+}
+
+/// The observatory a config names; `-test` proves both blocks parse without starting either probe loop.
+fn start_observatory(
+    root: &Json,
+    test: bool,
+) -> Result<Option<Arc<crate::observatory::Observatory>>, String> {
+    if test {
+        crate::observatory::validate(root).map(|()| None)
+    } else {
+        crate::observatory::configure(root)
+    }
+}
+
+/// The file-backed apps and the `geodata` block: `-test` parses them without opening or creating anything the reference also leaves alone.
+fn install_file_apps(root: &Json, test: bool) -> Result<Option<crate::geodata::Config>, String> {
+    let geodata = crate::geodata::parse(root, &crate::router::asset_dirs())?;
+    if test {
+        crate::metrics::parse(root)?;
+        crate::accesslog::parse(root)?;
+    } else {
+        crate::metrics::install(root)?;
+        crate::accesslog::install(root)?;
+    }
+    Ok(geodata)
+}
+
+/// Attach the runtime a management call drives, then listen for it; `-test` skips the listener.
+fn wire_api(
+    api: &Arc<crate::commander::Api>,
+    observatory: Option<Arc<crate::observatory::Observatory>>,
+    runtime: Runtime,
+    test: bool,
+) -> Result<(), String> {
+    api.set_observatory(observatory);
+    api.set_runtime(Arc::new(runtime));
+    if !test {
+        api.serve_listen()?;
+    }
+    Ok(())
+}
+
+/// One inbound's lane: a route plan when the config carries rules, else the single configured outbound.
+fn routed_out(
+    outbound: Option<&Outbound>,
+    route: Option<&Arc<RouteShared>>,
+    inbound: &Json,
+    source_known: bool,
+) -> Option<Outbound> {
+    match route {
+        Some(shared) => Some(Outbound::Route(Arc::new(RoutePlan::new(
+            Arc::clone(shared),
+            inbound_tag(inbound),
+            inbound_name(inbound),
+            source_known,
+        )))),
+        None => outbound.cloned(),
+    }
+}
+
+/// Opens every inbound the config names, proving each server inbound's rules at startup, and reports
+/// how many opened and whether a hysteria inbound wants the readiness token.
+fn inbound_sniffing(inbound: &Json, label: &str) -> Option<Arc<crate::sniff::Sniffing>> {
+    crate::sniff::parse(inbound.get("sniffing")).unwrap_or_else(|error| {
+        exit(&format!(
+            "bad config {label}: inbound {} sniffing {error}",
+            inbound_tag(inbound).as_deref().unwrap_or("<untagged>")
+        ))
+    })
+}
+
+fn refuse_source(
+    route: Option<&Arc<RouteShared>>,
+    inbound: &Json,
+    label: &str,
+    kind: &str,
+    prove: bool,
+) -> bool {
+    let Some(shared) = route else {
+        return false;
+    };
+    let tag = inbound_tag(inbound);
+    let Some(selector) = shared
+        .routing
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .source_refusal(tag.as_deref())
+    else {
+        return false;
+    };
+    let message = format!(
+        "bad config {label}: {} inbound {} names `{selector}`, which a {kind} flow cannot answer",
+        canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or("")),
+        tag.as_deref().unwrap_or("<untagged>")
+    );
+    if prove {
+        exit(&message);
+    }
+    eprintln!("{message}");
+    true
+}
+
+/// Whether this inb
