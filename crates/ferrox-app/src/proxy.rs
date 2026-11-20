@@ -1377,4 +1377,233 @@ impl Drop for SendThroughGuard {
 
 /// The options the flow on this thread dials with, for a carrier that binds its own datagram socket.
 pub(crate) fn flow_sockopts() -> Option<Arc<crate::sockopt::SocketOptions>> {
-    DIAL_SOCKOPTS.with(|c
+    DIAL_SOCKOPTS.with(|cell| cell.borrow().clone())
+}
+
+/// The source the flow on this thread leaves from, for a carrier that binds its own datagram socket.
+pub(crate) fn flow_source() -> std::io::Result<Option<IpAddr>> {
+    resolve_source(SEND_THROUGH.with(std::cell::Cell::get))
+}
+
+/// The options one flow's dial carries, cleared on drop so a pooled lane thread's next flow starts on the bare socket.
+struct DialSockoptsGuard;
+
+impl DialSockoptsGuard {
+    fn enter(sockopts: Option<Arc<crate::sockopt::SocketOptions>>) -> Self {
+        DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = sockopts);
+        Self
+    }
+}
+
+impl Drop for DialSockoptsGuard {
+    fn drop(&mut self) {
+        DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+/// The `targetStrategy` one flow's outbound names, cleared on drop so a lane that answers before the
+/// request is built cannot leave it for the next flow on the thread.
+struct TargetStrategyGuard;
+
+impl TargetStrategyGuard {
+    fn enter(strategy: Option<FreedomDomain>) -> Self {
+        TARGET_STRATEGY.with(|cell| cell.set(strategy));
+        Self
+    }
+}
+
+impl Drop for TargetStrategyGuard {
+    fn drop(&mut self) {
+        TARGET_STRATEGY.with(|cell| cell.set(None));
+    }
+}
+
+/// The outbound-level `sendThrough`: an address or a CIDR, while xray's two names for the inbound's
+/// own addresses warn and leave the dial unbound.
+fn parse_send_through(outbound: &Json) -> Result<Option<SendThrough>, String> {
+    let Some(value) = outbound.get("sendThrough") else {
+        return Ok(None);
+    };
+    if matches!(value, Json::Null) {
+        return Ok(None);
+    }
+    let Some(text) = value.as_str() else {
+        return Err("sendThrough is not a string".to_owned());
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let refuse = || format!("unable to send through: {text}");
+    if let Some((address, prefix)) = text.split_once('/') {
+        let base = address.parse::<IpAddr>().map_err(|_| refuse())?;
+        let prefix = prefix.parse::<u8>().map_err(|_| refuse())?;
+        let bits = if base.is_ipv4() { 32 } else { 128 };
+        if prefix > bits {
+            return Err(refuse());
+        }
+        return Ok(Some(SendThrough::Cidr { base, prefix }));
+    }
+    if text.eq_ignore_ascii_case("origin") || text.eq_ignore_ascii_case("srcip") {
+        eprintln!(
+            "outbound sendThrough `{text}` is not wired; the dial uses the OS source address"
+        );
+        return Ok(None);
+    }
+    text.parse::<IpAddr>()
+        .map(|address| Some(SendThrough::Address(address)))
+        .map_err(|_| refuse())
+}
+
+/// Whether any outbound names a dial setting, so a config with no `routing` block still builds the
+/// plan that carries it.
+fn dial_settings_present(root: &Json) -> Result<bool, String> {
+    let outbounds = root.get("outbounds").and_then(Json::as_arr).unwrap_or(&[]);
+    let mut present = false;
+    for outbound in outbounds {
+        present |= is_chain_config(outbound);
+        present |= parse_send_through(outbound)?.is_some();
+        present |= parse_outbound_sockopt(outbound)?.is_some();
+        present |= parse_target_strategy(outbound)?.is_some();
+    }
+    Ok(present)
+}
+
+/// The outbound-level `targetStrategy`: the family the handler resolves a named target to before
+/// the protocol sends it, and the reference's own refusal for a name it does not know.
+fn parse_target_strategy(outbound: &Json) -> Result<Option<FreedomDomain>, String> {
+    let Some(text) = outbound.get("targetStrategy").and_then(Json::as_str) else {
+        return Ok(None);
+    };
+    let strategy = FreedomDomain::parse(text)
+        .ok_or_else(|| format!("unsupported target domain strategy: {text}"))?;
+    Ok((strategy != FreedomDomain::AsIs).then_some(strategy))
+}
+
+/// The socket options an outbound's `streamSettings.sockopt` names: the mark, interface and TCP
+/// options its transport dial carries.
+fn parse_outbound_sockopt(
+    outbound: &Json,
+) -> Result<Option<crate::sockopt::SocketOptions>, String> {
+    let mut options = crate::sockopt::parse_outbound(
+        outbound
+            .get("streamSettings")
+            .and_then(|s| s.get("sockopt")),
+    )?;
+    if let Some(tag) = detour_tag(outbound) {
+        if let Some(named) = options
+            .as_ref()
+            .and_then(crate::sockopt::SocketOptions::dialer_proxy)
+        {
+            if named != tag {
+                return Err(format!(
+                    "outbound names both dialerProxy `{named}` and detour `{tag}`"
+                ));
+            }
+        }
+        options
+            .get_or_insert_with(crate::sockopt::SocketOptions::default)
+            .set_dialer_proxy(Some(tag));
+    }
+    let Some(options) = options else {
+        return Ok(None);
+    };
+    if options.address_port_strategy() != crate::sockopt::AddressPortStrategy::None
+        && outbound
+            .get("protocol")
+            .and_then(Json::as_str)
+            .is_some_and(|protocol| protocol.eq_ignore_ascii_case("freedom"))
+    {
+        return Err("freedom outbound does not support \"sockopt.addressPortStrategy\"".to_owned());
+    }
+    Ok(Some(options))
+}
+
+/// The routing table a config runs with: its own block, or an empty one when an outbound names a
+/// dial setting the plan must carry.
+fn routing_for(root: &Json) -> Result<Option<crate::router::Routing>, String> {
+    match crate::router::Routing::parse(root)? {
+        Some(routing) => Ok(Some(routing)),
+        None if dial_settings_present(root)? => Ok(Some(crate::router::Routing::empty())),
+        None => Ok(None),
+    }
+}
+
+/// One dial that leaves from the source `sendThrough` names and carries the options `sockopt`
+/// took; the plain dial stays the same.
+fn dial_from(
+    target: &SocketAddr,
+    source: Option<IpAddr>,
+    sockopts: Option<&crate::sockopt::SocketOptions>,
+    fast: bool,
+    timeout: std::time::Duration,
+) -> std::io::Result<(std::net::TcpStream, bool)> {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    if timeout.is_zero() {
+        return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+    }
+    let domain = if target.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    if let Some(sockopts) = sockopts {
+        sockopts.apply_to(&socket, *target)?;
+    }
+    if let Some(source) = source {
+        socket.bind(&SockAddr::from(SocketAddr::new(source, 0)))?;
+    }
+    let armed = fast && crate::fastopen::arm(&socket).is_ok();
+    crate::conn::connect_bounded(&socket, &SockAddr::from(*target), timeout)?;
+    Ok((std::net::TcpStream::from(socket), armed))
+}
+
+/// Hand the target to the outbound a `dialerProxy` names over a loopback pipe, then return the
+/// other end to the dialer. The hop owns its own source, options and strategy; the pipe owns none.
+pub(crate) fn dial_through_proxy(
+    target: SocketAddr,
+    tag: &str,
+    options: &crate::sockopt::SocketOptions,
+) -> std::io::Result<Connection> {
+    let Some(shared) = options.route() else {
+        return Err(std::io::Error::other(
+            "there is no outbound handler for dialerProxy",
+        ));
+    };
+    if OUTBOUND_TAG.with(|cell| cell.borrow().as_deref() == Some(tag)) {
+        return Err(std::io::Error::other(format!(
+            "dialerProxy loops through `{tag}`"
+        )));
+    }
+    if shared.outbound_ref(tag).is_none() {
+        return Err(std::io::Error::other(
+            "there is no outbound handler for dialerProxy",
+        ));
+    }
+    let (source, sockopts, strategy) = if shared.default_tag.as_deref() == Some(tag) {
+        (
+            shared.default_source,
+            shared.default_sockopts.clone(),
+            shared.default_strategy,
+        )
+    } else {
+        (
+            shared.sources.get(tag).copied(),
+            shared.sockopts.get(tag).cloned(),
+            shared.strategies.get(tag).copied(),
+        )
+    };
+    let (client, server) = crate::reverse::loopback_pair()
+        .ok_or_else(|| std::io::Error::other("dialerProxy: no loopback pipe"))?;
+    let name = tag.to_owned();
+    thread::Builder::new()
+        .name("ferrox-dialer-proxy".to_owned())
+        .spawn(move || {
+            let Some(out) = shared.outbound_ref(&name) else {
+                return;
+            };
+            let _source = SendThroughGuard::enter(source);
+            let _sockopts = DialSockoptsGuard::enter(sockopts);
+            let _target = TargetStrategyGuard::enter(strategy);
+            serve_co
