@@ -760,4 +760,88 @@ fn serve_inbounds_counted(
                             );
                             inbounds += armed;
                             if tcp && !dokodemo_has(&dokodemo_networks(inbound), "udp") {
-            
+                                if let Some(stop) = &handler_stop {
+                                    handler_stops.push((Arc::clone(stop), address.clone()));
+                                }
+                            }
+                        }
+                    }
+                    "hc" => {
+                        if serve_hc_inbound(address, inbound) {
+                            inbounds += 1;
+                        }
+                    }
+                    "blackhole" => {
+                        if serve_blackhole_inbound(
+                            address,
+                            inbound,
+                            label,
+                            handler_stop.as_ref().map(Arc::clone),
+                        ) {
+                            if let Some(stop) = &handler_stop {
+                                handler_stops.push((Arc::clone(stop), address.clone()));
+                            }
+                            inbounds += 1;
+                        }
+                    }
+                    "tun" => {
+                        // A tun flow has no source or local address, so a reaching rule that names one is refused here.
+                        if refuse_source(route, inbound, label, "tun", prove) {
+                            continue;
+                        }
+                        let Some(out) = routed(inbound, false) else {
+                            continue;
+                        };
+                        let spec = match tun_spec(inbound) {
+                            Ok(spec) => spec,
+                            Err(error) => {
+                                eprintln!("tun inbound: {error}");
+                                continue;
+                            }
+                        };
+                        // `-test` proves the device spec without opening an interface the reference also leaves closed.
+                        if test {
+                            #[cfg(not(target_os = "linux"))]
+                            if tun_stack(inbound) == "system" {
+                                eprintln!("tun inbound: the system tun stack is Linux-only");
+                                continue;
+                            }
+                            inbounds += 1;
+                        } else if serve_tun_inbound(&spec, inbound, &out, address) {
+                            inbounds += 1;
+                        }
+                    }
+                    "wireguard" => {
+                        if refuse_source(route, inbound, label, "tunnel", prove) {
+                            continue;
+                        }
+                        let Some(out) = routed(inbound, false) else {
+                            continue;
+                        };
+                        match crate::wg::serve_inbound(inbound, &out, address) {
+                            Ok(_) => inbounds += 1,
+                            Err(reason) => eprintln!("wireguard inbound {address}: {reason}"),
+                        }
+                    }
+                    "masque" => {
+                        if refuse_source(route, inbound, label, "MASQUE", prove) {
+                            continue;
+                        }
+                        let Some(out) = routed(inbound, false) else {
+                            continue;
+                        };
+                        match crate::masque::serve_inbound(inbound, &out, address) {
+                            Ok(_) => inbounds += 1,
+                            Err(reason) => eprintln!("masque inbound {address}: {reason}"),
+                        }
+                    }
+                    _ => eprintln!("unsupported inbound protocol `{protocol}` in {label}"),
+                }
+            }
+            if !prove && inbounds > before {
+                if let Some(networks) = server_networks(inbound) {
+                    if let Some(shared) = route {
+                        shared.record_server_inbound(
+                            handler_tag.clone(),
+                            &networks,
+                            portal_inbound(protoc
