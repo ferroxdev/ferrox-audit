@@ -175,4 +175,183 @@ impl DokodemoRewrite {
             .get("port")
             .and_then(Json::as_port)
             .filter(|port| *port != 0)
-            .or_else(|| settings.get("rewritePort").and_th
+            .or_else(|| settings.get("rewritePort").and_then(Json::as_port))
+            .filter(|port| *port != 0);
+        Self { host, port }
+    }
+
+    /// The target a followed flow falls back to: only what the config spelled, with no
+    /// local address to complete it, because the reference fills from the flow alone.
+    fn configured(&self) -> Option<Destination> {
+        let host = self.host.as_deref()?;
+        Some(dokodemo_destination(host, self.port.unwrap_or(0)))
+    }
+
+    /// The target a non-followed flow asks for: the config's half, or the flow's own
+    /// address half, completed by a `portMap` entry for the flow's local port.
+    fn resolved(
+        &self,
+        local: Option<SocketAddr>,
+        port_map: &HashMap<String, DokodemoPortMapEntry>,
+    ) -> Destination {
+        let host = self
+            .host
+            .as_deref()
+            .unwrap_or_else(|| dokodemo_default_host(local));
+        let port = self
+            .port
+            .or_else(|| local.map(|local| local.port()))
+            .unwrap_or(0);
+        let mut dest = dokodemo_destination(host, port);
+        let key = local
+            .map(|local| local.port().to_string())
+            .unwrap_or_default();
+        if let Some(entry) = port_map.get(&key) {
+            if let Some(host) = entry.host.as_deref() {
+                dest = dokodemo_destination(host, dest.port());
+            }
+            if let Some(port) = entry.port {
+                dest = dokodemo_with_port(&dest, port);
+            }
+        }
+        dest
+    }
+}
+
+/// xray's fallback when the config names no address: the loopback of the flow's family,
+/// or `localhost` when the local address did not parse.
+fn dokodemo_default_host(local: Option<SocketAddr>) -> &'static str {
+    match local {
+        Some(local) if local.ip().to_canonical().is_ipv4() => "127.0.0.1",
+        Some(_) => "::1",
+        None => "localhost",
+    }
+}
+
+/// One host and port in xray's own spelling, with a bracketed IPv6 literal unwrapped.
+fn dokodemo_destination(host: &str, port: u16) -> Destination {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    match host.parse::<IpAddr>() {
+        Ok(ip) => Destination::Address(SocketAddr::new(ip, port)),
+        Err(_) => Destination::Name(host.to_owned(), port),
+    }
+}
+
+fn dokodemo_with_port(dest: &Destination, port: u16) -> Destination {
+    match dest {
+        Destination::Name(host, _) => Destination::Name(host.clone(), port),
+        Destination::Address(address) => Destination::Address(SocketAddr::new(address.ip(), port)),
+    }
+}
+
+/// The networks dokodemo-door is told to carry; the reference defaults an absent list to
+/// tcp and lets `network` alone override its older `allowedNetwork` spelling.
+fn dokodemo_networks(inbound: &Json) -> Vec<&str> {
+    let Some(settings) = inbound.get("settings") else {
+        return vec!["tcp"];
+    };
+    let named = match settings.get("network") {
+        Some(Json::Null) | None => settings.get("allowedNetwork"),
+        named => named,
+    };
+    match named {
+        Some(Json::Arr(items)) => items.iter().filter_map(Json::as_str).collect(),
+        Some(Json::Str(network)) => network.split(',').collect(),
+        _ => vec!["tcp"],
+    }
+}
+
+fn dokodemo_has(networks: &[&str], network: &str) -> bool {
+    networks
+        .iter()
+        .any(|named| named.eq_ignore_ascii_case(network))
+}
+
+/// The reference carries `userLevel` on the inbound's user; the door applies it as the
+/// accepted stream's policy level.
+fn dokodemo_user_level(inbound: &Json) -> u32 {
+    inbound
+        .get("settings")
+        .and_then(|settings| settings.get("userLevel"))
+        .and_then(Json::as_u32)
+        .unwrap_or(0)
+}
+
+#[allow(clippy::too_many_lines)]
+fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, test: bool) -> ! {
+    // Sized before the first lane, so every flow from here reads the ceiling its role named.
+    if dials_a_proxy(root) {
+        lane_pool::mark_proxy_peer();
+    }
+    // Armed before the first inbound opens, so every flow from here reads the budget the operator named.
+    crate::budgets::apply_config(
+        &crate::config::budgets(root)
+            .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}"))),
+    );
+    crate::dnsapp::install(root)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    crate::policy::install(root)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    if let Some(policy) = seed.and_then(|seed| seed.policy.clone()) {
+        crate::policy::install_config(policy);
+    }
+    crate::stats::install(root)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    let geodata = install_file_apps(root, test)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    install_default_outbound_tag(root);
+    let freedom = has_protocol(root, "outbounds", "freedom");
+    let configured = find_outbound_with(root, test)
+        .unwrap_or_else(|reason| exit(&format!("bad config {label}: {reason}")));
+    // A loopback outbound names its inbound by tag, so it resolves only when no concrete dial won.
+    let loopback = find_loopback_outbound(root);
+    let outbound = match configured.clone() {
+        Some(Outbound::Freedom(_)) | None if loopback.is_some() => {
+            let tag = loopback.expect("guarded by is_some");
+            Some(
+                resolve_loopback(root, &tag, freedom).unwrap_or_else(|reason| {
+                    exit(&format!("bad config {label}: loopback {reason}"))
+                }),
+            )
+        }
+        selected => selected,
+    };
+    if let Some(Outbound::Freedom(freedom)) = &outbound {
+        let _ = DIRECT_FREEDOM.set(Arc::clone(freedom));
+    }
+    // Named only when no outbound was built, so the reason behind an exit that names nothing is on its own line first.
+    let refused = outbound.is_none().then(|| diagnose_outbounds(root));
+    let portals =
+        reverse_portals(root).unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    let routing = routing_for(root)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
+        .or_else(|| {
+            geodata
+                .as_ref()
+                .filter(|geodata| !geodata.outbound().is_empty())
+                .map(|_| crate::router::Routing::empty())
+        });
+    let observatory = start_observatory(root, test)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    crate::metrics::set_observatory(observatory.clone());
+    let api_config = match seed.and_then(|seed| seed.api.clone()) {
+        Some(config) => Some(config),
+        None => crate::commander::ApiConfig::from_json(root),
+    };
+    let api = api_config.map(crate::commander::Api::new);
+    if let Some(api) = api.as_ref() {
+        match seed {
+            Some(seed) => api.seed_outbounds(&seed.outbounds),
+            None => api.seed_json_outbounds(root),
+        }
+    }
+    let route = routing.map(|routing| {
+        route_shared_with_api(
+            root,
+            routing,
+            &portals,
+            observatory.clone(),
+            api.as_ref(),
