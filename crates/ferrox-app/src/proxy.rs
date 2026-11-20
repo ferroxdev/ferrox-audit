@@ -844,4 +844,297 @@ fn serve_inbounds_counted(
                         shared.record_server_inbound(
                             handler_tag.clone(),
                             &networks,
-                            portal_inbound(protoc
+                            portal_inbound(protocol),
+                        );
+                    }
+                }
+            }
+            let handler_users = vmess_users;
+            if let Some(stop) = &handler_stop {
+                stop.expect_listeners(handler_stops.len());
+            }
+            if let Some(api) = api {
+                if inbounds > before {
+                    api.register_inbound(
+                        handler_tag.as_deref().unwrap_or_default(),
+                        handler_raw,
+                        protocol,
+                        handler_users,
+                        handler_stops,
+                    );
+                }
+            }
+        }
+    }
+    inbounds
+}
+
+fn register_inbound_sniffing(inbound: &Json, label: &str, addresses: &[String]) {
+    let sniffing = inbound_sniffing(inbound, label);
+    for address in addresses {
+        crate::sniff::register(address, sniffing.clone());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn serve_inbounds(
+    label: &str,
+    root: &Json,
+    outbound: Option<&Outbound>,
+    route: Option<&Arc<RouteShared>>,
+    freedom: bool,
+    portals: &crate::reverse::Portals,
+    api: Option<&std::sync::Arc<crate::commander::Api>>,
+    seed: Option<&crate::xray_pb::Seed>,
+) -> usize {
+    serve_inbounds_counted(
+        label,
+        root,
+        outbound,
+        route,
+        true,
+        freedom,
+        portals,
+        api.map(std::sync::Arc::as_ref),
+        seed,
+        false,
+        false,
+    )
+}
+
+/// The listener lanes an inbound opens: the device's own (a tun names no socket), else one
+/// address per port the reference expands. `None` is an inbound that bound nothing, skipped.
+fn serve_addresses(inbound: &Json, protocol: &str) -> Option<Vec<String>> {
+    if crate::tun::is_device(protocol) {
+        return Some(vec![String::new()]);
+    }
+    let addresses = inbound_addresses(inbound);
+    (!addresses.is_empty()).then_some(addresses)
+}
+
+/// A device inbound is refused with the reason the device layer computes from the config; any other unserved inbound is refused by name.
+fn refuse_inbound(protocol: &str, label: &str, inbound: &Json) {
+    if crate::tun::is_device(protocol) {
+        let settings = inbound.get("settings");
+        let field = |key| {
+            settings
+                .as_ref()
+                .and_then(|s| s.get(key))
+                .or_else(|| inbound.get(key))
+        };
+        let spec = crate::tun::Spec::new(
+            field("name").and_then(Json::as_str),
+            field("mtu").and_then(Json::as_u32).map(|m| m as usize),
+        );
+        eprintln!(
+            "device inbound `{protocol}` in {label}: {}",
+            crate::tun::refusal_reason(&spec)
+        );
+    } else {
+        eprintln!("unsupported inbound protocol `{protocol}` in {label}: refused, not served");
+    }
+}
+
+/// Served inbounds; the `tun` device inbound opens a native interface and relays TCP flows.
+const SERVED_INBOUNDS: [&str; 16] = [
+    "vless",
+    "trojan",
+    "vmess",
+    "shadowsocks",
+    "hysteria",
+    "tuic",
+    "anytls",
+    "socks",
+    "http",
+    "mixed",
+    "tun",
+    "wireguard",
+    "masque",
+    "dokodemo-door",
+    "hc",
+    "blackhole",
+];
+
+/// Whether this protocol is an inbound this binary serves.
+fn inbound_served(protocol: &str) -> bool {
+    SERVED_INBOUNDS.contains(&protocol)
+}
+
+/// A listener's stop flag: removal sets it and dials the address, so a blocked accept wakes, sees
+/// the flag, and drops the socket instead of waiting for a flow that will never come.
+#[derive(Debug, Default)]
+pub(crate) struct Stop {
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    listeners: std::sync::atomic::AtomicUsize,
+    closed: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+impl Stop {
+    pub(crate) fn new() -> Self {
+        Self {
+            listeners: std::sync::atomic::AtomicUsize::new(1),
+            ..Self::default()
+        }
+    }
+
+    /// The number of listener threads that must drop their sockets before the stop is closed.
+    pub(crate) fn expect_listeners(&self, count: usize) {
+        self.listeners
+            .store(count.max(1), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The same flag as an owned handle the QUIC driver can poll.
+    pub(crate) fn shared(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.stopped)
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn mark_closed(&self) {
+        if self
+            .listeners
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            > 1
+        {
+            return;
+        }
+        if let Ok(mut closed) = self.closed.lock() {
+            *closed = true;
+            self.wake.notify_all();
+        }
+    }
+
+    /// Wait for the listener thread to drop its socket, so a caller that removes a handler does not
+    /// report success while the port still accepts.
+    pub(crate) fn wait_closed(&self) -> bool {
+        let Ok(mut closed) = self.closed.lock() else {
+            return false;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !*closed {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let Ok(next) = self.wake.wait_timeout(closed, left) else {
+                return false;
+            };
+            closed = next.0;
+        }
+        true
+    }
+}
+
+/// Wake a listener the stop flag already named; the accepted connection carries no flow.
+pub(crate) fn wake_listener(stop: &Stop, address: &str) {
+    if !stop.stopped() {
+        return;
+    }
+    if let Ok(target) = parse_target(address) {
+        let _ = crate::conn::connect(&target, std::time::Duration::from_millis(500));
+    }
+}
+
+fn spawn_role(address: &str, role: Role, tag: Option<String>) {
+    spawn_role_stopped(address, role, tag, None);
+}
+
+fn spawn_role_stopped(
+    address: &str,
+    role: Role,
+    tag: Option<String>,
+    stop: Option<std::sync::Arc<Stop>>,
+) {
+    let listener = bind_listener(address, &role)
+        .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
+    let address = address.to_owned();
+    thread::spawn(move || accept_listener(listener, &address, &role, tag.as_deref(), stop));
+}
+
+fn try_spawn_role_stopped(
+    address: &str,
+    role: Role,
+    tag: Option<String>,
+    stop: Option<std::sync::Arc<Stop>>,
+) -> std::io::Result<()> {
+    let listener = bind_listener(address, &role)?;
+    let address = address.to_owned();
+    thread::spawn(move || accept_listener(listener, &address, &role, tag.as_deref(), stop));
+    Ok(())
+}
+
+/// The role a listener serves, wrapped when its config says the first bytes are a PROXY header.
+fn inbound_role(inbound: &Json, role: Role) -> Role {
+    if crate::config::accept_proxy_protocol(inbound.get("streamSettings")) {
+        Role::Proxied(Box::new(role))
+    } else {
+        role
+    }
+}
+
+fn serve_vless_inbound(
+    address: &str,
+    inbound: &Json,
+    freedom: bool,
+    path: &str,
+    portals: &crate::reverse::Portals,
+    stop: Option<&Arc<Stop>>,
+) -> bool {
+    let users = inbound_users(inbound, portals);
+    let carrier = inbound_carrier(inbound);
+    let sec = stream_security(inbound);
+    // QUIC arrives on UDP with its own handshake, so it never reaches the TCP accept loop.
+    if matches!(carrier, Carrier::Quic) {
+        return serve_vless_quic_inbound(address, inbound, &users, freedom, path);
+    }
+    if let Carrier::Unknown { network } = &carrier {
+        eprintln!("unsupported network `{network}` in {path}: refused, not served");
+        return false;
+    }
+    // An xdrive inbound has no socket: its `security` belongs to the store's lanes, so the stream is served as it arrives from the log.
+    if let Carrier::Xdrive { settings } = &carrier {
+        serve_vless_xdrive_inbound(address, inbound, &users, settings, freedom);
+        return true;
+    }
+    match sec {
+        // Hysteria carries its own QUIC TLS, so xray's `security: tls` names that handshake rather than a second layer above it.
+        _ if matches!(carrier, Carrier::Hysteria(_)) => {
+            let Carrier::Hysteria(config) = carrier else {
+                return false;
+            };
+            if config.version != 2 {
+                eprintln!(
+                    "hysteria v{} carrier in {path} is not the v2 serve `hysteria` names: serves nothing",
+                    config.version
+                );
+                return false;
+            }
+            let owned = address.to_owned();
+            let Some(settings) = inbound.get("streamSettings") else {
+                eprintln!("unreadable hysteria identity in {path}: serves nothing");
+                return false;
+            };
+            let Some(identity) = crate::config::tls_identity_from_settings(settings) else {
+                eprintln!("unreadable hysteria identity in {path}: serves nothing");
+                return false;
+            };
+            let masq = crate::config::masquerade_from_stream(Some(settings));
+            let users = Arc::clone(&users);
+            let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+            let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+                serve_vless_hysteria(flow.with_meter(meter.clone()), &users, freedom);
+            });
+            serve_hysteria_thread(&owned, &config, &identity, &masq, &serve)
+        }
+        "tls" => serve_vless_tls_inbound(address, inbound, &users, &carrier, freedom, path, stop),
+        "reality" => serve_vless_reality_inbound(address, inbound, &users, &carrier, freedom, path),
+        _ if !vle
