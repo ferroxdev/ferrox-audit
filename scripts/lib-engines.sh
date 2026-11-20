@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+
+note() { echo "note: $*" >&2; }
+fail() { echo "::error::$*" >&2; exit 1; }
+
+release_of() {
+  awk -v want="$1" '
+    /^\[sources\./ { in_source = ($0 == "[sources." want "]") }
+    in_source && /^bench_release[[:space:]]*=/ {
+      gsub(/^bench_release[[:space:]]*=[[:space:]]*"|"[[:space:]]*$/, "")
+      print; exit
+    }
+  ' "$pins_file"
+}
+
+release_digest_of() {
+  awk -v want="$1" -v asset="$2" '
+    /^\[sources\./ { in_source = ($0 == "[sources." want "]") }
+    in_source && /^bench_sha256[[:space:]]*=/ {
+      line = $0
+      sub(/^[^=]*=[[:space:]]*"/, "", line)
+      sub(/"[[:space:]]*$/, "", line)
+      count = split(line, entries, ",")
+      for (i = 1; i <= count; i++) {
+        split(entries[i], pair, "=")
+        name = pair[1]; value = pair[2]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+        if (name == asset) { print value; exit }
+      }
+    }
+  ' "$pins_file"
+}
+
+pin_of() {
+  awk -v want="$1" '
+    /^\[sources\./ { in_source = ($0 == "[sources." want "]") }
+    in_source && /^rev[[:space:]]*=/ {
+      gsub(/^rev[[:space:]]*=[[:space:]]*"|"[[:space:]]*$/, "")
+      print; exit
+    }
+  ' "$pins_file"
+}
+
+verify_checkout() {
+  local name="$1" rev
+  rev="$(pin_of "$name")"
+  [[ -n "$rev" ]] || fail "no rev for $name in $pins_file"
+  # Never let git walk up to the ferrox tree itself: a missing .git must read
+  # as missing, not as the parent checkout's HEAD.
+  if [[ ! -d "upstream/$name/.git" ]]; then
+    fail "upstream/$name is missing; run scripts/fetch-upstream.sh"
+  fi
+  local have
+  have="$(GIT_CEILING_DIRECTORIES="$PWD" git -C "upstream/$name" rev-parse HEAD 2>/dev/null)" || \
+    fail "upstream/$name has no readable HEAD; re-run scripts/fetch-upstream.sh"
+  [[ "$have" == "$rev" ]] || fail "upstream/$name is at $have, not the pinned $rev"
+}
+
+exe_suffix() {
+  case "${OS:-}" in
+    Windows_NT) printf '.exe' ;;
+    *) printf '' ;;
+  esac
+}
+
+built() {
+  # `download-artifact` records the mode in its zip and restores 0644, so a
+  # binary handed over from the build job arrives non-executable and would be
+  # refused for the one thing `--no-build` needs it for. Put the bit back
+  # before judging, or the cells job fails on a binary it was given.
+  local path
+  for path in "$1$(exe_suffix)" "$1"; do
+    if [[ -f "$path" ]]; then
+      chmod +x "$path" 2>/dev/null || true
+    fi
+    if [[ -x "$path" ]]; then
+      printf '%s\n' "$path"
+      return 0
+    fi
+  done
+  return 1
+}
+
+build() {
+  local name="$1" rev binary cached
+  # The reference trees are not held to this tree's lint gate: their vendored
+  # dependencies trip `-D warnings` in ways their own maintainers accept.
+  rev="$(pin_of "$name")"
+  binary="$engine_dir/$name$(exe_suffix)"
+  if cached="$(built "$binary")"; then
+    # A cache hit carries another lane's adapter beside its runtime: the one
+    # script this tree edits is copied over it, or the cell runs the stale one.
+    [[ "$name" != aether ]] || cp scripts/run-aether.py "$binary" || return 1
+    echo "$cached"
+    return 0
+  fi
+  # The artifact lane hands checkouts between jobs, and a checkout that did
+  # not survive the handoff is re-fetched at its pin here, never guessed: the
+  # subshell keeps verify_checkout's exit from ending the whole matrix run.
+  if ! (verify_checkout "$name" 2>/dev/null); then
+    note "re-fetching $name at its pin; the handoff did not carry it"
+    local -a refetch=(--only "$name")
+    [[ -z "${FERROX_UPSTREAM_HANDOFF:-}" ]] || refetch+=(--replace)
+    ./scripts/fetch-upstream.sh "${refetch[@]}" >&2 || return 1
+    verify_checkout "$name" || return 1
+  fi
+  case "$name" in
+    xray-core)
+      note "building the pinned Xray-core at $rev"
+      (cd "upstream/$name" && GOENV=off GOWORK=off CGO_ENABLED=0 \
+        go build -o "$OLDPWD/$binary" ./main) || return 1
+      ;;
+    sing-box)
+      note "building the pinned sing-box at $rev"
+      (cd "upstream/$name" && python3 "$OLDPWD/scripts/patch-sing-box.py" . &&
+        GOENV=off GOWORK=off CGO_ENABLED=0 \
+        go build -tags "with_utls,with_quic,with_wireguard" -o "$OLDPWD/$binary" ./cmd/sing-box) || return 1
+      ;;
+    zeronet)
+      note "building the pinned ZeroNet (zray) at $rev"
+      (cd "upstream/$name" && env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo build --release -p zray-cli --bin zray) || return 1
+      local zray
+      zray="$(built "upstream/$name/target/release/zray")" || return 1
+      cp "$zray" "$binary" || return 1
+      ;;
+    xray-rust)
+      note "building the pinned xray-rust at $rev (long: aws-lc-rs, quinn, prost)"
+      (cd "upstream/$name" && CARGO_TARGET_DIR="$OLDPWD/$engine_dir/xray-rust-target" \
+        env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo build --release -p xray-cli --bin xray-rust) || return 1
+      local rust_cli
+      rust_cli="$(built "$engine_dir/xray-rust-target/release/xray-rust")" || return 1
+      cp "$rust_cli" "$binary" || return 1
+      ;;
+    xray-core-rust)
+      # btls builds a patched BoringSSL with CMake, clang and a setup script; the
+      # project publishes that build for the runners this matrix has, so use it
+      # and keep the source checkout for reading rather than rebuilding it.
+      local release asset
+      release="$(release_of "$name")"
+      [[ -n "$release" ]] || { note "no bench_release pinned for $name"; return 1; }
+      case "$(uname -s)/$(uname -m)" in
+        Linux/x86_64) asset="xray-linux-amd64" ;;
+        Darwin/arm64 | Darwin/aarch64) asset="xray-macos-arm64" ;;
+        Darwin/x86_64) asset="xray-macos-amd64" ;;
+        MINGW*/x86_64 | MSYS*/x86_64 | CYGWIN*/x86_64) asset="xray-windows-amd64.exe" ;;
+        *)
+          note "no pinned xray-core-rust release for $(uname -s)/$(uname -m)"
+          return 1
+          ;;
+      esac
+      local digest part actual
+      digest="$(release_digest_of "$name" "$asset")"
+      [[ -n "$digest" ]] || { note "no pinned digest for $name $asset"; return 1; }
+      note "downloading xray-core-rust $release ($asset)"
+      part="$(mktemp "$binary.part.XXXXXX")" || return 1
+      curl -fsSL --retry 3 -o "$part" \
+        "https://github.com/Be90nia/xray-core-rust/releases/download/$release/$asset" || {
+        rm -f "$part"
+        return 1
+      }
+      actual="$(python3 -c 'import hashlib,sys
+print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$part")" || {
+        rm -f "$part"
+        return 1
+      }
+      if [[ "$actual" != "$digest" ]]; then
+        rm -f "$part"
+        note "$asset digest $actual does not match the pinned $digest"
+        return 1
+      fi
+      mv -f "$part" "$binary" || return 1
+      chmod +x "$binary" 2>/dev/null || true
+      ;;
+    leaf)
+      note "building the pinned leaf at $rev (long: aws-lc-rs, quinn, tungstenite)"
+      (cd "upstream/$name" && CARGO_TARGET_DIR="$OLDPWD/$engine_dir/leaf-target" \
+        env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo build --release -p leaf-cli --bin leaf) || return 1
+      local leaf_cli
+      leaf_cli="$(built "$engine_dir/leaf-target/release/leaf")" || return 1
+      cp "$leaf_cli" "$binary" || return 1
+      ;;
+    aether)
+      case "$(uname -s)" in
+        Linux | Darwin) ;;
+        *)
+          note "aether's benchmark adapter is POSIX-only"
+          return 1
+          ;;
+      esac
+      note "building the pinned Aether at $rev (long: BoringSSL, quiche)"
+      (cd "upstream/$name/aether" && CARGO_TARGET_DIR="$OLDPWD/$engine_dir/aether-target" \
+        env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo build --release --locked --bin aether) || return 1
+      local aether_bin
+      aether_bin="$(built "$engine_dir/aether-target/release/aether")" || return 1
+      cp "$aether_bin" "$engine_dir/aether-bin" || return 1
+      cp scripts/run-aether.py "$binary" || return 1
+      chmod +x "$binary"
+      ;;
+    *)
+      fail "unknown engine source `$name`"
+      ;;
+  esac
+  built "$binary"
+}
+
+config_arg_for() {
+  case "$1" in
+    sing-box) echo short ;;
+    zeronet) echo positional ;;
+    leaf) echo dash-c ;;
+    *) echo long ;;
+  esac
+}
+
+dialect_for() {
+  case "$1" in
+    sing-box) echo sing-box ;;
+    leaf) echo leaf ;;
+    *) echo xray ;;
+  esac
+}

@@ -1,0 +1,271 @@
+"""Shared numbers for the benchmark matrix: medians, verdicts, and run deltas.
+
+The Rust harness measures and gates; this module restates its two pure
+functions so the renderer and the validator share them: the median of a cell's
+repeats, and the whole-interval rule that turns an interval into a verdict.
+Tolerance and rule match `crates/ferrox-bench/src/stats.rs` (`TOLERANCE`,
+`verdict`); if they ever disagree the validator fails, which is the point.
+
+The comparison helpers are the other direction: they ask whether this run moved
+against the previous published run, not whether it beat the reference in its own
+cell. A shared runner can move 5-10% without a code change, so a delta needs a
+threshold; the default is the top of that noise band, 10%.
+"""
+
+import statistics
+from itertools import pairwise
+
+TOLERANCE = 0.05
+CHANGE_THRESHOLD = 0.10
+
+COMPARE_METRICS = {
+    "throughput_mib_s": ("throughput", "MiB/s", "higher"),
+    "cpu_millis_per_gib": ("CPU per GiB", "ms/GiB", "lower"),
+    "rss_mib": ("peak RSS", "MiB", "lower"),
+    "threads_peak": ("peak threads", "threads", "lower"),
+    "startup_seconds": ("cold start", "s", "lower"),
+    "kernel_calls_per_gib": ("kernel asks", "calls/GiB", "lower"),
+}
+
+
+def median(values):
+    """Median of a non-empty cell sample, statistics.median."""
+    if not values:
+        raise ValueError("median of no values")
+    return statistics.median(values)
+
+
+def verdict_for(interval, _direction):
+    """Whole-interval verdict: better, worse, within-noise, or unproven.
+
+    `interval` is a (low, high) pair or None. It is already oriented by
+    `stats::paired_ratios`, which inverts lower-is-better pairs, so an
+    interval below 1 is worse whichever direction the row names. `_direction`
+    is kept for parity with `stats::verdict`, where the interval is likewise
+    oriented before this rule sees it.
+    """
+    if interval is None:
+        return "unproven"
+    low, high = interval
+    if high < 1.0 - TOLERANCE:
+        return "worse"
+    if low > 1.0 + TOLERANCE:
+        return "better"
+    return "within-noise"
+
+
+def change_for(metric, before, after, threshold=CHANGE_THRESHOLD):
+    """Classify one metric's move against the previous run.
+
+    A change smaller than the threshold is not reported, whatever its sign:
+    the shared runner's own noise is larger than that, and a table full of
+    five-percent flickers is not a regression report. A metric with a missing
+    side is reported as `new` or `missing`, because coverage moving is worth
+    seeing even when no ratio exists.
+    """
+    if metric not in COMPARE_METRICS:
+        raise ValueError(f"unknown metric {metric}")
+    _, _, direction = COMPARE_METRICS[metric]
+    if before is None and after is None:
+        return None
+    if before is None:
+        return {"kind": "new", "change": None, "verdict": "new"}
+    if after is None:
+        return {"kind": "missing", "change": None, "verdict": "missing"}
+    if before == 0:
+        if after == 0:
+            return None
+        return {"kind": "new", "change": None, "verdict": "new"}
+    change = (after - before) / before
+    if abs(change) <= threshold:
+        return None
+    better = change > 0 if direction == "higher" else change < 0
+    return {
+        "kind": "change",
+        "change": change,
+        "verdict": "improvement" if better else "regression",
+    }
+
+
+def compare_results(after, before, threshold=CHANGE_THRESHOLD):
+    """Every scenario/engine/metric that moved beyond the noise threshold.
+
+    Both documents are `matrix-results.json`; scenarios and engines that
+    disappeared are reported as coverage loss rather than dropped, so a tier
+    that loses a row cannot look unchanged.
+    """
+    previous = {
+        scenario.get("id"): scenario for scenario in before.get("scenarios", [])
+    }
+    current = {
+        scenario.get("id"): scenario for scenario in after.get("scenarios", [])
+    }
+    changes = []
+    for scenario_id in sorted(previous, key=str):
+        old = previous[scenario_id]
+        scenario = current.get(scenario_id)
+        if scenario is None:
+            changes.append(
+                {
+                    "scenario": scenario_id,
+                    "base": old.get("base"),
+                    "server": old.get("server"),
+                    "engine": "all",
+                    "metric": "scenario",
+                    "before": None,
+                    "after": None,
+                    "kind": "missing-scenario",
+                    "change": None,
+                    "verdict": "removed scenario",
+                }
+            )
+            continue
+        old_medians = old.get("medians", {})
+        new_medians = scenario.get("medians", {})
+        for engine in sorted(set(old_medians) | set(new_medians)):
+            before_values = old_medians.get(engine, {})
+            after_values = new_medians.get(engine, {})
+            for metric in COMPARE_METRICS:
+                found = change_for(
+                    metric,
+                    before_values.get(metric),
+                    after_values.get(metric),
+                    threshold,
+                )
+                if found is None:
+                    continue
+                changes.append(
+                    {
+                        "scenario": scenario_id,
+                        "base": scenario.get("base"),
+                        "server": scenario.get("server"),
+                        "engine": engine,
+                        "metric": metric,
+                        "before": before_values.get(metric),
+                        "after": after_values.get(metric),
+                        **found,
+                    }
+                )
+    for scenario_id in sorted(set(current) - set(previous), key=str):
+        scenario = current[scenario_id]
+        changes.append(
+            {
+                "scenario": scenario_id,
+                "base": scenario.get("base"),
+                "server": scenario.get("server"),
+                "engine": "all",
+                "metric": "scenario",
+                "before": None,
+                "after": None,
+                "kind": "new-scenario",
+                "change": None,
+                "verdict": "new scenario",
+            }
+        )
+    return changes
+
+
+def changes_markdown(changes, before_date="previous run", threshold=CHANGE_THRESHOLD):
+    """A table of meaningful moves, or one line saying there were none."""
+    if not changes:
+        return (
+            f"No cell moved by more than {threshold:.0%} against "
+            f"{before_date}; the previous bundle stands."
+        )
+    lines = [
+        f"Only cells whose median moved by more than {threshold:.0%} against "
+        f"{before_date} are listed. A positive change is not always good: "
+        "`lower is better` metrics read the other way.",
+        "",
+        "| scenario | server | engine | metric | before | after | change | verdict |",
+        "| -------- | ------ | ------ | ------ | -----: | ----: | -----: | ------- |",
+    ]
+    for change in changes:
+        if change["metric"] == "scenario":
+            metric = (change["verdict"], "")
+            before = after = delta = "\u2014"
+        else:
+            metric = COMPARE_METRICS[change["metric"]]
+            before = format_metric(change["before"], metric[1])
+            after = format_metric(change["after"], metric[1])
+            delta = (
+                "\u2014"
+                if change["change"] is None
+                else f"{change['change']:+.1%}"
+            )
+        lines.append(
+            f"| `{change['base'] or change['scenario']}` | "
+            f"{change['server'] or '\u2014'} | {change['engine']} | "
+            f"{metric[0]} | {before} | {after} | {delta} | "
+            f"{change['verdict']} |"
+        )
+    return "\n".join(lines)
+
+
+def format_metric(value, unit):
+    """A compact metric value for a table cell."""
+    if value is None:
+        return "\u2014"
+    if unit in ("threads", "calls/GiB", "MiB/s"):
+        return f"{value:.0f}"
+    if unit == "s":
+        return f"{value:.2f}"
+    return f"{value:.1f}"
+
+
+def spread(values):
+    """Repeat spread for one cell: a split when one repeat left the others.
+
+    Three repeats cannot prove a distribution, so the stronger word is
+    reserved for a visible gap: at least a 1.25x min-to-max range and a
+    largest gap of at least half that range. Anything else with a sample
+    deviation over 10% is `wide`; the rest is `stable`.
+    """
+    ordered = sorted(values)
+    count = len(ordered)
+    if count < 2 or ordered[-1] <= 0:
+        return None
+    mean = statistics.fmean(ordered)
+    deviation = statistics.stdev(ordered)
+    ratio = ordered[-1] / ordered[0] if ordered[0] > 0 else None
+    gaps = [b - a for a, b in pairwise(ordered)]
+    gap = max(gaps)
+    span = ordered[-1] - ordered[0]
+    split = count >= 3 and (ratio is None or ratio >= 1.25) and gap >= span / 2.0
+    state = "split" if split else "wide" if deviation / mean >= 0.10 else "stable"
+    return {
+        "n": count,
+        "min": ordered[0],
+        "median": statistics.median(ordered),
+        "max": ordered[-1],
+        "mean": mean,
+        "stdev": deviation,
+        "cv": deviation / mean,
+        "ratio": ratio,
+        "gap_ratio": gap / span if span else 0.0,
+        "state": state,
+    }
+
+
+def selftest():
+    """The split rule and the two calmer states."""
+    split = spread([2055.9, 2608.5, 2880.3])
+    assert split["state"] == "split" and split["ratio"] > 1.25
+    wide = spread([90.0, 100.0, 111.0])
+    assert wide["state"] == "wide"
+    stable = spread([100.0, 101.0, 102.0])
+    assert stable["state"] == "stable"
+    stalled = spread([0.0, 500.0, 520.0])
+    assert stalled["state"] == "split" and stalled["ratio"] is None
+    assert spread([0.0, 0.0]) is None
+    assert spread([100.0]) is None
+    assert verdict_for((0.90, 0.94), "higher") == "worse"
+    assert verdict_for((1.06, 1.10), "lower") == "better"
+    assert verdict_for((0.96, 1.04), "lower") == "within-noise"
+    assert verdict_for(None, "higher") == "unproven"
+    print("benchstats: selftest ok")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(selftest())
