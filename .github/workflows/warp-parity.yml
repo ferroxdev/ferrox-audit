@@ -1,0 +1,136 @@
+name: warp parity
+
+on:
+  workflow_dispatch:
+    inputs:
+      edge:
+        description: "Cloudflare MASQUE edge, host:port (blank = 162.159.198.2:443)"
+        required: false
+        type: string
+      target_url:
+        description: "Public file downloaded through WARP (blank = speed.cloudflare.com 64 MiB)"
+        required: false
+        type: string
+      repeats:
+        description: "Paired repeats per engine; nested cells use 3"
+        required: false
+        default: "3"
+        type: string
+  schedule:
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: warp-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  warp-parity:
+    name: same-key WARP parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: upstream/pins.toml
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: warp-parity
+      - name: build the engine and the harness
+        run: cargo build --locked --release -p ferrox-app -p ferrox-bench
+      - name: build the reference
+        run: |
+          set -euo pipefail
+          rev="$(python3 -c 'import tomllib; print(tomllib.load(open("upstream/pins.toml", "rb"))["sources"]["aether"]["rev"])')"
+          test -n "$rev"
+          curl -sSLf -o "$RUNNER_TEMP/aether.tgz" "https://github.com/CluvexStudio/Aether/archive/$rev.tar.gz"
+          mkdir -p upstream/aether
+          tar -xzf "$RUNNER_TEMP/aether.tgz" --strip-components=1 -C upstream/aether
+          (cd upstream/aether/aether && env -u CARGO_ENCODED_RUSTFLAGS cargo build --locked --release --bin aether)
+      - name: registration, same-key local and Cloudflare runs
+        env:
+          WARP_MASQUE_EDGE: ${{ inputs.edge }}
+          WARP_PARITY_URL: ${{ inputs.target_url }}
+          REPEATS: ${{ inputs.repeats || '3' }}
+        run: |
+          [[ "$REPEATS" =~ ^0*[1-9][0-9]*$ ]] || { echo "::error::repeats must be a positive integer, got '$REPEATS'"; exit 1; }
+          args=(--aether upstream/aether/aether/target/release/aether
+                --repeats "$REPEATS")
+          if test -n "${WARP_MASQUE_EDGE:-}"; then args+=(--edge "$WARP_MASQUE_EDGE"); fi
+          if test -n "${WARP_PARITY_URL:-}"; then args+=(--target-url "$WARP_PARITY_URL"); fi
+          python3 scripts/run-warp-parity.py "${args[@]}"
+      - name: local nested WARP cells
+        if: always()
+        env:
+          AETHER_BIN: ${{ github.workspace }}/upstream/aether/aether/target/release/aether
+          FERROX_UPSTREAM_HANDOFF: "1"
+        run: |
+          mkdir -p target/warp-parity
+          cp scripts/run-aether.py target/warp-parity/aether-adapter
+          chmod +x target/warp-parity/aether-adapter
+          ./scripts/run-benchmark-matrix.sh \
+            --tier standard \
+            --out target/warp-parity/local-nested \
+            --engines "xray-core,ferrox,aether=$PWD/target/warp-parity/aether-adapter" \
+            --only warp-masque \
+            --only warp-gool \
+            --only warp-mim \
+            --repeats 3 \
+            --no-build \
+            --bench-bin target/release/ferrox-bench
+      - name: publish the report
+        if: always()
+        run: |
+          {
+            echo
+            echo '```'
+            cat target/warp-parity/report.md 2>/dev/null || echo "no report"
+            echo '```'
+            if test -f target/warp-parity/local-nested/summary.txt; then
+              echo
+              echo '```'
+              cat target/warp-parity/local-nested/summary.txt
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: upload the evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: warp-parity-${{ github.run_id }}
+          path: |
+            target/warp-parity/report.md
+            target/warp-parity/results.json
+            target/warp-parity/local-nested/
+            target/warp-parity/logs/
+            target/warp-parity/runs/**/logs/
+          retention-days: 30
+          if-no-files-found: warn
+
+  result:
+    name: result
+    needs: [warp-parity]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/result
+        with:
+          title: warp-parity
+          needs: ${{ toJSON(needs) }}
+          artifacts: warp-parity-*

@@ -1,0 +1,140 @@
+name: conformance
+
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 5 * * 1"
+
+concurrency:
+  group: conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  plan:
+    name: plan what this change owes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      wide: ${{ steps.scope.outputs.wide }}
+      suites: ${{ steps.scope.outputs.suites }}
+      methods: ${{ steps.scope.outputs.methods }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: plan the scope
+        id: scope
+        shell: bash
+        run: python3 scripts/ci-scope.py scope --wide
+
+  suites:
+    name: upstream suites (those in scope)
+    needs: plan
+    if: needs.plan.outputs.suites == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: conformance
+      # A pin's rev is immutable, so its build is cacheable by the pin file; a pin bump is a new key.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ferrox-upstream
+          key: upstream-build-${{ runner.os }}-${{ hashFiles('upstream/pins.toml') }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: upstream-go-${{ runner.os }}-${{ hashFiles('upstream/pins.toml') }}
+      - name: plan the scope, so each suite is read from the same plan
+        shell: bash
+        run: python3 scripts/ci-scope.py scope --wide > /dev/null
+      - name: upstream suites by test_enabled bit
+        run: ./scripts/run-upstream-suite.sh
+
+  # The gate asks "do the tests Ferrox is expected to answer still answer?". This asks the
+  # other question — "of the 72 tests in xray-core's own scenario package, which ones does
+  # Ferrox answer today?" — and answers it by running them, not by a list someone keeps by
+  # hand. It runs every family and records each verdict; a red family is a row on the map,
+  # never a red job. What it will refuse is a run that proved nothing: an unresolvable pin,
+  # a binary that will not build, a family that answered no test, or a gated name the map
+  # cannot see, which would mean the gate and the map had drifted.
+  scenario-map:
+    name: every xray scenario family vs ferrox-app (informational, never red on test failures)
+    needs: plan
+    if: needs.plan.outputs.suites == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: conformance
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: upstream-go-${{ runner.os }}-${{ hashFiles('upstream/pins.toml') }}
+      - name: plan the scope, so the map runs on the same plan as the gate
+        shell: bash
+        run: python3 scripts/ci-scope.py scope --wide > /dev/null
+      - name: map every scenario family against Ferrox
+        run: ./scripts/run-xray-scenario-map.sh
+      - name: publish the map
+        if: always()
+        shell: bash
+        run: cat target/xray-scenario-map/xray-scenario-map.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no map written"
+      - name: upload the per-family transcripts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-scenario-map-${{ github.run_id }}
+          path: |
+            target/xray-scenario-map/xray-scenario-map.md
+            target/xray-scenario-map/logs/
+          retention-days: 30
+          if-no-files-found: error
+
+  result:
+    name: result
+    needs: [plan, suites, scenario-map]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/result
+        with:
+          title: conformance
+          needs: ${{ toJSON(needs) }}
+          artifacts: xray-scenario-map-*

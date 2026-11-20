@@ -1,0 +1,130 @@
+name: xray-baseline
+
+
+on:
+  schedule:
+    - cron: "41 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      pattern:
+        description: "go test pattern (blank = packages in scope; ./... = all of xray-core)"
+        required: false
+        default: ""
+
+concurrency:
+  group: xray-baseline-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: plan what this change owes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      wide: ${{ steps.scope.outputs.wide }}
+      go: ${{ steps.scope.outputs.go }}
+      methods: ${{ steps.scope.outputs.methods }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: plan the scope
+        id: scope
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == pull_request ]]; then
+            python3 scripts/ci-scope.py scope --base "$BASE"
+          else
+            python3 scripts/ci-scope.py scope --wide
+          fi
+
+  baseline:
+    name: xray-core packages in scope (informational, never red on test failures)
+    needs: plan
+    if: needs.plan.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # A pin's rev is immutable, so its modules, compiled packages and test verdicts are
+      # cacheable. The recipe that produced them is part of the key too: the tree's path, the
+      # pattern and the flags all sit in the step's own files, and a verdict Go reached for a
+      # different one of them is not this run's answer.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: xray-go-${{ runner.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/run-xray-baseline.sh', '.github/workflows/xray-baseline.yml') }}
+          restore-keys: xray-go-${{ runner.os }}-
+      - name: plan the scope, so the package list is read from the same plan
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == pull_request ]]; then
+            python3 scripts/ci-scope.py scope --base "$BASE" > /dev/null
+          else
+            python3 scripts/ci-scope.py scope --wide > /dev/null
+          fi
+      - name: run the pinned xray-core tests in scope, report, stay green
+        shell: bash
+        env:
+          WANT_PATTERN: ${{ inputs.pattern }}
+        run: |
+          if [ -n "$WANT_PATTERN" ]; then
+            ./scripts/run-xray-baseline.sh "$WANT_PATTERN"
+          else
+            ./scripts/run-xray-baseline.sh
+          fi
+      - name: publish the totals
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo
+            echo '```'
+            cat target/xray-baseline/xray-baseline-summary.md 2>/dev/null || echo "no summary written"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: upload the full log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-baseline-${{ github.run_id }}
+          path: |
+            target/xray-baseline/xray-baseline.log
+            target/xray-baseline/xray-baseline-summary.md
+          retention-days: 30
+          if-no-files-found: error
+
+  result:
+    name: result
+    needs: [plan, baseline]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/result
+        with:
+          title: xray-baseline
+          needs: ${{ toJSON(needs) }}
+          artifacts: xray-baseline-*

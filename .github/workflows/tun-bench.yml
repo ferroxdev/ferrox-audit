@@ -1,0 +1,243 @@
+name: tun-bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      engines:
+        description: Space-separated engines (`sing-tun-*` names the sing-box tun inbound, `hev` is the same engine as `hev-socks5-tunnel`; `tun2socks` is fetched and run only when named here)
+        type: string
+        default: "hev-socks5-tunnel ferrox ferrox-native singbox-system singbox-gvisor"
+      scenarios:
+        description: Space-separated scenarios
+        type: string
+        default: "tcp-up-1 tcp-up-10 tcp-down-1 tcp-down-10 rr rr-8x1k udp-100k"
+      duration:
+        description: Seconds per scenario
+        type: string
+        default: "5"
+      repeat:
+        description: Rounds per engine
+        type: string
+        default: "2"
+      queues:
+        description: TUN queues for engines that take them
+        type: string
+        default: "4"
+      mtu:
+        description: TUN MTU
+        type: string
+        default: "1500"
+      settle:
+        description: Idle seconds before the memory-after reading
+        type: string
+        default: "3"
+      raw_variants:
+        description: Space-separated raw device variants
+        type: string
+        default: "ferrox-raw-plain ferrox-raw-gso ferrox-raw-mq ferrox-raw-gso-mq tun-rs-sync-normal tun-rs-sync-gso tun-rs-sync-gso-concurrent"
+
+concurrency:
+  group: tun-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: --cfg aes_armv8 --cfg polyval_armv8
+  HEV_TUNNEL_REV: 8e3b4cd7168fe64b64f8b58537b5623fb6a7074d
+  HEV_SERVER_REV: d23aaad702eb532ddb7c03be4598ed6f79cb79c1
+  SINGBOX_VERSION: 1.14.0
+  TUN2SOCKS_VERSION: 2.7.0
+
+jobs:
+  bench:
+    name: netns comparison
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: tun-bench
+
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git python3 iproute2 util-linux curl unzip
+
+      - name: allow unprivileged namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo modprobe tun || true
+
+      - name: build ferrox with symbols for the perf round
+        run: CARGO_PROFILE_RELEASE_STRIP=none cargo build --locked --release -p ferrox-app
+
+      - name: build the traffic client
+        run: cargo build --release --manifest-path scripts/tun-bench/Cargo.toml
+
+      - name: build the hev peers
+        run: |
+          for spec in "hev-socks5-tunnel $HEV_TUNNEL_REV" "hev-socks5-server $HEV_SERVER_REV"; do
+            set -- $spec
+            git init --quiet "$RUNNER_TEMP/$1"
+            git -C "$RUNNER_TEMP/$1" remote add origin "https://github.com/heiher/$1"
+            git -C "$RUNNER_TEMP/$1" fetch --quiet --no-tags --depth 1 origin "$2"
+            git -C "$RUNNER_TEMP/$1" checkout --quiet FETCH_HEAD
+            git -C "$RUNNER_TEMP/$1" submodule update --init --recursive --quiet
+            make -C "$RUNNER_TEMP/$1" -j"$(nproc)"
+          done
+
+      - name: install perf (best effort; the profile step skips without it)
+        run: |
+          sudo apt-get install -y "linux-tools-$(uname -r)" linux-tools-generic 2>/dev/null \
+            || sudo apt-get install -y linux-tools-common 2>/dev/null || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 || true
+          perf --version || echo "perf unavailable"
+
+      - name: fetch sing-box
+        run: |
+          curl -sSLf "https://github.com/SagerNet/sing-box/releases/download/v$SINGBOX_VERSION/sing-box-$SINGBOX_VERSION-linux-amd64.tar.gz" \
+            | tar xz -C "$RUNNER_TEMP"
+
+      - name: fetch tun2socks
+        if: contains(inputs.engines, 'tun2socks')
+        run: |
+          curl -sSLf -o "$RUNNER_TEMP/t2s.zip" \
+            "https://github.com/xjasonlyu/tun2socks/releases/download/v$TUN2SOCKS_VERSION/tun2socks-linux-amd64.zip"
+          unzip -q -o "$RUNNER_TEMP/t2s.zip" -d "$RUNNER_TEMP/tun2socks"
+          chmod +x "$RUNNER_TEMP/tun2socks/tun2socks-linux-amd64"
+
+      - name: build identity
+        run: |
+          {
+            printf '| component | revision |\n|---|---|\n'
+            printf '| ferrox | `%s` |\n' "$(git rev-parse HEAD)"
+            printf '| hev-socks5-tunnel | `%s` |\n' "$HEV_TUNNEL_REV"
+            printf '| hev-socks5-server | `%s` |\n' "$HEV_SERVER_REV"
+            printf '| sing-box | `v%s` |\n' "$SINGBOX_VERSION"
+            printf '| sing-tun | sing-box v%s tun inbound (`gvisor`, `system` stacks) |\n' "$SINGBOX_VERSION"
+            printf '| tun2socks | `v%s` |\n' "$TUN2SOCKS_VERSION"
+          } > "$RUNNER_TEMP/tun-bench-identity.md"
+          cat "$RUNNER_TEMP/tun-bench-identity.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: throughput, latency, udp, cpu and memory
+        env:
+          FERROX: ${{ github.workspace }}/target/release/ferrox-app
+          BENCH: ${{ github.workspace }}/scripts/tun-bench/target/release/ferrox-tun-bench
+          HEV: ${{ runner.temp }}/hev-socks5-tunnel/bin/hev-socks5-tunnel
+          HEV_SERVER: ${{ runner.temp }}/hev-socks5-server/bin/hev-socks5-server
+          SINGBOX: ${{ runner.temp }}/sing-box-${{ env.SINGBOX_VERSION }}-linux-amd64/sing-box
+          TUN2SOCKS: ${{ runner.temp }}/tun2socks/tun2socks-linux-amd64
+          OUT_DIR: tun-bench-results
+          ENGINES: ${{ inputs.engines }}
+          SCENARIOS: ${{ inputs.scenarios }}
+          DURATION: ${{ inputs.duration }}
+          REPEAT: ${{ inputs.repeat }}
+          QUEUES: ${{ inputs.queues }}
+          MTU: ${{ inputs.mtu }}
+          SETTLE: ${{ inputs.settle }}
+          PROFILE: "1"
+        run: sh scripts/tun-bench.sh
+
+      - name: summary
+        if: always()
+        run: |
+          cat "$RUNNER_TEMP/tun-bench-identity.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          cat tun-bench-results/runner.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          cat tun-bench-results/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          for log in tun-bench-results/ferrox-*.log tun-bench-results/hev-0.log tun-bench-results/singbox-*.log tun-bench-results/tun2socks.log tun-bench-results/perf-*.txt tun-bench-results/rss-*.txt; do
+            [ -s "$log" ] || continue
+            printf '\n### %s\n\n```\n' "$log" >> "$GITHUB_STEP_SUMMARY"
+            tail -n 40 "$log" >> "$GITHUB_STEP_SUMMARY"
+            printf '```\n' >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tun-bench-${{ github.run_id }}
+          path: tun-bench-results
+          retention-days: 30
+          if-no-files-found: warn
+
+  raw:
+    name: raw device
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: tun-raw
+
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git python3 iproute2 util-linux iperf3 iputils-ping curl
+
+      - name: build the native device forwarder
+        run: cargo build --release --manifest-path scripts/tun-raw/Cargo.toml
+
+      - name: build the tun-rs benchmark suite
+        run: |
+          git init --quiet "$RUNNER_TEMP/tun-benchmark2"
+          git -C "$RUNNER_TEMP/tun-benchmark2" remote add origin https://github.com/tun-rs/tun-benchmark2
+          git -C "$RUNNER_TEMP/tun-benchmark2" fetch --quiet --no-tags --depth 1 origin e65a9ff57a3b6565215f83d2b97accda00ca7b3d
+          git -C "$RUNNER_TEMP/tun-benchmark2" checkout --quiet FETCH_HEAD
+          sed -i 's/tun-rs = { version = "2.8.1"/tun-rs = { version = "=2.8.18"/' "$RUNNER_TEMP/tun-benchmark2/Cargo.toml"
+          tun_rs=2.8.18
+          if ! ( cd "$RUNNER_TEMP/tun-benchmark2" && cargo build --release --bins ); then
+            echo "the 2.8.18 build failed; falling back to the suite's 2.8.1 pin"
+            rm -f "$RUNNER_TEMP/tun-benchmark2/Cargo.lock"
+            git -C "$RUNNER_TEMP/tun-benchmark2" checkout -- Cargo.toml
+            sed -i 's/tun-rs = { version = "2.8.1"/tun-rs = { version = "=2.8.1"/' "$RUNNER_TEMP/tun-benchmark2/Cargo.toml"
+            tun_rs=2.8.1
+            ( cd "$RUNNER_TEMP/tun-benchmark2" && cargo build --release --bins )
+          fi
+          {
+            printf '| component | revision |\n|---|---|\n'
+            printf '| ferrox-tun-raw | `%s` |\n' "$(git rev-parse HEAD)"
+            printf '| tun-benchmark2 | `e65a9ff57a3b6565215f83d2b97accda00ca7b3d` |\n'
+            printf '| tun-rs | `=%s` |\n' "$tun_rs"
+          } > "$RUNNER_TEMP/tun-raw-identity.md"
+          cat "$RUNNER_TEMP/tun-raw-identity.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: raw throughput, udp, latency, cpu and memory
+        env:
+          FERROX_RAW: ${{ github.workspace }}/scripts/tun-raw/target/release/ferrox-tun-raw
+          TUN_RS_DIR: ${{ runner.temp }}/tun-benchmark2
+          OUT_DIR: tun-raw-results
+          DURATION: ${{ inputs.duration }}
+          REPEAT: ${{ inputs.repeat }}
+          QUEUES: ${{ inputs.queues }}
+          VARIANTS: ${{ inputs.raw_variants }}
+        run: sudo -E sh scripts/tun-raw-bench.sh
+
+      - name: summary
+        if: always()
+        run: |
+          cat "$RUNNER_TEMP/tun-raw-identity.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          cat tun-raw-results/runner.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          cat tun-raw-results/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tun-raw-${{ github.run_id }}
+          path: tun-raw-results
+          retention-days: 30
+          if-no-files-found: warn

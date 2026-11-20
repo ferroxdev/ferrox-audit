@@ -1,0 +1,137 @@
+name: ops
+
+on:
+  workflow_dispatch:
+
+# The exact-count gate is local (`scripts/check.sh`). A dispatch supersedes an
+# older run of the same ref, since only the latest rebless matters.
+concurrency:
+  group: ops-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: plan what this change owes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      wide: ${{ steps.scope.outputs.wide }}
+      rust: ${{ steps.scope.outputs.rust }}
+      ops: ${{ steps.scope.outputs.ops }}
+      methods: ${{ steps.scope.outputs.methods }}
+      rows: ${{ steps.scope.outputs.ops_rows }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: plan the scope
+        id: scope
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == pull_request ]]; then
+            python3 scripts/ci-scope.py scope --base "$BASE"
+          else
+            python3 scripts/ci-scope.py scope --wide
+          fi
+
+  counts:
+    name: exact operation counts (${{ needs.plan.outputs.rows }} row(s))
+    needs: plan
+    if: needs.plan.outputs.ops == 'true'
+    runs-on: ubuntu-24.04
+    container:
+      image: buildpack-deps:noble-scm@sha256:7cd30264921d935e52e399fdbae125f6a5a763e89a5a031362c8f449fccddbbc
+    defaults:
+      run:
+        shell: bash
+    timeout-minutes: 45
+    steps:
+      - name: provision the counting userspace from a fixed archive
+        id: provision
+        run: |
+          apt-get update -qq --snapshot 20261027T000000Z
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            --snapshot 20261027T000000Z build-essential ca-certificates cmake curl git \
+            libclang-dev pkg-config python3 strace zstd valgrind=1:3.22.0-0ubuntu3 libc6-dbg=2.39-0ubuntu8.9
+      - uses: actions/checkout@v4
+        if: steps.provision.outcome == 'success'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: trust the mounted checkout
+        if: steps.provision.outcome == 'success'
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: dtolnay/rust-toolchain@1.99.1
+        if: steps.provision.outcome == 'success'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ops-line-tables-ubuntu24-20261027
+          # The rows price thin-LTO layout, so a restored target measures a different build.
+          cache-targets: false
+      - name: plan the scope, so the rows are read from the same plan
+        if: steps.provision.outcome == 'success'
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == pull_request ]]; then
+            python3 scripts/ci-scope.py scope --base "$BASE" > /dev/null
+          else
+            python3 scripts/ci-scope.py scope --wide > /dev/null
+          fi
+      - name: check exact counts
+        if: steps.provision.outcome == 'success' && needs.plan.outputs.rust == 'true'
+        env:
+          RUSTFLAGS: -C debuginfo=line-tables-only
+        run: ./scripts/count-ops.sh check quic::tests::pem_wraps_at_sixty_four_columns scripts/expected-ops.txt
+      - name: report the per-method counts in scope, never red
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' }}
+        env:
+          RUSTFLAGS: -C debuginfo=line-tables-only
+          METHODS: ${{ needs.plan.outputs.methods }}
+          REASON: ${{ needs.plan.outputs.reason }}
+        run: |
+          mkdir -p target
+          {
+            echo '# per-method retired instructions, informational'
+            echo
+            echo "Scope: ${METHODS:-the whole tree} -- $REASON"
+          } > target/method-ops.md
+          python3 scripts/ci-scope.py rows > .ferrox/scope-rows.txt
+          # One call, so one build of the two test binaries serves every row: the
+          # loop this replaces resolved both of them once per row, 31 times.
+          ./scripts/count-ops.sh report-file .ferrox/scope-rows.txt \
+            >> target/method-ops.md 2>&1 || echo 'measurement broke; see the log above' \
+            >> target/method-ops.md
+          cat target/method-ops.md
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' }}
+        with:
+          name: method-ops
+          path: target/method-ops.md
+          if-no-files-found: warn
+
+  result:
+    name: result
+    needs: [plan, counts]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/result
+        with:
+          title: ops
+          needs: ${{ toJSON(needs) }}
+          artifacts: method-ops

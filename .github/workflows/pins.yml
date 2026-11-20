@@ -1,0 +1,63 @@
+name: pins
+
+on:
+  pull_request:
+    paths:
+      - "upstream/pins.toml"
+      - "scripts/check-upstream-pins.sh"
+      - "scripts/fetch-upstream.sh"
+      - "scripts/run-upstream-suite.sh"
+      - "scripts/utls-oracle/go.mod"
+      - "scripts/utls-oracle/go.sum"
+      - "scripts/utls-oracle/main.go"
+      - "scripts/utls-oracle/script.txt"
+      - "scripts/utls-oracle/expected.txt"
+      - "scripts/check-utls-oracle.sh"
+      - ".github/workflows/pins.yml"
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: pins-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pins:
+    name: every upstream pin resolves
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: the fetcher holds one checkout per repo and rev
+        shell: bash
+        run: ./scripts/fetch-upstream.sh --selftest
+      - name: check the upstream pins resolve
+        shell: bash
+        run: ./scripts/check-upstream-pins.sh
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: check the uTLS oracle matches
+        shell: bash
+        run: ./scripts/check-utls-oracle.sh
+
+  result:
+    name: result
+    needs: [pins]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/result
+        with:
+          title: pins
+          needs: ${{ toJSON(needs) }}

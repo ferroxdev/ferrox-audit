@@ -1,0 +1,126 @@
+name: compare
+
+
+on:
+  workflow_dispatch:
+    inputs:
+      vless_link:
+        description: "Working vless:// link (uuid/pbk stay masked; only type/security/flow reach the report)"
+        required: true
+        type: string
+      live:
+        description: "TCP reachability check too (sends nothing)?"
+        required: false
+        default: "false"
+
+concurrency:
+  group: compare-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  compare:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux x86_64
+            os: ubuntu-latest
+          - name: macos aarch64
+            os: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: check the upstream pins resolve
+        run: ./scripts/check-upstream-pins.sh
+      - name: record the machine
+        run: |
+          echo "### machine" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '```'
+            uname -a || ver
+            rustc -vV
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: offline comparison (no network, link stays masked)
+        run: |
+          link="$(python3 -c 'import json, os; print(json.load(open(os.environ["GITHUB_EVENT_PATH"])).get("inputs", {}).get("vless_link", ""))')"
+          if [[ "$link" == *[[:cntrl:]]* ]]; then
+            echo "::error::vless_link must not contain control characters"
+            exit 1
+          fi
+          printf '::add-mask::%s\n' "${link//'%'/%25}"
+          if [ -n "$link" ]; then
+            cargo run --locked --release -p ferrox-bench -- --config "$link"
+          else
+            echo "no vless_link input: exercising parser against the brief link shape only"
+            cargo test --locked --release -p ferrox-core vless
+          fi
+      - name: app check (offline, no network)
+        run: |
+          link="$(python3 -c 'import json, os; print(json.load(open(os.environ["GITHUB_EVENT_PATH"])).get("inputs", {}).get("vless_link", ""))')"
+          if [[ "$link" == *[[:cntrl:]]* ]]; then
+            echo "::error::vless_link must not contain control characters"
+            exit 1
+          fi
+          printf '::add-mask::%s\n' "${link//'%'/%25}"
+          if [ -n "$link" ]; then
+            cargo run --locked --release -p ferrox-app -- check "$link"
+          fi
+      - name: live reachability (TCP connect only, sends nothing)
+        if: inputs.live == 'true'
+        run: |
+          link="$(python3 -c 'import json, os; print(json.load(open(os.environ["GITHUB_EVENT_PATH"])).get("inputs", {}).get("vless_link", ""))')"
+          if [[ "$link" == *[[:cntrl:]]* ]]; then
+            echo "::error::vless_link must not contain control characters"
+            exit 1
+          fi
+          printf '::add-mask::%s\n' "${link//'%'/%25}"
+          # `run` serves and never returns: this leg asks for the dial and its exit
+          # code, which is what "reachability" means here.
+          cargo run --locked --release -p ferrox-app -- check "$link"
+      - name: publish the table
+        if: always()
+        run: |
+          {
+            echo
+            echo '```'
+            cat target/bench-report.md 2>/dev/null || echo "no report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-report-${{ matrix.name }}-${{ github.run_id }}
+          path: target/bench-report.md
+          retention-days: 30
+          if-no-files-found: warn
+
+  result:
+    name: result
+    needs: [compare]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/result
+        with:
+          title: compare
+          needs: ${{ toJSON(needs) }}
+          artifacts: bench-report-*
