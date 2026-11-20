@@ -213,4 +213,385 @@ struct Inner {
     last_osl: Mutex<Option<Instant>>,
     last_osl_failure: Mutex<Option<Instant>>,
     upgrade_started: Arc<AtomicBool>,
-    last_up
+    last_upgrade_attempt: Mutex<Option<Instant>>,
+    dsl_running: AtomicBool,
+    dsl_last_fetch: Mutex<Option<Instant>>,
+    self_ref: Mutex<Weak<Self>>,
+    sessions: Mutex<Vec<Arc<Session>>>,
+    next_session: AtomicUsize,
+    dial_window: AtomicUsize,
+    entry_cursor: AtomicUsize,
+    affinity: Mutex<Option<(String, u16)>>,
+    moved_to_front: Mutex<HashSet<String>>,
+    dsl_placeholders: Arc<Mutex<Vec<DslPlaceholder>>>,
+    connecting: Mutex<()>,
+    session_id: String,
+    stopping: AtomicBool,
+    endpoint: SocketAddr,
+    http_endpoint: Option<SocketAddr>,
+    udpgw: Mutex<Option<Arc<UdpGateway>>>,
+    conduit: Mutex<Option<(ConduitMode, Arc<crate::psiphon_webrtc::Conduit>)>>,
+    conduit_started: OnceLock<Instant>,
+    conduit_fallback: AtomicBool,
+    conduit_connected: AtomicBool,
+    split_untunneled: Mutex<HashMap<String, Instant>>,
+    replay: Arc<crate::psiphon_replay::Cache>,
+    light: Option<Arc<crate::psiphon_light::Client>>,
+    /// One in-proxy dial bucket for the client's life, as the reference holds it: a bucket built per attempt never throttles a client that reconnects.
+    inproxy_limiter: Option<Arc<DialRateLimiter>>,
+}
+
+/// The reference's protocol hold-off: a jittered delay before a new tunnel is activated.
+#[derive(Clone, Debug, Default)]
+struct HoldOff {
+    names: Vec<String>,
+    probability: f64,
+    min: Duration,
+    max: Duration,
+}
+
+impl HoldOff {
+    /// The hold-off for a protocol, zero when it is not named.
+    fn duration(&self, protocol: &str) -> Duration {
+        if self.names.is_empty()
+            || !self
+                .names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(protocol))
+            || !coin(self.probability)
+        {
+            return Duration::ZERO;
+        }
+        let low = u64::try_from(self.min.as_millis()).unwrap_or(u64::MAX);
+        let high = u64::try_from(self.max.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(low);
+        let span = high.saturating_sub(low).saturating_add(1);
+        Duration::from_millis(low + u64::from_le_bytes(random::<8>()) % span)
+    }
+}
+
+/// The reference's provider-scoped hold-off: direct and inproxy key on provider/region,
+/// fronting keys on the fronting provider ID.
+#[derive(Clone, Debug, Default)]
+struct HoldOffClass {
+    providers: Vec<(String, Vec<String>)>,
+    region_scoped: bool,
+    probability: f64,
+    min: Duration,
+    max: Duration,
+}
+
+impl HoldOffClass {
+    fn delay(&self, provider: Option<&str>, region: Option<&str>) -> Duration {
+        if self.providers.is_empty() || !coin(self.probability) {
+            return Duration::ZERO;
+        }
+        let Some(provider) = provider else {
+            return Duration::ZERO;
+        };
+        let matched = self.providers.iter().any(|(id, regions)| {
+            id == provider
+                && (!self.region_scoped
+                    || regions
+                        .iter()
+                        .any(|allowed| allowed.is_empty() || Some(allowed.as_str()) == region))
+        });
+        if !matched {
+            return Duration::ZERO;
+        }
+        let low = u64::try_from(self.min.as_millis()).unwrap_or(u64::MAX);
+        let high = u64::try_from(self.max.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(low);
+        let span = high.saturating_sub(low).saturating_add(1);
+        Duration::from_millis(low + u64::from_le_bytes(random::<8>()) % span)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LivenessSpec {
+    pattern: String,
+    min_upstream: usize,
+    max_upstream: usize,
+    min_downstream: usize,
+    max_downstream: usize,
+}
+
+/// The reference's liveness probes, keyed by tunnel-protocol pattern.
+#[derive(Clone, Debug, Default)]
+struct Liveness {
+    initial: Vec<LivenessSpec>,
+    periodic: Vec<LivenessSpec>,
+}
+
+impl Liveness {
+    /// The first probe spec naming this protocol in the given state.
+    fn spec(&self, protocol: &str, established: bool) -> Option<LivenessSpec> {
+        let probes = if established {
+            &self.periodic
+        } else {
+            &self.initial
+        };
+        let mut matched: Option<&LivenessSpec> = None;
+        let mut fallback = None;
+        for probe in probes {
+            if probe.pattern.is_empty() {
+                fallback = Some(probe);
+            } else if wildcard_match(&probe.pattern, protocol)
+                && matched.is_none_or(|best| probe.pattern.len() > best.pattern.len())
+            {
+                matched = Some(probe);
+            }
+        }
+        matched.or(fallback).cloned()
+    }
+}
+
+/// The reference's protocol wildcard: `*` matches any run of bytes, everything else is literal.
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let Some(mut rest) = text.strip_prefix(parts.next().unwrap_or_default()) else {
+        return false;
+    };
+    let mut part = parts.next();
+    while let Some(current) = part {
+        part = parts.next();
+        if part.is_none() {
+            return current.is_empty() || rest.ends_with(current);
+        }
+        if current.is_empty() {
+            continue;
+        }
+        let Some(at) = rest.find(current) else {
+            return false;
+        };
+        rest = &rest[at + current.len()..];
+    }
+    rest.is_empty()
+}
+
+/// The dynamic server list fetcher's window, resolved from the config and the
+/// handshake tactics in that order.
+#[derive(Clone, Debug)]
+struct Dsl {
+    enable: bool,
+    timeout: Duration,
+    retry_count: usize,
+    retry_delay: Duration,
+    retry_jitter: f64,
+    ttl: Duration,
+    discover_min: usize,
+    discover_max: usize,
+    get_min: usize,
+    get_max: usize,
+    prioritize_new: f64,
+    prioritize_existing: f64,
+}
+
+impl Default for Dsl {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            timeout: Duration::from_secs(5),
+            retry_count: 0,
+            retry_delay: Duration::from_secs(5),
+            retry_jitter: 0.3,
+            ttl: Duration::from_hours(1),
+            discover_min: 1,
+            discover_max: 2,
+            get_min: 30,
+            get_max: 60,
+            prioritize_new: 0.5,
+            prioritize_existing: 0.25,
+        }
+    }
+}
+
+struct DslTag {
+    tag: Vec<u8>,
+    version: i32,
+    prioritize: bool,
+}
+
+struct DslPlaceholder {
+    host: String,
+    port: u16,
+    created: Instant,
+}
+
+fn dsl_placeholder_position(
+    placeholders: &[DslPlaceholder],
+    host: &str,
+    port: u16,
+) -> Option<usize> {
+    placeholders
+        .iter()
+        .position(|placeholder| placeholder.host == host && placeholder.port == port)
+}
+
+fn expire_dsl_placeholder(
+    placeholders: &Mutex<Vec<DslPlaceholder>>,
+    host: &str,
+    port: u16,
+    ttl: Duration,
+) {
+    if ttl.is_zero() {
+        return;
+    }
+    lock(placeholders).retain(|placeholder| {
+        !(placeholder.host == host
+            && placeholder.port == port
+            && placeholder.created.elapsed() >= ttl)
+    });
+}
+
+fn clear_dsl_placeholder(placeholders: &Mutex<Vec<DslPlaceholder>>, host: &str, port: u16) {
+    let mut list = lock(placeholders);
+    if let Some(at) = dsl_placeholder_position(&list, host, port) {
+        list.remove(at);
+    }
+}
+
+fn retain_dsl_placeholder(
+    placeholders: &Mutex<Vec<DslPlaceholder>>,
+    host: &str,
+    port: u16,
+    retain: f64,
+) {
+    if coin(retain) {
+        return;
+    }
+    clear_dsl_placeholder(placeholders, host, port);
+}
+
+fn promote_dsl_placeholders(
+    placeholders: &Mutex<Vec<DslPlaceholder>>,
+    entries: &mut Vec<Server>,
+    moved: &mut HashSet<String>,
+    max: i64,
+) {
+    for placeholder in lock(placeholders).iter() {
+        if max > 0 && i64::try_from(moved.len()).unwrap_or(i64::MAX) >= max {
+            break;
+        }
+        if move_to_front(entries, &placeholder.host, placeholder.port) {
+            moved.insert(format!("{}:{}", placeholder.host, placeholder.port));
+        }
+    }
+}
+
+impl Dsl {
+    fn resolved(config: Option<&Json>, tactics: Option<&Json>) -> Self {
+        let mut dsl = Self::default();
+        dsl.apply(config);
+        dsl.apply(tactics);
+        if field(config, "DisableDSLFetcher")
+            .and_then(Json::as_bool)
+            .unwrap_or(false)
+        {
+            dsl.enable = false;
+        }
+        dsl
+    }
+
+    fn apply(&mut self, fields: Option<&Json>) {
+        if let Some(enable) = field(fields, "EnableDSLFetcher").and_then(Json::as_bool) {
+            self.enable = enable;
+        }
+        self.timeout = duration_field(fields, "DSLFetcherTunneledRequestTimeout", self.timeout)
+            .min(Duration::from_mins(2));
+        self.retry_count = number(fields, "DSLFetcherTunneledRequestRetryCount")
+            .map_or(self.retry_count, |count| {
+                usize::try_from(count).unwrap_or(usize::MAX)
+            });
+        self.retry_delay = duration_field(
+            fields,
+            "DSLFetcherTunneledRequestRetryDelay",
+            self.retry_delay,
+        )
+        .min(Duration::from_mins(1));
+        self.retry_jitter = decimal(fields, "DSLFetcherTunneledRequestRetryDelayJitter")
+            .unwrap_or(self.retry_jitter)
+            .clamp(0.0, 1.0);
+        self.ttl = duration_field(fields, "DSLFetcherTunneledFetchTTL", self.ttl)
+            .min(Duration::from_hours(24));
+        self.discover_min = count_field(
+            fields,
+            "DSLFetcherTunneledDiscoverServerEntriesMinCount",
+            self.discover_min,
+        );
+        self.discover_max = count_field(
+            fields,
+            "DSLFetcherTunneledDiscoverServerEntriesMaxCount",
+            self.discover_max,
+        );
+        self.get_min = count_field(
+            fields,
+            "DSLFetcherTunneledGetServerEntriesMinCount",
+            self.get_min,
+        );
+        self.get_max = count_field(
+            fields,
+            "DSLFetcherTunneledGetServerEntriesMaxCount",
+            self.get_max,
+        );
+        self.prioritize_new = probability_field(
+            fields,
+            "DSLPrioritizeDialNewServerEntryProbability",
+            self.prioritize_new,
+        );
+        self.prioritize_existing = probability_field(
+            fields,
+            "DSLPrioritizeDialExistingServerEntryProbability",
+            self.prioritize_existing,
+        );
+        if self.discover_max < self.discover_min {
+            self.discover_max = self.discover_min;
+        }
+        if self.get_max < self.get_min {
+            self.get_max = self.get_min;
+        }
+    }
+}
+
+fn field<'a>(fields: Option<&'a Json>, key: &str) -> Option<&'a Json> {
+    fields.and_then(|fields| fields.get(key))
+}
+
+fn duration_field(fields: Option<&Json>, key: &str, default: Duration) -> Duration {
+    let Some(value) = field(fields, key) else {
+        return default;
+    };
+    if let Some(text) = value.as_str() {
+        return go_duration(text).unwrap_or(default);
+    }
+    value.as_i64().map_or(default, |nanos| {
+        Duration::from_nanos(u64::try_from(nanos).unwrap_or(0))
+    })
+}
+
+fn count_field(fields: Option<&Json>, key: &str, default: usize) -> usize {
+    number(fields, key).map_or(default, |count| count.min(256) as usize)
+}
+
+/// The reference's token bucket for in-proxy dials; zero disables it.
+fn rate_limit(fields: Option<&Json>) -> Option<(usize, Duration)> {
+    let quantity = number(fields, "InproxyClientDialRateLimitQuantity").unwrap_or(2);
+    if quantity == 0 {
+        return None;
+    }
+    let interval = number(fields, "InproxyClientDialRateLimitIntervalMilliseconds").map_or_else(
+        || {
+            duration_field(
+                fields,
+                "InproxyClientDialRateLimitInterval",
+                Duration::from_millis(500),
+            )
+        },
+        Duration::from_millis,
+    );
+    if interval.is_zero() {
+        return None;
+    }
+    Some((usize::try_from(quantity).unwrap_
