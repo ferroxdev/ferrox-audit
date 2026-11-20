@@ -1606,4 +1606,217 @@ pub(crate) fn dial_through_proxy(
             let _source = SendThroughGuard::enter(source);
             let _sockopts = DialSockoptsGuard::enter(sockopts);
             let _target = TargetStrategyGuard::enter(strategy);
-            serve_co
+            serve_connect(
+                server,
+                out,
+                &Destination::Address(target),
+                Front::Probe,
+                &[],
+                Some(&name),
+                FlowFacts::default(),
+            );
+        })
+        .map_err(|error| std::io::Error::other(format!("dialerProxy: {error}")))?;
+    Ok(client)
+}
+
+/// The outbounds `serve_udp_lane_with` gives a datagram lane; a tagged dial refuses a hop
+/// without one instead of handing its caller a socket no reply can reach.
+fn udp_lane_supported(out: &Outbound) -> bool {
+    match out {
+        Outbound::Loopback(loopback) => loopback.dial.as_ref().is_some_and(udp_lane_supported),
+        Outbound::Vless(vless) => match &vless.carrier {
+            Carrier::Quic => true,
+            Carrier::Raw(_) => vless.tls.is_none(),
+            Carrier::Kcp(_) => vless.mux.tcp.is_some(),
+            Carrier::Hysteria(_) => {
+                vless.mux.tcp.is_none() && hysteria_dial_session(vless).is_some()
+            }
+            _ => false,
+        },
+        Outbound::Trojan(trojan) => {
+            (matches!(trojan.carrier, Carrier::Hysteria(_))
+                && trojan_hysteria_dial(trojan).is_some())
+                || trojan_udp_carried(&trojan.carrier)
+        }
+        Outbound::Vmess(_)
+        | Outbound::Hysteria(_)
+        | Outbound::Tuic(_)
+        | Outbound::Foxy(_)
+        | Outbound::WireGuard(_)
+        | Outbound::Masque(_)
+        | Outbound::Warp(_)
+        | Outbound::Freedom(_)
+        | Outbound::Psiphon(_)
+        | Outbound::Dns(_)
+        | Outbound::ReversePortal(_) => true,
+        Outbound::Shadowsocks(ss) => matches!(ss.carrier, Carrier::Raw(_)),
+        Outbound::Socks(socks) => socks.version != crate::socks::Version::V4,
+        Outbound::Http(_)
+        | Outbound::AnyTls(_)
+        | Outbound::Veepn(_)
+        | Outbound::Route(_)
+        | Outbound::Block(_)
+        | Outbound::Metrics { .. }
+        | Outbound::Api(_) => false,
+    }
+}
+
+/// Hand a datagram destination to the outbound a `dialerProxy` names. The caller gets a socket
+/// connected to a shim that frames each datagram into the hop's own UDP lane, so the hop owns the
+/// carrier and its source, options and strategy, and the pipe owns none.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn dial_udp_through_proxy(
+    target: SocketAddr,
+    tag: &str,
+    options: &crate::sockopt::SocketOptions,
+) -> Option<(UdpSocket, Arc<AtomicBool>)> {
+    let shared = options.route()?;
+    if OUTBOUND_TAG.with(|cell| cell.borrow().as_deref() == Some(tag)) {
+        return None;
+    }
+    let out = shared.outbound_ref(tag)?.clone();
+    if !udp_lane_supported(&out) {
+        return None;
+    }
+    let (source, sockopts, strategy) = if shared.default_tag.as_deref() == Some(tag) {
+        (
+            shared.default_source,
+            shared.default_sockopts.clone(),
+            shared.default_strategy,
+        )
+    } else {
+        (
+            shared.sources.get(tag).copied(),
+            shared.sockopts.get(tag).cloned(),
+            shared.strategies.get(tag).copied(),
+        )
+    };
+    let relay = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).ok()?;
+    let relay_addr = relay.local_addr().ok()?;
+    relay.set_read_timeout(Some(budgets::udp_idle())).ok()?;
+    let client = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).ok()?;
+    let client_addr = client.local_addr().ok()?;
+    let request_in = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).ok()?;
+    let request_out = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).ok()?;
+    request_in.connect(client_addr).ok()?;
+    request_out.connect(relay_addr).ok()?;
+    client.connect(request_in.local_addr().ok()?).ok()?;
+    request_in.set_read_timeout(Some(UDP_POLL)).ok()?;
+    request_out.set_read_timeout(Some(UDP_POLL)).ok()?;
+    client.set_read_timeout(Some(budgets::udp_idle())).ok()?;
+    let reply_in = request_out.try_clone().ok()?;
+    let reply_out = request_in.try_clone().ok()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let request_stop = Arc::clone(&stop);
+    if thread::Builder::new()
+        .name("ferrox-tagged-udp-in".to_owned())
+        .spawn(move || {
+            let mut buf = udp_buffer();
+            let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+            while !request_stop.load(Ordering::Relaxed) {
+                match request_in.recv(&mut buf) {
+                    Ok(n) => {
+                        let frame = socks_udp_frame(&mut frame, &target, &buf[..n]);
+                        if request_out.send(frame).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if is_timeout(&error) => {}
+                    Err(_) => break,
+                }
+            }
+        })
+        .is_err()
+    {
+        return None;
+    }
+    let reply_stop = Arc::clone(&stop);
+    if thread::Builder::new()
+        .name("ferrox-tagged-udp-out".to_owned())
+        .spawn(move || {
+            let mut buf = udp_buffer();
+            while !reply_stop.load(Ordering::Relaxed) {
+                match reply_in.recv(&mut buf) {
+                    Ok(n) => {
+                        let Some((_, payload)) = parse_socks_udp(&buf[..n]) else {
+                            continue;
+                        };
+                        if reply_out.send(payload).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if is_timeout(&error) => {}
+                    Err(_) => break,
+                }
+            }
+        })
+        .is_err()
+    {
+        stop.store(true, Ordering::Relaxed);
+        return None;
+    }
+    let name = tag.to_owned();
+    let relay_stop = Arc::clone(&stop);
+    if thread::Builder::new()
+        .name("ferrox-tagged-udp".to_owned())
+        .spawn(move || {
+            let _source = SendThroughGuard::enter(source);
+            let _target = TargetStrategyGuard::enter(strategy);
+            let _tag = OutboundTag::enter(Some(&name));
+            serve_udp_lane_with(&relay, &out, None, source, sockopts.as_ref());
+            relay_stop.store(true, Ordering::Relaxed);
+        })
+        .is_err()
+    {
+        stop.store(true, Ordering::Relaxed);
+        return None;
+    }
+    Some((client, stop))
+}
+
+fn dial(target: &SocketAddr) -> Result<Connection, Failure> {
+    dial_kind(target, false).map(|(stream, _)| stream)
+}
+
+/// What the kernel did with the SYN on a direct leg, so the caller knows whether the first write
+/// rides it and whether the reference's rewrite is still needed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fast {
+    /// A `dialerProxy` hop owns the hello, so this leg never asked for it.
+    Off,
+    /// A direct leg that could not ask: the kernel lacks `TCP_FASTOPEN_CONNECT`.
+    Absent,
+    /// The kernel held the SYN back: establishment starts at the first write, whose bytes ride the
+    /// SYN as far as its payload room allows.
+    Deferred,
+    /// The handshake completed outright: this server sent no cookie, so the record is rewritten.
+    Refused,
+}
+
+/// The same dial, with Fast Open wanted on a direct leg. A second round fetches the cookie the
+/// first handshake did not carry; a failed second round keeps the first socket, and a server that
+/// still answers directly leaves the first-record rewrite in place.
+fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Failure> {
+    // The seam's one dial entry: a named source or option builds the socket before the same budget, and neither is the TCP dial unchanged.
+    let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow().clone());
+    if let Some(options) = sockopts.as_deref() {
+        if let Some(tag) = options.dialer_proxy() {
+            let stream = dial_through_proxy(*target, tag, options)
+                .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?;
+            no_delay(&stream);
+            return Ok((outbound_metered(stream), Fast::Off));
+        }
+    }
+    let source = resolve_source(SEND_THROUGH.with(std::cell::Cell::get))
+        .map_err(|_| Failure::new(Stage::SocketConnected, Kind::Local))?;
+    if fast && crate::fastopen::supported() {
+        let mut kept = None;
+        let mut outcome = Fast::Refused;
+        let budget = budgets::dial();
+        let started = std::time::Instant::now();
+        for round in 0..2 {
+            let left = budget.saturating_sub(started.elapsed());
+            match dial_from(target, source, sockopts.as_deref(), true, left) {
+                Ok((stream, armed)) => {
+                    let deferred = a
