@@ -1,0 +1,3826 @@
+#!/bin/bash
+# ferrox-cli: one front-facing command for every lane this binary dials.
+#
+#   ferrox-cli login                           save the foxy account once (0600)
+#   ferrox-cli up --foxy --vpn                 the Foxy lane, whole-device proxy
+#   ferrox-cli up --veepn --vpn                the VeePN lane, no account needed
+#   ferrox-cli up --psiphon --vpn              the Psiphon lane, native OSSH/SSH
+#   ferrox-cli up --psiphon-cdn --vpn          the same lane, CDN fronting requested
+#   ferrox-cli locations --veepn               VeePN region ids
+#   ferrox-cli up --vless 'vless://...'        any vless share link
+#   ferrox-cli up --vmess 'vmess://...'        any vmess share link
+#   ferrox-cli up --config mine.json           any config the binary serves
+#   ferrox-cli down | status | ports | tun | version
+#
+# In a release package this script sits beside the binary and runs it; in the
+# repository it runs a local build: the release binary when one exists, else the
+# dev binary the test cycle already produces. A release build optimises every
+# dependency and links with thin LTO, so it costs minutes; a dev build is seconds.
+# FERROX_PROFILE=release (or FERROX_RELEASE=1) asks for the measured binary.
+#
+# The fronts are local proxies (SOCKS5, HTTP CONNECT, mixed). "VPN mode" here
+# means the macOS system proxy, because this binary has no utun device: TUN
+# mode is refused by name, and `ferrox-cli tun` says what that costs.
+set -uo pipefail
+
+if [ "$(uname -s 2>/dev/null)" = Linux ] && grep -qi microsoft /proc/version 2>/dev/null; then
+  echo "ferrox-cli.sh: WSL detected; run ferrox-cli.exe from Windows instead." >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SELF="$SCRIPT_DIR/$(basename "$0")"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Three homes for the binary, first hit wins: $FERROX_BIN names one outright; a
+# release package puts it next to this script; in the repository cargo writes
+# where build.target-dir says, not under $ROOT/target, so resolving the name is
+# the only way `up` runs what the last build produced. A checkout can hold both
+# profiles, and the release binary is the measured one, so it wins; a tree whose
+# last build was a test still has a dev binary, and `up` uses it rather than pay
+# for an optimised link. FERROX_PROFILE names one. Resolution is deferred:
+# --help, down or a missing flag answers without waiting for cargo.
+BIN="${FERROX_BIN:-}"
+resolve_bin() {
+  [ -n "$BIN" ] && return 0
+  local cand dir cargo_target
+  local -a profiles
+  for cand in "$SCRIPT_DIR/ferrox-app" "$SCRIPT_DIR/ferrox-app.exe"; do
+    [ -x "$cand" ] && { BIN="$cand"; return 0; }
+  done
+  cargo_target="$(cd "$ROOT" && cargo metadata --format-version 1 --no-deps 2>/dev/null | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -1)"
+  cargo_target="${cargo_target:-$ROOT/target}"
+  if [ -n "${FERROX_PROFILE:-}" ]; then
+    case "$FERROX_PROFILE" in
+      release|debug) profiles=("$FERROX_PROFILE") ;;
+      *) die "FERROX_PROFILE must be debug or release, not '$FERROX_PROFILE'" ;;
+    esac
+  elif [ "${FERROX_RELEASE:-0}" = 1 ]; then
+    profiles=(release)
+  else
+    profiles=(release debug)
+  fi
+  for dir in "${profiles[@]}"; do
+    [ -x "$cargo_target/$dir/ferrox-app" ] && { BIN="$cargo_target/$dir/ferrox-app"; return 0; }
+  done
+  BIN="$cargo_target/${profiles[0]}/ferrox-app"
+}
+CONF_DIR="${FERROX_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ferrox}"
+# The system proxy is machine-wide, so its marker and the lane registry live
+# outside the per-user config dir that FERROX_CONF_DIR can move.
+if [ -n "${FERROX_STATE_DIR:-}" ]; then
+  STATE_DIR="$FERROX_STATE_DIR"
+elif [ "$(uname -s)" = Darwin ]; then
+  STATE_DIR="$HOME/Library/Application Support/ferrox"
+else
+  STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ferrox"
+fi
+LANES_FILE="$STATE_DIR/lanes"
+PROXY_OWNER="$STATE_DIR/system-proxy.owner"
+PROXY_LOCK_DEPTH=0
+PROXY_LOCK_PID=""
+PROXY_LOCK_READY=""
+PROXY_LOCK_RELEASE=""
+PROXY_LOCK_ACQUIRING=0
+CREDS="${FOXY_CREDENTIALS:-$CONF_DIR/credentials}"
+CFG="$CONF_DIR/lane.json"
+# The signed-in session FxA handed back, so a launch after the first signs in
+# once and never sees a new-sign-in mail: the grant lives here, not in the config.
+TOKEN_FILE="$CONF_DIR/foxy-token.json"
+# The exit the user remembered, and the last published edge list kept so the
+# selection still answers when the catalogue is down.
+LOCATION_FILE=""
+LOCATIONS_FILE=""
+PID_FILE="$CONF_DIR/lane.pid"
+META_FILE="$CONF_DIR/lane.meta"
+LOG="$CONF_DIR/lane.log"
+PROXY_PORTS="$STATE_DIR/system-proxy.ports"
+PROXY_STATE="$STATE_DIR/system-proxy.state"
+SUPERVISOR_FILE="$STATE_DIR/system-proxy.supervisor"
+SUPERVISOR_PID_FILE="$STATE_DIR/system-proxy.supervisor.pid"
+
+ACTION="up"
+SUPERVISE_PID=""
+OUTBOUND=""
+INSTANCE=""
+ALL=0
+VLESS=""
+VMESS=""
+VMESS_ID=""
+VMESS_NETWORK="tcp"
+TROJAN=""
+SS=""
+SS_METHOD="aes-256-gcm"
+CONFIG_FILE=""
+EMAIL=""
+PASSWORD=""
+CODE=""
+COUNTRY="US"
+COUNTRY_SET=0
+CITY=""
+CITY_SET=0
+CARRIER="auto"
+CARRIER_SET=0
+FXA_USER_AGENT=""
+LOC_COUNTRY=""
+LOC_CITY=""
+LOC_FILTER=""
+LOC_PING=0
+# Targets that leave the tunnel instead of riding it: a domain suffix or a port is enough.
+EXCLUDE_DOMAINS=""
+EXCLUDE_PORTS=""
+UPSTREAM=""
+WANT_WARP=0
+UDP_VIA=""
+BUILT_UDP_OUTBOUND=""
+BUILT_UDP_TAG=""
+WARP_STARTED=0
+WARP_CFG=""
+WARP_PID_FILE=""
+WARP_LOG=""
+WARP_PORT_FILE=""
+# VeePN has no account and no server: an empty region lets the plane pick, and
+# the device id is kept under $CONF_DIR so a restart is the same device.
+REGION=""
+VEEPN_DOMAINS=""
+VEEPN_UDID=""
+PSIPHON_BIN=""
+PSIPHON_DIR=""
+PSIPHON_LISTEN=""
+PSIPHON_HTTP=""
+PSIPHON_REGION=""
+PSIPHON_SHAPE=""
+PSIPHON_READY=""
+PSIPHON_BASE=""
+PSIPHON_ENTRIES=""
+PSIPHON_SPLIT=0
+PSIPHON_SPLIT_REGIONS=""
+PSIPHON_USER=""
+PSIPHON_PASS=""
+PSIPHON_POOL=""
+PSIPHON_WORKERS=""
+PSIPHON_AGGRESSIVE=""
+PSIPHON_AGGRESSIVE_SET=0
+PSIPHON_FEATURES=""
+PSIPHON_LATENCY=""
+PSIPHON_CDN_PROFILE=""
+PSIPHON_CDN_IPS=""
+PSIPHON_CDN_SNI=""
+PSIPHON_CDN_SETS=""
+PSIPHON_UNSAFE_ALERTS=0
+PSIPHON_LOCATION_PRECISION=""
+PSIPHON_SHARE_PORT=""
+PSIPHON_SHARE_HTTP=""
+PSIPHON_GEOIP=""
+PSIPHON_REJECT_CENSORED=0
+PSIPHON_REJECT_COUNTRIES=""
+PSIPHON_COMPARTMENT=""
+PSIPHON_DISABLE_TIMEOUTS=0
+PSIPHON_DNS_ALTERNATE=""
+PSIPHON_DEVICE_LOCATION=""
+PSIPHON_DEVICE_REGION=""
+PSIPHON_NETWORK_ID=""
+PSIPHON_ADDITIONAL_PARAMS=""
+PSIPHON_ESTABLISH_TIMEOUT=""
+PSIPHON_EMIT_BYTES=0
+PSIPHON_CONDUIT_MODE=""
+PSIPHON_CONDUIT_TIMEOUT=""
+PSIPHON_SHARE=0
+PSIPHON_SERVER_LISTS=""
+PSIPHON_OSL=""
+PSIPHON_ENTRY_KEY=""
+PSIPHON_LIST_KEY=""
+PSIPHON_EXCHANGE_KEY=""
+PROBE_TIMEOUT=20
+FRONTS="socks,http,mixed"
+FRONTS_SET=0
+SOCKS_PORT="${FOXY_SOCKS_PORT:-10808}"
+HTTP_PORT="${FOXY_HTTP_PORT:-8080}"
+MIXED_PORT="${FOXY_MIXED_PORT:-10809}"
+SOCKS_SET=0; [ -n "${FOXY_SOCKS_PORT:-}" ] && SOCKS_SET=1
+HTTP_SET=0; [ -n "${FOXY_HTTP_PORT:-}" ] && HTTP_SET=1
+MIXED_SET=0; [ -n "${FOXY_MIXED_PORT:-}" ] && MIXED_SET=1
+WANT_VPN=0
+DEBUG=0
+
+die() { echo "ferrox-cli: $*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+rule() { printf '%s\n' "----------------------------------------------------------------"; }
+
+# The shell launcher writes and plans configs with Python and proves the lane
+# with curl; name a missing one before it looks like a lane failure.
+require_tools() {
+  local missing="" tool
+  for tool in python3 curl; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+  done
+  [ -z "$missing" ] ||
+    die "missing required command(s):$missing. The shell launcher needs python3 (to write and plan configs) and curl (to prove the connection); install them, or use the native ferrox-cli.exe on Windows."
+}
+
+# A flag that takes a value must have one. `shift 2` on a lone flag fails
+# without consuming it, and the parse loop would ask the same question forever.
+# Say what is missing and stop before a running lane is touched.
+need_value() {
+  local flag="$1" hint="$2" have="$3" value="${4:-}"
+  [ "$have" -ge 2 ] && [ -n "$value" ] && return 0
+  if [ "$flag" = --vless ]; then
+    die "--vless needs a vless:// share link; nothing was started.
+  example: ferrox-cli up --vless 'vless://uuid@host:443?type=ws&security=tls&sni=host&path=/ws'
+  a config instead: ferrox-cli up --config mine.json
+  no server to name: ferrox-cli up --foxy   or   ferrox-cli up --veepn   or   ferrox-cli up --psiphon"
+  fi
+  if [ "$flag" = --vmess ]; then
+    die "--vmess needs a vmess:// share link or HOST:PORT; nothing was started.
+  example: ferrox-cli up --vmess 'vmess://base64-json'
+  or: ferrox-cli up --vmess host:443 --uuid UUID
+  a config instead: ferrox-cli up --config mine.json"
+  fi
+  die "$flag needs $hint; nothing was started (see --help)."
+}
+
+# A header value has to fit on one line and carry no control byte; trim the padding the binary trims.
+printable_ascii() {
+  local LC_ALL=C value="$1"
+  case "$value" in *[![:print:]]*) return 1 ;; esac
+}
+
+need_port() {
+  local flag="$1" have="$2" value="${3:-}"
+  need_value "$flag" "a port number" "$have" "$value"
+  case "$value" in
+    ''|*[!0-9]*) die "$flag wants a port number, got '$value'; nothing was started." ;;
+  esac
+  [ "$value" -ge 1 ] && [ "$value" -le 65535 ] ||
+    die "$flag wants a port between 1 and 65535, got '$value'; nothing was started."
+}
+
+usage() {
+  cat <<EOF
+usage: ferrox-cli <command> [options]
+
+commands
+  login      save the foxy account once (prompts for the password; file is 0600)
+  logout     stop the lane, then forget the account and its stored session
+  locations  list exits: locations [--foxy|--veepn|--psiphon] [CC]
+             (--ping measures foxy's handshake to each edge, fastest first)
+  location   remember an exit: location --foxy|--veepn|--psiphon CC [CITY]
+  up         start the lane in the background, print the port map (default)
+  serve      start the lane in this terminal, until Ctrl-C
+  down       stop the lane and clear the system proxy it set (--all: every lane)
+  status     show the lane (--instance NAME for one of several), then its exit
+  ports      print the port map and the macOS settings to type
+  tun        what TUN mode would need, and why this binary refuses it
+  version    print the binary's version
+
+first run, then every run: the foxy lane signs in once and keeps the session in
+\$CONF_DIR/foxy-token.json (0600). The launches after it mint a pass from that grant,
+so no password is asked again and FxA sends no new-sign-in mail.
+
+  ferrox-cli up --foxy --vpn                    # asks once, then connects
+  ferrox-cli up --foxy --vpn                    # second run: resumes, no sign-in
+  ferrox-cli up --foxy --vpn --udp-via warp     # TCP on foxy, UDP on WARP
+  ferrox-cli locations --foxy                   # countries and cities to pin
+  ferrox-cli locations --ping                   # the same list, nearest exit first
+  ferrox-cli locations --veepn                  # VeePN region ids, no account
+  ferrox-cli locations --psiphon                # regions in the signed server list
+  ferrox-cli location --foxy DE                 # remember Germany for every up
+  ferrox-cli location --veepn nl                # remember the Netherlands for VeePN
+  ferrox-cli location --psiphon US              # remember the US for Psiphon
+  ferrox-cli status                             # exit IP and country
+  ferrox-cli down                               # stop, clear the system proxy
+  ferrox-cli logout                             # forget the account and session
+
+and from the same fresh package, with nothing to type in at all:
+  ferrox-cli up --veepn --vpn                   # anonymous, no account, no server
+  ferrox-cli up --psiphon --vpn                 # native OSSH/SSH, no client binary
+
+several lanes at once
+  ferrox-cli up --foxy --instance work --country DE
+  ferrox-cli up --foxy --instance home --country NL --socks 10818 --http 8088
+  ferrox-cli status --instance work
+  ferrox-cli down --all
+  A named instance keeps its own config, pid, log, ports and remembered exit;
+  the account and the edge catalogue are shared. Ports left unnamed are the
+  first free ones near the defaults, so a second lane never fights the first.
+  --vpn belongs to the unnamed lane: the system proxy is one machine-wide
+  setting, and an instance is reached by pointing the app at its fronts.
+
+outbound (choose one)
+  --foxy                 Foxy lane; account from \$FOXY_CREDENTIALS
+  --veepn                VeePN lane; anonymous, no account and no server
+  --psiphon              Psiphon lane; native OSSH/SSH, no client binary
+  --psiphon-cdn          the same lane with CDN fronting + beast mode requested
+  --vless LINK           any vless:// share link
+  --vmess LINK|HOST:PORT any vmess:// share link, or HOST:PORT with --uuid ID
+  --trojan HOST:PORT --password PW
+  --ss HOST:PORT --method METHOD --password PW
+  --config FILE          any JSON config this binary serves, used verbatim
+
+foxy options (email + password is the whole setup; there is no server to name)
+  --email ADDR           Firefox account, else \$FOXY_EMAIL, else the credentials file
+  --password PW          password, else \$FOXY_PASS (a file with 0600 is better)
+  --code CODE            two-factor code (kept with the pending sign-in until it verifies)
+  --country CC           exit country; default is the remembered one, else US
+  --city CODE            city tier inside the country (SFO, NYC; see locations)
+  --carrier NAME         auto|h1|h2|h3, default auto (h2, then h1, then h3);
+                         asked once on a terminal when the flag is left off, and
+                         auto on a pipe; h2 outran h3 on CI in every run and on
+                         every runner, so auto opens on h2; h3 is still the
+                         carrier UDP asks first, and a named h3 falls back to
+                         h2 and h1 when the path drops QUIC
+  --fxa-user-agent UA    override the pinned desktop Firefox identity for FxA
+  --upstream URL         http:// or socks5(h):// hop to reach the edge through
+  --warp                 chain through WARP first: register once, race WireGuard
+                         against MASQUE, and egress the account plane and the
+                         carrier through it (a region block sees a WARP exit)
+  --udp-via LANE         split egress: TCP stays on foxy, datagrams take a second
+                         outbound in the same config. LANE is foxy (default),
+                         warp, psiphon, psiphon-cdn, direct or block. warp is a
+                         registering WARP lane (or the --warp hop when both are
+                         named); psiphon rides its udpgw; direct is unencrypted;
+                         block drops UDP.
+  --exclude-domains LIST domain suffixes that leave the tunnel and dial directly
+                         (comma-separated; example.com also covers its subdomains)
+  --exclude-ports LIST   destination ports that leave the tunnel and dial directly
+                         (comma-separated; 22,53 are the usual ones)
+
+locations
+  ferrox-cli locations --foxy [--ping] [CC]   countries and cities; --ping measures edges
+  ferrox-cli locations --veepn [CC]           VeePN region ids from its public list
+  ferrox-cli locations --psiphon [CC]         regions in the signed Psiphon server list
+  ferrox-cli location --foxy CC [CITY]        remember it; up --foxy moves there
+  ferrox-cli location --veepn REGION          remember a VeePN region; up --veepn moves there
+  ferrox-cli location --psiphon CC            remember a Psiphon region; up --psiphon moves there
+  The foxy list is public and cached by the binary; the last answer is kept in
+  \$CONF_DIR/foxy-locations.jsonl. VeePN's list is public too and is kept in
+  \$CONF_DIR/veepn-locations.jsonl. Psiphon's list is the signed server list the
+  lane already downloads. Each lane remembers its own exit, so changing one
+  does not move another.
+
+psiphon options (native OSSH/SSH transport and the lane's local SOCKS)
+  --psiphon-cdn          CDN fronting + beast mode in one shortcut; fronted
+                         entries ride fronted-meek, and a list with no fronted
+                         entry falls back to SSH/OSSH with one line
+  --psiphon-fronted      an alias for --psiphon-cdn
+  --psiphon-region CC    two-letter egress region, else the remembered one
+  --country CC           an alias for --psiphon-region on this lane
+  --psiphon-compartment ID  the private conduit compartment, default is the
+                         public private-compartment value built into the binary
+  --psiphon-listen ADDR  the lane's local SOCKS address, default 127.0.0.1:1821
+  --psiphon-dir DIR      the lane's state, default \$CONF_DIR/psiphon
+  --psiphon-ready SECS   how long a tunnel may take, default 180
+  --psiphon-entries FILE a server-entry list read at startup
+  --psiphon-user USER    the local proxy's username (with --psiphon-pass)
+  --psiphon-pass PASS    the local proxy's password
+  --psiphon-share        listen on every interface so the proxy can be shared
+  --psiphon-share-port PORT  the shared SOCKS port on every interface
+  --psiphon-server-list LIST  remote server-list URLs (comma separated)
+  --psiphon-list-key KEY  the signed list's RSA publisher key
+  --upstream URL         accepted for compatibility; this lane dials its SSH
+                         servers directly and names the field as ignored
+  --psiphon-conduit-mode MODE  auto, private or public; private uses the
+                         private compartment, and conduits need volunteer relays
+  --psiphon-cdn-profile NAME   fronted, legacy, android or off; fronted selects
+                         fronted-meek
+  The client-tuning flags from earlier releases (--psiphon-bin, --psiphon-mode,
+  --psiphon-http, --psiphon-base, --psiphon-pool, --psiphon-workers,
+  --psiphon-aggressive, --psiphon-no-aggressive, --psiphon-conduit-*,
+  --psiphon-split*, --psiphon-osl, --psiphon-entry-key, --psiphon-exchange-key,
+  --psiphon-feature, --psiphon-latency, --psiphon-disable-timeouts, --psiphon-cdn-*,
+  --psiphon-unsafe-alerts, --psiphon-location-precision, --psiphon-share-http,
+  --psiphon-geoip, --psiphon-reject-*, --psiphon-compartment, --psiphon-dns,
+  --psiphon-device-*, --psiphon-network-id, --psiphon-additional-params,
+  --psiphon-establish-timeout, --psiphon-emit-bytes) are still parsed for script
+  compatibility; the native engine names each one as ignored in one line.
+
+veepn options (nothing is required: the plane names the region and its edges)
+  --region CC            exit region id (lowercase, e.g. nl, us-va), else the remembered one
+  --country CC           an alias for --region on this lane
+  --domains URLS         comma-separated https origins to ask, else the shipped seven
+  --udid ID              the device identity the plane sees, else one kept per machine
+
+fronts
+  --fronts LIST          socks,http,mixed (default all three)
+  --socks PORT           default $SOCKS_PORT (a named instance takes the next free one)
+  --http PORT            default $HTTP_PORT
+  --mixed PORT           default $MIXED_PORT
+  --instance NAME        another lane beside the unnamed one: its config, pid,
+                         log, ports and remembered exit are its own; ports left
+                         unnamed are the first free ones near the defaults
+  --vpn                  also point the macOS system proxy at the fronts; other
+                         platforms refuse and print the environment command; the
+                         unnamed lane only (it is one machine-wide setting)
+  --all                  with down: stop every lane
+  --debug                keep the lane's dial trace in the log (FOXY_DEBUG=1)
+  --tun                  refused: this binary has no utun device
+  -h, --help             this text
+  -V, --version          print the binary's version
+
+ports (defaults)
+  SOCKS5         127.0.0.1:$SOCKS_PORT    curl --socks5-hostname, UDP-aware
+  HTTP + HTTPS   127.0.0.1:$HTTP_PORT     CONNECT tunnels and plain forwards
+  mixed          127.0.0.1:$MIXED_PORT    SOCKS5 and HTTP on one port
+EOF
+}
+
+# ---------------------------------------------------------------- credentials
+
+shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+resolve_real() {
+  local path="$1" dir base
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$path" && return 0
+  fi
+  dir="$(cd -P "$(dirname "$path")" 2>/dev/null && pwd)" || { printf '%s\n' "$path"; return 0; }
+  base="$(basename "$path")"
+  printf '%s/%s\n' "${dir%/}" "$base"
+}
+
+absolute_path() {
+  local path="$1" dir base
+  dir="$(dirname "$path")"
+  base="$(basename "$path")"
+  if dir="$(cd -P "$dir" 2>/dev/null && pwd)"; then
+    printf '%s/%s\n' "${dir%/}" "$base"
+    return 0
+  fi
+  case "$path" in /*) printf '%s\n' "$path" ;; *) printf '%s/%s\n' "$PWD" "$path" ;; esac
+}
+
+repo_root_of_path() {
+  local path="$1" dir root
+  dir="$(dirname "$path")"
+  while [ ! -d "$dir" ]; do
+    [ "$dir" = / ] && return 1
+    dir="$(dirname "$dir")"
+  done
+  root="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  resolve_real "$root"
+}
+
+credentials_inside_repo() {
+  local real lex root
+  real="$(resolve_real "$CREDS")"
+  lex="$(absolute_path "$CREDS")"
+  if root="$(repo_root_of_path "$lex")"; then
+    case "$lex" in "$root"/*) return 0 ;; esac
+  fi
+  if [ "$real" != "$lex" ] && root="$(repo_root_of_path "$real")"; then
+    case "$real" in "$root"/*) return 0 ;; esac
+  fi
+  return 1
+}
+
+credential_ancestors_trusted() {
+  local cur="$1" uid unsafe sticky owner
+  uid="$(id -u)"
+  cur="$(dirname "$cur")"
+  while :; do
+    owner="$(find "$cur" -maxdepth 0 \( -user 0 -o -user "$uid" \) -print -quit 2>/dev/null)"
+    [ -n "$owner" ] || return 1
+    unsafe="$(find "$cur" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print -quit 2>/dev/null)"
+    if [ -n "$unsafe" ]; then
+      sticky="$(find "$cur" -maxdepth 0 -perm -1000 -print -quit 2>/dev/null)"
+      [ -n "$sticky" ] || return 1
+    fi
+    [ "$cur" = / ] && return 0
+    cur="$(dirname "$cur")"
+  done
+}
+
+action_login() {
+  reconcile_stale_proxy || die "login: the stale system proxy could not be cleared; run ferrox-cli down."
+  credentials_inside_repo &&
+    die "$CREDS would be written inside the repository; point FOXY_CREDENTIALS outside it"
+  local email="${EMAIL:-${FOXY_EMAIL:-}}" pass="${PASSWORD:-${FOXY_PASS:-}}"
+  if [ -z "$email" ]; then
+    printf 'firefox account email: ' && read -r email
+  fi
+  if [ -z "$pass" ]; then
+    printf 'password (hidden, not echoed): ' && read -rs pass && printf '\n'
+  fi
+  [ -n "$email" ] && [ -n "$pass" ] || die "an account is an email and a password"
+  local cred_dir save_dir tmp unsafe login_epoch
+  if [ "${LOGIN_GUARD_SET:-0}" = 1 ]; then
+    login_epoch="$LOGIN_GUARD_EPOCH"
+  else
+    login_epoch="$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)"
+  fi
+  cred_dir="$(dirname "$CREDS")"
+  [ -d "$CREDS" ] && die "$CREDS is a directory; FOXY_CREDENTIALS must name a file"
+  mkdir -p "$CONF_DIR" || die "cannot create $CONF_DIR; the saved session was kept."
+  chmod 700 "$CONF_DIR" 2>/dev/null || true
+  if [ "$cred_dir" != "$CONF_DIR" ]; then
+    ( umask 077; mkdir -p "$cred_dir" ) || die "cannot create $cred_dir; the saved session was kept."
+  fi
+  save_dir="$(resolve_real "$cred_dir")"
+  [ -O "$save_dir" ] || die "$cred_dir is not owned by you; choose an owner-only directory"
+  unsafe="$(find "$save_dir" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print -quit 2>/dev/null)"
+  [ -z "$unsafe" ] || die "$cred_dir is writable by another user; choose an owner-only directory"
+  credential_ancestors_trusted "$save_dir" ||
+    die "$cred_dir has an ancestor writable by another user; choose a private directory"
+  tmp="$(mktemp "$save_dir/.ferrox-credentials.XXXXXX")" ||
+    die "cannot create a temporary credentials file in $cred_dir; the saved session was kept."
+  (
+    umask 077
+    {
+      printf "FOXY_EMAIL=%s\n" "$(shell_quote "$email")"
+      printf "FOXY_PASS=%s\n" "$(shell_quote "$pass")"
+    } >"$tmp"
+  ) || { rm -f "$tmp"; die "cannot write $CREDS; the saved session was kept."; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; die "cannot set owner-only mode on $CREDS; the saved session was kept."; }
+  [ -d "$CREDS" ] && { rm -f "$tmp"; die "$CREDS is a directory; FOXY_CREDENTIALS must name a file"; }
+  proxy_lock || { rm -f "$tmp"; die "login: the system proxy lock was unavailable; the saved session was kept."; }
+  if [ "$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)" != "$login_epoch" ]; then
+    rm -f "$tmp"; proxy_unlock
+    die "login: a concurrent down or logout cancelled this sign-in."
+  fi
+  mv -f "$tmp" "$save_dir/$(basename "$CREDS")" ||
+    { rm -f "$tmp"; proxy_unlock; die "cannot replace $CREDS; the saved session was kept."; }
+  # A login is the user asking for this account now: the grant the last one left is not the one to resume.
+  rm -f "$TOKEN_FILE"
+  proxy_unlock
+  if [ "${LOGIN_QUIET:-0}" != 1 ]; then
+    say "account saved to $CREDS: owner-only, outside the repository, read by every future up."
+    say "the next up --foxy signs in once and keeps the session in $TOKEN_FILE."
+  fi
+}
+
+read_credentials() {
+  local env_email="${FOXY_EMAIL:-}" env_pass="${FOXY_PASS:-}" file_email="" file_pass=""
+  if [ -f "$CREDS" ]; then
+    credentials_inside_repo &&
+      die "$CREDS resolves inside the repository; move it outside"
+    # shellcheck disable=SC1090
+    . "$CREDS"
+    file_email="${FOXY_EMAIL:-}"
+    file_pass="${FOXY_PASS:-}"
+  fi
+  # A named flag beats the environment, which beats a stored file.
+  EMAIL="${EMAIL:-${env_email:-$file_email}}"
+  PASSWORD="${PASSWORD:-${env_pass:-$file_pass}}"
+}
+
+# The account a stored session belongs to, so a launch can resume it even when
+# the credentials file is gone; a missing or corrupt session answers nothing.
+stored_email() {
+  [ -f "$TOKEN_FILE" ] || return 0
+  python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("email", ""))' "$TOKEN_FILE" 2>/dev/null || true
+}
+
+same_stored_account() {
+  local stored
+  stored="$(stored_email)"
+  [ -n "$stored" ] || return 1
+  [ "$(printf '%s' "$stored" | tr '[:upper:]' '[:lower:]')" = \
+    "$(printf '%s' "$EMAIL" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" ]
+}
+
+action_logout() {
+  proxy_lock ||
+    die "logout: the account lock was unavailable; the saved account was kept."
+  if ! stop_all_lanes; then
+    proxy_unlock
+    die "logout: the lanes or system proxy could not be stopped; the saved account was kept."
+  fi
+  rm -f "$TOKEN_FILE" "$CREDS"
+  proxy_unlock
+  say "signed out: every lane is stopped, and the stored session, the saved account and generated lane configs are gone."
+  say "the remembered exit stays in $LOCATION_FILE; 'ferrox-cli login' signs in again."
+}
+
+# ---------------------------------------------------------------- locations
+
+# The list is public and needs no account, so it is the binary's catalogue call
+# and not an authenticated one; the last answer is kept for an offline listing.
+action_locations() {
+  case "${OUTBOUND:-foxy}" in
+    foxy) action_locations_foxy ;;
+    veepn) action_locations_veepn ;;
+    psiphon) action_locations_psiphon ;;
+    *) die "locations names foxy, veepn or psiphon; nothing was started." ;;
+  esac
+}
+
+action_locations_foxy() {
+  local filter rows plain formatter
+  filter="$(printf '%s' "$LOC_FILTER" | tr '[:lower:]' '[:upper:]')"
+  require_bin
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  if [ "$LOC_PING" = 1 ]; then
+    rows="$("$BIN" edges --ping 2>/dev/null)"
+  else
+    rows="$("$BIN" edges 2>/dev/null)"
+  fi
+  if [ -z "$rows" ]; then
+    if [ -s "$LOCATIONS_FILE" ]; then
+      say "the catalogue did not answer; showing the last list it gave ($LOCATIONS_FILE)."
+      rows="$(cat "$LOCATIONS_FILE")"
+    else
+      die "the catalogue did not answer and no list is saved yet: check the network, then run 'ferrox-cli locations' again."
+    fi
+  else
+    # The offline copy keeps the same rows without this launch's readings.
+    plain="$(printf '%s\n' "$rows" | sed -e 's/,"ms":null//' -e 's/,"ms":[0-9][0-9]*//')"
+    ( umask 077; printf '%s\n' "$plain" >"$LOCATIONS_FILE" )
+  fi
+  # A here-document on this command would take stdin's place and hide the rows.
+  formatter="$(cat <<'PY'
+import json, sys
+
+wanted, current_country, current_city, saved, ping = sys.argv[1:6]
+ping = ping == "1"
+places = {}
+best = {}
+total = 0
+measured = False
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        edge = json.loads(line)
+    except ValueError:
+        continue
+    country = str(edge.get("country") or "").upper()
+    city = str(edge.get("city") or "").upper()
+    if not country:
+        continue
+    if wanted and country != wanted:
+        continue
+    cities = places.setdefault(country, {})
+    cities[city] = cities.get(city, 0) + 1
+    total += 1
+    if "ms" in edge:
+        measured = True
+        reading = edge.get("ms")
+        key = (country, city)
+        if not isinstance(reading, int):
+            best.setdefault(key, None)
+        elif key not in best or best[key] is None or reading < best[key]:
+            best[key] = reading
+if not places:
+    if wanted:
+        print(f"{wanted} is not in the published catalogue; run 'ferrox-cli locations' for every country it lists.")
+    else:
+        print("the catalogue listed no dialable edge just now; the lane would refuse every country.")
+    sys.exit(1)
+country_best = {}
+for (country, _city), reading in best.items():
+    if not isinstance(reading, int):
+        country_best.setdefault(country, None)
+    elif country not in country_best or country_best[country] is None or reading < country_best[country]:
+        country_best[country] = reading
+
+def reading_of(key, table):
+    if not ping or key not in table:
+        return ""
+    value = table[key]
+    if not isinstance(value, int):
+        return "no answer".rjust(12)
+    return f"{value} ms".rjust(12)
+
+def country_order(code):
+    if code == "REC":
+        return (0, 0, code)
+    if code not in country_best:
+        return (3, 0, code)
+    reading = country_best[code]
+    return (1, reading, code) if isinstance(reading, int) else (2, 0, code)
+
+def city_order(country, code):
+    key = (country, code)
+    if key not in best:
+        return (3, 0, code)
+    reading = best[key]
+    return (1, reading, code) if isinstance(reading, int) else (2, 0, code)
+
+print(f"exit locations from Mozilla's catalogue: {len(places)} countries, {total} edges")
+print("country and city are the codes --country and --city take; * is what this machine remembers.")
+if ping:
+    print("ms is one TCP handshake from this machine to the edge (1.5 s budget); 'no answer' is an edge that did not take it.")
+    if not measured:
+        print("latency not measured: this listing came from the offline copy; run 'locations --ping' again when the catalogue answers.")
+if ping:
+    countries = sorted(places, key=country_order)
+else:
+    countries = sorted(places, key=lambda code: (code != "REC", code))
+for country in countries:
+    cities = places[country]
+    mark = "*" if country == current_country else " "
+    print(f" {mark} {country:<4} {sum(cities.values()):>3} edges{reading_of(country, country_best)}")
+    if ping:
+        ordered = sorted(cities, key=lambda code: city_order(country, code))
+    else:
+        ordered = sorted(cities, key=lambda code: (code == "", code))
+    for city in ordered:
+        star = "*" if country == current_country and city == current_city else " "
+        print(f"   {star}   {(city or 'any'):<6} {cities[city]:>3}{reading_of((country, city), best)}")
+print()
+print("remember one:  ferrox-cli location <CC> [CITY]")
+print(f"the list is saved in {saved}")
+PY
+)"
+  printf '%s\n' "$rows" | python3 -c "$formatter" "$filter" "$(remembered_country)" "$(remembered_city)" "$LOCATIONS_FILE" "$LOC_PING"
+}
+
+action_locations_veepn() {
+  local filter rows
+  filter="$(printf '%s' "$LOC_FILTER" | tr '[:lower:]' '[:upper:]')"
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  rows="$(curl -q -sS --max-time 20 https://antpeak.com/v3/location/extension/ 2>/dev/null)" || rows=""
+  if [ -z "$rows" ]; then
+    if [ -s "$LOCATIONS_FILE" ]; then
+      say "the VeePN list did not answer; showing the last list it gave ($LOCATIONS_FILE)."
+      rows="$(cat "$LOCATIONS_FILE")"
+    else
+      die "the VeePN list did not answer and no list is saved yet: check the network, then run 'ferrox-cli locations --veepn' again."
+    fi
+  else
+    ( umask 077; printf '%s\n' "$rows" >"$LOCATIONS_FILE" )
+  fi
+  printf '%s' "$rows" | python3 -c '
+import json, sys
+wanted, current = sys.argv[1:3]
+try:
+    document = json.load(sys.stdin)
+except ValueError:
+    sys.exit("the VeePN list was not JSON")
+places = {}
+for location in document.get("locations", []):
+    code = str(location.get("countryCode") or "").upper()
+    region = str(location.get("region") or "")
+    name = str(location.get("name") or "")
+    if not code:
+        continue
+    if wanted and wanted not in (code, region.upper()):
+        continue
+    places.setdefault(code, []).append((region, name))
+if not places:
+    if wanted:
+        sys.exit(f"{wanted} is not in the VeePN list; run ferrox-cli locations --veepn for every code it lists.")
+    sys.exit("the VeePN list named no region just now.")
+current = current.upper()
+print(f"exit locations from VeePN: {len(places)} countries, {sum(len(v) for v in places.values())} regions")
+print("the region id is what --region takes (lowercase); --country takes either it or the two-letter code.")
+for code in sorted(places):
+    mark = "*" if code == current else " "
+    print(f" {mark} {code}  {len(places[code]):>3} regions")
+    for region, name in sorted(places[code]):
+        print(f"      {region:<18} {name}")
+' "$filter" "$(remembered_country)"
+}
+
+action_locations_psiphon() {
+  local filter rows tmp outbound
+  filter="$(printf '%s' "$LOC_FILTER" | tr '[:lower:]' '[:upper:]')"
+  require_bin
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  tmp="$(mktemp)" || die "cannot make a temporary config for the Psiphon list"
+  outbound="$(psiphon_outbound)" || { rm -f "$tmp"; die "$outbound"; }
+  printf '{"inbounds":[],"outbounds":[%s]}\n' "$outbound" >"$tmp"
+  rows="$("$BIN" psiphon-regions -c "$tmp" 2>/dev/null)" || rows=""
+  rm -f "$tmp"
+  if [ -z "$rows" ]; then
+    if [ -s "$LOCATIONS_FILE" ]; then
+      say "the Psiphon list did not answer; showing the last list it gave ($LOCATIONS_FILE)."
+      rows="$(cat "$LOCATIONS_FILE")"
+    else
+      die "the Psiphon list did not answer and no list is saved yet: check the network, then run 'ferrox-cli locations --psiphon' again."
+    fi
+  else
+    ( umask 077; printf '%s\n' "$rows" >"$LOCATIONS_FILE" )
+  fi
+  printf '%s\n' "$rows" | python3 -c '
+import sys
+wanted, current = sys.argv[1:3]
+rows = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    code, _, count = line.partition("\t")
+    code = code.upper()
+    if wanted and code != wanted:
+        continue
+    rows.append((code, int(count or 0)))
+if not rows:
+    if wanted:
+        sys.exit(f"{wanted} is not in the Psiphon server list; run ferrox-cli locations --psiphon for every code it lists.")
+    sys.exit("the Psiphon server list named no region just now.")
+current = current.upper()
+print(f"exit regions from the signed Psiphon server list: {len(rows)} codes")
+print("the code is what --psiphon-region takes; a code with no entry is not dialable from that list.")
+for code, count in rows:
+    mark = "*" if code == current else " "
+    print(f" {mark} {code:<4} {count:>4} entries")
+' "$filter" "$(remembered_country)"
+}
+
+action_location() {
+  local lane="${OUTBOUND:-foxy}" raw country city
+  raw="$(printf '%s' "$LOC_COUNTRY" | tr -d '[:space:]')"
+  country="$(printf '%s' "$raw" | tr '[:lower:]' '[:upper:]')"
+  city="$(printf '%s' "$LOC_CITY" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+  [ -n "$country" ] || die "usage: ferrox-cli location --foxy|--veepn|--psiphon <CC> [CITY]   (see 'ferrox-cli locations')"
+  case "$lane" in
+    foxy)
+      if [ -s "$LOCATIONS_FILE" ] && ! grep -qiF "\"country\":\"$country\"" "$LOCATIONS_FILE"; then
+        die "'$country' is not in the saved catalogue list; run 'ferrox-cli locations --foxy' to refresh it, or pick a code it prints."
+      fi ;;
+    veepn)
+      if [ -s "$LOCATIONS_FILE" ]; then
+        python3 - "$LOCATIONS_FILE" "$raw" <<'PY' || die "'$raw' is not in the saved VeePN list; run 'ferrox-cli locations --veepn' to refresh it, or pick a region it prints."
+import json, sys
+path, wanted = sys.argv[1:3]
+wanted = wanted.upper()
+with open(path, encoding="utf-8") as handle:
+    document = json.load(handle)
+for location in document.get("locations", []):
+    code = str(location.get("countryCode") or "").upper()
+    region = str(location.get("region") or "").upper()
+    if wanted in (code, region):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+      fi ;;
+    psiphon)
+      if [ -s "$LOCATIONS_FILE" ] && ! awk -F'\t' -v code="$country" '$1 == code { found = 1 } END { exit !found }' "$LOCATIONS_FILE"; then
+        die "'$country' is not in the saved Psiphon list; run 'ferrox-cli locations --psiphon' to refresh it, or pick a code it prints."
+      fi ;;
+    *) die "location names foxy, veepn or psiphon; nothing was started." ;;
+  esac
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  case "$lane" in
+    veepn) ( umask 077; printf '%s\n' "$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')" >"$LOCATION_FILE" ) ;;
+    *) ( umask 077; printf '%s %s\n' "$country" "$city" >"$LOCATION_FILE" ) ;;
+  esac
+  if [ "$lane" = foxy ] && [ -n "$city" ]; then
+    say "exit remembered: $country / $city. The next 'up --foxy' moves there."
+  elif [ "$lane" = foxy ]; then
+    say "exit remembered: $country (its catalogue order picks the city). The next 'up --foxy' moves there."
+  else
+    say "exit remembered: $raw. The next 'up --$lane' moves there."
+  fi
+}
+
+# ---------------------------------------------------------------- config files
+
+# One JSON writer for every outbound: python3 already carries this tree's scripts.
+write_config() {
+  local outbound="$1" udp="${2:-}" tag="${3:-}" rc=0
+  ( umask 077
+    python3 - "$CFG" "$FRONTS" "$SOCKS_PORT" "$HTTP_PORT" "$MIXED_PORT" "$tag" \
+      3< <(printf '%s' "$outbound") 4< <(printf '%s' "$udp") <<'PY'
+import json, os, sys
+
+cfg, fronts, socks, http, mixed, tag = sys.argv[1:7]
+with os.fdopen(3) as handle:
+    outbound = handle.read()
+with os.fdopen(4) as handle:
+    udp = handle.read()
+ports = {"socks": int(socks), "http": int(http), "mixed": int(mixed)}
+wanted = [f.strip() for f in fronts.split(",") if f.strip()]
+for front in wanted:
+    if front not in ports:
+        sys.exit(f"unknown front `{front}`: socks, http, mixed")
+doc = {
+    "inbounds": [{"protocol": f, "listen": "127.0.0.1", "port": ports[f]} for f in wanted],
+    "outbounds": [json.loads(outbound)],
+}
+if udp:
+    lane = json.loads(udp)
+    lane["tag"] = tag
+    doc["outbounds"].append(lane)
+    doc["routing"] = {
+        "rules": [{"type": "field", "network": "udp", "outboundTag": tag}]
+    }
+fd = os.open(cfg, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.chmod(cfg, 0o600)
+with os.fdopen(fd, "w") as handle:
+    json.dump(doc, handle, indent=2)
+PY
+  ) || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  chmod 600 "$CFG"
+}
+
+# The ports this lane runs: the flags win, a lane's own config is adopted so a
+# restart keeps its fronts, and a named instance takes the next free ones so a
+# second lane never fights the first. Prints "socks http mixed".
+plan_ports() {
+  local scan="$1"
+  python3 - "$SOCKS_PORT" "$HTTP_PORT" "$MIXED_PORT" "$SOCKS_SET" "$HTTP_SET" \
+    "$MIXED_SET" "$FRONTS" "$scan" "$CFG" <<'PY'
+import json, socket, sys
+
+values = [int(a) for a in sys.argv[1:4]]
+explicit = [a == "1" for a in sys.argv[4:7]]
+fronts = {f.strip() for f in sys.argv[7].split(",") if f.strip()}
+scan = sys.argv[8] == "1"
+config = sys.argv[9]
+names = ["socks", "http", "mixed"]
+fixed = list(explicit)
+if config:
+    try:
+        with open(config, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError):
+        document = {}
+    adopted = set()
+    for inbound in document.get("inbounds", []):
+        name = inbound.get("protocol")
+        port = inbound.get("port")
+        if name in names and name in fronts and not explicit[names.index(name)] and name not in adopted and isinstance(port, int):
+            values[names.index(name)] = port
+            fixed[names.index(name)] = True
+            adopted.add(name)
+taken = {values[i] for i, name in enumerate(names) if name in fronts and fixed[i]}
+if scan:
+    for i, name in enumerate(names):
+        if name not in fronts or fixed[i]:
+            continue
+        port = values[i]
+        while port <= 65535:
+            if port not in taken:
+                probe = socket.socket()
+                try:
+                    probe.bind(("127.0.0.1", port))
+                    break
+                except OSError:
+                    pass
+                finally:
+                    probe.close()
+            port += 1
+        values[i] = port
+        taken.add(port)
+print(" ".join(str(v) for v in values))
+PY
+}
+
+# A config lane serves the proxy inbounds its file names, so the fronts and the
+# ports a system proxy may point at come from that file, not from the defaults.
+# A selected front must be reachable at 127.0.0.1 before it is armed, and a file
+# with no proxy inbound is refused by name for --vpn.
+config_fronts() {
+  python3 - "$CONFIG_FILE" "$WANT_VPN" "$FRONTS_SET" "$FRONTS" <<'PY'
+import json, sys
+
+path, vpn, explicit, asked = sys.argv[1:5]
+try:
+    with open(path, encoding="utf-8") as handle:
+        document = json.load(handle)
+except (OSError, ValueError) as error:
+    sys.exit(f"cannot read config {path}: {error}")
+order = []
+for inbound in document.get("inbounds", []):
+    if not isinstance(inbound, dict):
+        continue
+    name = inbound.get("protocol")
+    if name not in ("socks", "http", "mixed"):
+        continue
+    port = inbound.get("port")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        sys.exit(f"inbound `{name}` has no port in 1-65535")
+    if name not in order:
+        order.append(name)
+if explicit == "1":
+    wanted = [front.strip() for front in asked.split(",") if front.strip()]
+    missing = [front for front in wanted if front not in order]
+    if missing:
+        sys.exit(f"the config serves no {missing[0]} inbound; --fronts names it")
+    order = [front for front in order if front in wanted]
+if vpn == "1" and not order:
+    sys.exit("the config serves no socks, http or mixed inbound; --vpn needs one")
+# This launcher reaches every front on 127.0.0.1, so an inbound bound to another
+# address would never answer the startup probe or the system proxy. `0.0.0.0` and
+# `::1` are refused with it: a wildcard front is reachable but also exposed, and
+# an IPv6-loopback front is not the address the probe and the system proxy use.
+checked = set()
+for inbound in document.get("inbounds", []):
+    if not isinstance(inbound, dict):
+        continue
+    name = inbound.get("protocol")
+    if name not in order or name in checked:
+        continue
+    checked.add(name)
+    listen = inbound.get("listen")
+    reachable = listen in ("127.0.0.1", "localhost")
+    if not reachable:
+        where = listen if isinstance(listen, str) and listen else "all interfaces"
+        sys.exit(
+            f"inbound `{name}` listens on {where}, not loopback; this launcher"
+            " reaches a front on 127.0.0.1, so use 127.0.0.1 or localhost"
+        )
+print(",".join(order))
+PY
+}
+
+# The config a running lane is served is the truth about its fronts; status and
+# ports read it back instead of guessing the defaults.
+adopt_lane_ports() {
+  [ -f "$CFG" ] || return 1
+  local planned
+  planned="$(plan_ports 0 2>/dev/null)" || return 1
+  read -r SOCKS_PORT HTTP_PORT MIXED_PORT <<<"$planned"
+}
+
+# The running lane's config path and fronts, so a later status or ports reads
+# the addresses it actually serves instead of the defaults.
+write_lane_meta() {
+  local tmp="$META_FILE.$$" rc=0
+  ( umask 077
+    {
+      printf 'config=%s\n' "$(resolve_real "$CFG")"
+      printf 'fronts=%s\n' "$FRONTS"
+      printf 'generated=%s\n' "$([ "$OUTBOUND" = config ] && echo 0 || echo 1)"
+    } >"$tmp"
+  ) || rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$tmp"; return "$rc"; fi
+  mv -f "$tmp" "$META_FILE" || { rm -f "$tmp"; return 1; }
+}
+
+load_lane_meta() {
+  [ -f "$META_FILE" ] || return 1
+  local line
+  GENERATED=0
+  while IFS= read -r line; do
+    case "$line" in
+      config=*) CFG="${line#config=}" ;;
+      fronts=*) FRONTS="${line#fronts=}"; FRONTS_SET=1 ;;
+      generated=*) GENERATED="${line#generated=}" ;;
+    esac
+  done <"$META_FILE"
+}
+
+foxy_outbound() {
+  python3 - "$EMAIL" "$PASSWORD" "$CODE" "$COUNTRY" "$CITY" "$CARRIER" "$FXA_USER_AGENT" "$UPSTREAM" "$TOKEN_FILE" "$EXCLUDE_DOMAINS" "$EXCLUDE_PORTS" <<'PY'
+import json, sys
+
+email, password, code, country, city, carrier, fxa_user_agent, upstream, token_file, domains, ports = sys.argv[1:12]
+
+def split_domains(raw):
+    names = []
+    for item in raw.split(","):
+        name = item.strip().lower().rstrip(".")
+        # The starred and dotted spellings mean what they mean in a browser: this name and below it.
+        if name.startswith("*."):
+            name = name[2:]
+        if name.startswith("."):
+            name = name[1:]
+        if not name:
+            continue
+        if ("/" in name or ":" in name or "*" in name or ".." in name
+                or name.startswith(".") or any(ch.isspace() for ch in name)):
+            sys.exit(f"--exclude-domains wants domain suffixes like example.com, got '{item.strip()}'; nothing was started.")
+        names.append(name)
+    if not names:
+        sys.exit("--exclude-domains wants at least one domain suffix; nothing was started.")
+    return names
+
+def split_ports(raw):
+    numbers = []
+    for item in raw.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        try:
+            port = int(value, 10)
+        except ValueError:
+            sys.exit(f"--exclude-ports wants ports 1-65535, got '{value}'; nothing was started.")
+        if not 0 < port < 65536:
+            sys.exit(f"--exclude-ports wants ports 1-65535, got '{value}'; nothing was started.")
+        numbers.append(port)
+    if not numbers:
+        sys.exit("--exclude-ports wants at least one port; nothing was started.")
+    return numbers
+
+if any(not 32 <= ord(ch) <= 126 for ch in fxa_user_agent):
+    sys.exit("--fxa-user-agent wants printable ASCII only; nothing was started.")
+fxa_user_agent = fxa_user_agent.strip()
+
+# The account, not a minted pass: the pass the edge accepts lives 600 seconds,
+# so a lane handed a bare token cannot renew it and dies when it expires.
+settings = {"email": email, "password": password, "country": country.upper(), "carrier": carrier}
+if fxa_user_agent:
+    settings["fxaUserAgent"] = fxa_user_agent
+# The session the first sign-in leaves: later launches mint from it instead of
+# signing in again, which is what keeps FxA from mailing a new-sign-in notice.
+if token_file:
+    settings["tokenFile"] = token_file
+if city:
+    settings["city"] = city.upper()
+if upstream:
+    settings["upstreamProxy"] = upstream
+if code:
+    settings["code"] = code
+if domains:
+    settings["directDomains"] = split_domains(domains)
+if ports:
+    settings["directPorts"] = split_ports(ports)
+print(json.dumps({"protocol": "foxy", "settings": settings}))
+PY
+}
+
+# ---------------------------------------------------------------- locations
+
+# The remembered exit fills only the flag nobody typed, so a country named now
+# starts from that country's own edges and never inherits another lane's city.
+load_lane_location() {
+  [ -f "$LOCATION_FILE" ] || return 0
+  case "$OUTBOUND" in
+    foxy) [ "$COUNTRY_SET" = 1 ] && return 0 ;;
+    veepn) { [ -n "$REGION" ] || [ "$COUNTRY_SET" = 1 ]; } && return 0 ;;
+    psiphon) [ -n "$PSIPHON_REGION" ] && return 0 ;;
+  esac
+  local country city
+  IFS=' ' read -r country city < "$LOCATION_FILE" || true
+  [ -n "$country" ] || return 0
+  case "$OUTBOUND" in
+    foxy)
+      COUNTRY="$country"
+      if [ "$CITY_SET" = 0 ] && [ -n "$city" ]; then CITY="$city"; fi ;;
+    veepn) REGION="$country" ;;
+    psiphon) PSIPHON_REGION="$country" ;;
+  esac
+  return 0
+}
+
+save_lane_location() {
+  local country="" city=""
+  case "$OUTBOUND" in
+    foxy) country="$COUNTRY"; city="$CITY" ;;
+    veepn) country="$(effective_region)" ;;
+    psiphon) country="$PSIPHON_REGION" ;;
+    *) return 0 ;;
+  esac
+  [ -n "$country" ] || return 0
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  (
+    umask 077
+    case "$OUTBOUND" in
+      veepn) printf '%s\n' "$(printf '%s' "$country" | tr '[:upper:]' '[:lower:]')" ;;
+      *) printf '%s %s\n' \
+           "$(printf '%s' "$country" | tr '[:lower:]' '[:upper:]')" \
+           "$(printf '%s' "$city" | tr '[:lower:]' '[:upper:]')" ;;
+    esac >"$LOCATION_FILE"
+  )
+}
+
+remembered_country() {
+  [ -f "$LOCATION_FILE" ] || return 0
+  local country _city
+  IFS=' ' read -r country _city < "$LOCATION_FILE" || true
+  printf '%s' "$country"
+}
+
+remembered_city() {
+  [ -f "$LOCATION_FILE" ] || return 0
+  local _country city
+  IFS=' ' read -r _country city < "$LOCATION_FILE" || true
+  printf '%s' "$city"
+}
+
+# --region wins, --country is the alias, and an empty answer means the plane picks.
+# The plane's own codes are lowercase region ids (`nl`, `us-va`) and its list ask
+# is case-sensitive, so what was typed is lowered rather than passed as typed.
+effective_region() {
+  local region="$REGION"
+  if [ -z "$region" ] && [ "$COUNTRY_SET" = 1 ]; then region="$COUNTRY"; fi
+  printf '%s' "$region" | tr '[:upper:]' '[:lower:]'
+}
+
+# The plane counts devices by the id the launch carries, so it is kept: a fresh
+# one per launch reads as a new device every time.
+stable_udid() {
+  [ -n "$VEEPN_UDID" ] && { printf '%s' "$VEEPN_UDID"; return 0; }
+  local file="$CONF_DIR/veepn.udid" value=""
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  if [ -f "$file" ]; then value="$(tr -d '[:space:]' < "$file" 2>/dev/null)"; fi
+  if [ -z "$value" ]; then
+    value="$(python3 -c 'import uuid; print(uuid.uuid4())')" || die "cannot mint a device id"
+    ( umask 077; printf '%s\n' "$value" > "$file" )
+  fi
+  printf '%s' "$value"
+}
+
+# The VeePN outbound: no account, no server, and only the fields that were asked for.
+veepn_outbound() {
+  local region udid
+  region="$(effective_region)"
+  udid="$(stable_udid)" || return 1
+  python3 - "$region" "$VEEPN_DOMAINS" "$udid" <<'PY'
+import json, sys
+
+region, domains, udid = sys.argv[1:4]
+settings = {}
+if region:
+    settings["region"] = region
+listed = [url.strip() for url in domains.split(",") if url.strip()]
+if listed:
+    settings["domains"] = listed
+if udid:
+    settings["udid"] = udid
+print(json.dumps({"protocol": "veepn", "settings": settings}))
+PY
+}
+
+# The Psiphon outbound: the native transport, its state, and only the fields
+# that were asked for; unsupported client fields are named as ignored by the lane.
+psiphon_outbound() {
+  local state="${PSIPHON_DIR:-${AETHER_PSIPHON_DIR:-$CONF_DIR/psiphon${INSTANCE:+-$INSTANCE}}}"
+  python3 - "$PSIPHON_BIN" "$state" "$PSIPHON_LISTEN" "$PSIPHON_HTTP" "$PSIPHON_REGION" \
+    "$PSIPHON_SHAPE" "$PSIPHON_READY" "$PSIPHON_BASE" "$PSIPHON_ENTRIES" "$UPSTREAM" \
+    "$PSIPHON_SPLIT" "$PSIPHON_SPLIT_REGIONS" "$PSIPHON_USER" "$PSIPHON_PASS" \
+    "$PSIPHON_POOL" "$PSIPHON_WORKERS" "$PSIPHON_AGGRESSIVE" "$PSIPHON_FEATURES" \
+    "$PSIPHON_LATENCY" "$PSIPHON_CDN_PROFILE" "$PSIPHON_GEOIP" "$PSIPHON_REJECT_CENSORED" \
+    "$PSIPHON_REJECT_COUNTRIES" "$PSIPHON_COMPARTMENT" "$PSIPHON_DISABLE_TIMEOUTS" \
+    "$PSIPHON_DNS_ALTERNATE" "$PSIPHON_DEVICE_LOCATION" "$PSIPHON_DEVICE_REGION" \
+    "$PSIPHON_NETWORK_ID" "$PSIPHON_ADDITIONAL_PARAMS" "$PSIPHON_ESTABLISH_TIMEOUT" \
+    "$PSIPHON_EMIT_BYTES" "$PSIPHON_CONDUIT_MODE" "$PSIPHON_CONDUIT_TIMEOUT" \
+    "$PSIPHON_SHARE" "$PSIPHON_SERVER_LISTS" "$PSIPHON_OSL" "$PSIPHON_ENTRY_KEY" \
+    "$PSIPHON_LIST_KEY" \
+    "$PSIPHON_EXCHANGE_KEY" "$PSIPHON_CDN_IPS" "$PSIPHON_CDN_SNI" "$PSIPHON_CDN_SETS" \
+    "$PSIPHON_UNSAFE_ALERTS" "$PSIPHON_LOCATION_PRECISION" "$PSIPHON_SHARE_PORT" \
+    "$PSIPHON_SHARE_HTTP" <<'PY'
+import json, sys
+
+(binary, state, listen, http, region, shape, ready, base, entries, upstream,
+ split, split_regions, user, password, pool, workers, aggressive, features,
+ latency, cdn_profile, geoip, reject_censored, reject_countries, compartment,
+ disable_timeouts, dns_alternate, device_location, device_region, network_id,
+ additional_params, establish_timeout, emit_bytes, conduit_mode, conduit_timeout,
+ share, server_lists, osl, entry_key, list_key, exchange_key, cdn_ips, cdn_sni,
+ cdn_sets, unsafe_alerts, location_precision, share_port, share_http) = sys.argv[1:]
+settings = {"dataRootDirectory": state}
+if binary:
+    settings["binary"] = binary
+if listen:
+    settings["listen"] = listen
+if http:
+    settings["httpListen"] = http
+if region:
+    settings["region"] = region
+if conduit_mode in ("private", "public"):
+    settings["protocolSelection"] = "conduit"
+if shape == "cdn":
+    settings["protocolSelection"] = "cdn_fronting"
+if shape == "auto":
+    settings["protocolSelection"] = "auto"
+if ready:
+    settings["readySeconds"] = int(ready)
+if base:
+    settings["baseConfig"] = base
+if entries:
+    settings["serverList"] = entries
+if upstream:
+    settings["upstreamProxy"] = upstream
+if split == "1":
+    settings["splitTunnelOwnRegion"] = True
+listed = [value.strip() for value in split_regions.split(",") if value.strip()]
+if listed:
+    settings["splitTunnelRegions"] = listed
+if user:
+    settings["localProxyUsername"] = user
+if password:
+    settings["localProxyPassword"] = password
+if pool.isdigit():
+    settings["tunnelPoolSize"] = int(pool)
+if workers.isdigit():
+    settings["ConnectionWorkerPoolSize"] = int(workers)
+if aggressive:
+    settings["aggressiveEstablishment"] = aggressive == "1"
+listed = [value.strip() for value in features.split(",") if value.strip()]
+if unsafe_alerts == "1" and "unsafe-traffic-alerts" not in listed:
+    listed.append("unsafe-traffic-alerts")
+if location_precision.isdigit() and int(location_precision) > 0 and "coarse-location" not in listed:
+    listed.append("coarse-location")
+if listed:
+    settings["ClientFeatures"] = listed
+if latency:
+    settings["NetworkLatencyMultiplier"] = float(latency)
+if cdn_profile:
+    settings["cdnProfile"] = cdn_profile
+for key, value in (
+    ("cdnIps", cdn_ips),
+    ("cdnSni", cdn_sni),
+    ("cdnSets", cdn_sets),
+):
+    listed = [item.strip() for item in value.split(",") if item.strip()]
+    if listed:
+        settings[key] = listed
+if share_port.isdigit():
+    settings["shareProxyOnNetworkSocksPort"] = int(share_port)
+if share_http.isdigit():
+    settings["shareProxyOnNetworkHttpPort"] = int(share_http)
+if geoip:
+    settings["GeoIPDatabasePath"] = geoip
+if reject_censored == "1":
+    settings["rejectCensoredProxies"] = True
+listed = [value.strip() for value in reject_countries.split(",") if value.strip()]
+if listed:
+    settings["rejectProxyCountries"] = listed
+if compartment:
+    settings["inproxyCompartment"] = compartment
+if disable_timeouts == "1":
+    settings["DisableTimeouts"] = True
+listed = [value.strip() for value in dns_alternate.split(",") if value.strip()]
+if listed:
+    settings["DNSResolverAlternateServers"] = listed
+if device_location:
+    settings["deviceLocation"] = device_location
+if device_region:
+    settings["deviceRegion"] = device_region
+if network_id:
+    settings["networkId"] = network_id
+if additional_params:
+    settings["additionalParameters"] = additional_params
+if establish_timeout.isdigit():
+    settings["EstablishTunnelTimeoutSeconds"] = int(establish_timeout)
+if emit_bytes == "1":
+    settings["emitBytesTransferred"] = True
+if conduit_mode:
+    settings["conduitMode"] = conduit_mode
+if conduit_timeout.isdigit():
+    settings["conduitTimeout"] = int(conduit_timeout)
+if share == "1":
+    settings["shareProxyOnNetwork"] = True
+for key, value in (
+    ("serverListURLs", server_lists),
+    ("ObfuscatedServerListRootURLs", osl),
+):
+    listed = [item.strip() for item in value.split(",") if item.strip()]
+    if listed:
+        settings[key] = listed
+if entry_key:
+    settings["ServerEntrySignaturePublicKey"] = entry_key
+if list_key:
+    settings["serverListSignaturePublicKey"] = list_key
+if exchange_key:
+    settings["ExchangeObfuscationKey"] = exchange_key
+print(json.dumps({"protocol": "psiphon", "settings": settings}))
+PY
+}
+
+# The lane UDP rides when it is not the foxy carrier: a second outbound in the
+# same config, so the routing rule `network: udp` sends datagrams there while
+# TCP stays on the first outbound.
+udp_outbound() {
+  case "$UDP_VIA" in
+    warp)
+      if [ "$WANT_WARP" = 1 ] && warp_hop_running; then
+        local port
+        port="$(cat "$WARP_PORT_FILE" 2>/dev/null || true)"
+        [ -n "$port" ] || return 1
+        python3 - "$port" <<'PY'
+import json, sys
+port = int(sys.argv[1])
+print(json.dumps({
+    "protocol": "socks",
+    "settings": {"servers": [{"address": "127.0.0.1", "port": port}]},
+}))
+PY
+      else
+        local identity
+        identity="$(resolve_real "$CONF_DIR/warp-identity.json")"
+        python3 - "$identity" <<'PY'
+import json, sys
+print(json.dumps({
+    "protocol": "warp",
+    "settings": {"identityFile": sys.argv[1], "register": True, "mode": "auto"},
+}))
+PY
+      fi ;;
+    psiphon|psiphon-cdn)
+      local state listen
+      state="$(resolve_real "${PSIPHON_DIR:-$CONF_DIR/psiphon-udp${INSTANCE:+-$INSTANCE}}")"
+      listen="${PSIPHON_LISTEN:-127.0.0.1:0}"
+      PSIPHON_DIR="$state" PSIPHON_LISTEN="$listen" psiphon_outbound ;;
+    direct) printf '%s' '{"protocol": "freedom"}' ;;
+    block) printf '%s' '{"protocol": "blackhole"}' ;;
+    *) return 1 ;;
+  esac
+}
+
+# A vless:// or vmess:// share link, or --vmess HOST:PORT, -> xray json.
+vless_outbound() { share_outbound vless "$VLESS" "" ""; }
+vmess_outbound() { share_outbound vmess "$VMESS" "$VMESS_ID" "$VMESS_NETWORK"; }
+
+share_outbound() {
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import base64, json, sys
+from urllib.parse import unquote
+
+def fail(message):
+    sys.exit(message)
+
+def text(value):
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return text(value[0]) if value else ""
+    return str(value)
+
+def flag(value):
+    return text(value).strip().lower() in ("1", "true", "yes", "on")
+
+def host_port(value, who):
+    raw = text(value).strip().split("/", 1)[0]
+    if raw.startswith("["):
+        end = raw.find("]")
+        if end < 0:
+            fail(f"{who} wants [host]:port")
+        host = raw[1:end]
+        rest = raw[end + 1:]
+        if not rest.startswith(":"):
+            fail(f"{who} wants [host]:port")
+        port = rest[1:]
+    else:
+        host, sep, port = raw.rpartition(":")
+        if not sep:
+            fail(f"{who} wants HOST:PORT")
+    if not host or not port.isdigit() or not 0 < int(port) < 65536:
+        fail(f"{who} wants HOST:PORT")
+    return host, int(port)
+
+def parse_uri(link, scheme):
+    if not link.lower().startswith(scheme + "://"):
+        fail(f"--{scheme} wants a {scheme}:// link")
+    body, _, name = link[len(scheme) + 3:].partition("#")
+    body, _, query = body.partition("?")
+    user, _, hostport = body.rpartition("@")
+    if not user or not hostport:
+        fail(f"a {scheme} link is {scheme}://{{uuid}}@{{host}}:{{port}}?{{query}}")
+    host, port = host_port(hostport, f"--{scheme}")
+    params = {}
+    for pair in query.split("&"):
+        if not pair:
+            continue
+        key, _, value = pair.partition("=")
+        key = unquote(key).lower()
+        if key not in params:
+            params[key] = unquote(value)
+    return unquote(user), host, port, params, network_of(params), params.get("headertype", "")
+
+def network_of(params):
+    kind = text(params.get("type")) or text(params.get("net")) or "tcp"
+    return kind.strip().lower()
+
+def decode_vmess(payload):
+    payload = unquote(payload).strip()
+    compact = "".join(payload.split())
+    for decode in (base64.urlsafe_b64decode, base64.b64decode):
+        for candidate in (compact, compact + "=" * (-len(compact) % 4)):
+            try:
+                data = json.loads(decode(candidate).decode("utf-8"))
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                return data
+    fail("--vmess could not decode the vmess:// payload as base64 JSON")
+
+def parse_vmess(link, uuid_arg, network_arg):
+    if link.lower().startswith("vmess://"):
+        head = link[len("vmess://"):].partition("#")[0]
+        if "@" in head.partition("?")[0]:
+            uuid, host, port, params, network, header = parse_uri(link, "vmess")
+            cipher = text(params.get("encryption")) or text(params.get("scy")) or "auto"
+            return uuid, host, port, params, network, header, cipher
+        data = decode_vmess(head)
+        for key in ("add", "port", "id"):
+            if not text(data.get(key)):
+                fail(f"a vmess link needs `{key}`")
+        host, port = host_port(f"{text(data.get('add'))}:{text(data.get('port'))}", "--vmess")
+        params = {key.lower(): (value if key.lower() == "extra" else text(value))
+                  for key, value in data.items()}
+        network = text(data.get("net")) or "tcp"
+        header = text(data.get("type"))
+        cipher = text(data.get("scy")) or "auto"
+        if not params.get("security") and text(data.get("tls")).lower() not in ("", "none"):
+            params["security"] = text(data.get("tls"))
+        return text(data.get("id")), host, port, params, network, header, cipher
+    host, port = host_port(link, "--vmess")
+    if not uuid_arg:
+        fail("--vmess needs --uuid ID as well, e.g. ferrox-cli up --vmess host:443 --uuid UUID")
+    return uuid_arg, host, port, {}, network_arg or "tcp", "", "auto"
+
+def value(params, *names):
+    for name in names:
+        found = text(params.get(name))
+        if found:
+            return found
+    return ""
+
+def alpn_list(text_value):
+    return [item.strip() for item in text_value.split(",") if item.strip()]
+
+def build_stream(params, address, network, header):
+    kind = network.strip().lower()
+    if kind in ("raw", ""):
+        kind = "tcp"
+    if kind == "websocket":
+        kind = "ws"
+    security = value(params, "security", "tls").strip().lower()
+    if security in ("", "none", "false", "off"):
+        security = "none"
+    if security == "xtls":
+        security = "tls"
+    if security == "reality" or value(params, "pbk"):
+        security = "reality"
+
+    host_header = value(params, "host")
+    path = value(params, "path") or "/"
+    stream = {"network": kind}
+
+    if kind == "tcp":
+        if header.strip().lower() == "http":
+            request = {"version": "1.1", "method": "GET", "path": [path]}
+            if host_header:
+                request["headers"] = {"Host": [host_header]}
+            stream["tcpSettings"] = {"header": {"type": "http", "request": request}}
+    elif kind == "ws":
+        settings = {"path": path}
+        if host_header:
+            settings["headers"] = {"Host": host_header}
+        if value(params, "ed").isdigit() and "ed=" not in path:
+            settings["path"] = f"{path}{'&' if '?' in path else '?'}ed={value(params, 'ed')}"
+            settings["maxEarlyData"] = int(value(params, "ed"))
+        if value(params, "eh"):
+            settings["earlyDataHeaderName"] = value(params, "eh")
+        stream["wsSettings"] = settings
+    elif kind == "grpc":
+        settings = {"serviceName": value(params, "servicename", "service", "path")}
+        if (value(params, "mode") or header).lower() == "multi":
+            settings["multiMode"] = True
+        if value(params, "authority") or host_header:
+            settings["authority"] = value(params, "authority") or host_header
+        stream["grpcSettings"] = settings
+    elif kind == "httpupgrade":
+        settings = {"path": path}
+        if host_header:
+            settings["host"] = host_header
+        stream["httpupgradeSettings"] = settings
+    elif kind in ("xhttp", "splithttp"):
+        settings = {"path": path}
+        if host_header:
+            settings["host"] = host_header
+        if value(params, "mode"):
+            settings["mode"] = value(params, "mode")
+        extra = params.get("extra")
+        if extra:
+            settings["extra"] = extra if isinstance(extra, dict) else text(extra)
+        stream["xhttpSettings"] = settings
+    elif kind in ("http", "h2", "h3"):
+        settings = {"path": path}
+        if host_header:
+            settings["host"] = [host_header]
+        stream["httpSettings"] = settings
+    elif kind in ("kcp", "mkcp"):
+        settings = {}
+        seed = value(params, "seed") or value(params, "path")
+        if seed:
+            settings["seed"] = seed
+        if header:
+            settings["header"] = {"type": header}
+        for source, target in (
+            ("mtu", "mtu"), ("tti", "tti"),
+            ("uplinkcapacity", "uplinkCapacity"),
+            ("downlinkcapacity", "downlinkCapacity"),
+            ("congestion", "congestion"),
+            ("readbuffersize", "readBufferSize"),
+            ("writebuffersize", "writeBufferSize"),
+        ):
+            raw = value(params, source)
+            if raw.isdigit():
+                settings[target] = int(raw)
+        stream["kcpSettings"] = settings
+    elif kind == "quic":
+        settings = {
+            "security": value(params, "quicsecurity") or host_header or "none",
+            "key": value(params, "key") or value(params, "path"),
+            "header": {"type": header or "none"},
+        }
+        stream["quicSettings"] = settings
+    else:
+        fail(f"`{kind}` needs --config: this converter writes tcp, ws, grpc, httpupgrade, xhttp, h2, kcp and quic")
+
+    if security == "tls":
+        settings = {"serverName": value(params, "sni", "peer") or address}
+        if any(flag(params.get(key)) for key in ("allowinsecure", "insecure")):
+            settings["allowInsecure"] = True
+        if value(params, "fp"):
+            settings["fingerprint"] = value(params, "fp")
+        if value(params, "alpn"):
+            settings["alpn"] = alpn_list(value(params, "alpn"))
+        if value(params, "cs"):
+            settings["cipherSuites"] = value(params, "cs")
+        if value(params, "cp"):
+            settings["curvePreferences"] = value(params, "cp")
+        if flag(params.get("esr")):
+            settings["enableSessionResumption"] = True
+        if value(params, "vcn"):
+            settings["verifyPeerCertByName"] = value(params, "vcn")
+        if value(params, "pcs"):
+            settings["pinnedPeerCertSha256"] = value(params, "pcs")
+        if value(params, "ech"):
+            settings["echConfigList"] = value(params, "ech")
+        stream["security"] = "tls"
+        stream["tlsSettings"] = settings
+    elif security == "reality":
+        if not value(params, "pbk"):
+            fail("a reality link without `pbk` names no server key")
+        settings = {"serverName": value(params, "sni", "peer") or address,
+                    "publicKey": value(params, "pbk")}
+        if value(params, "sid"):
+            settings["shortId"] = value(params, "sid")
+        if value(params, "fp"):
+            settings["fingerprint"] = value(params, "fp")
+        if value(params, "spx"):
+            settings["spiderX"] = value(params, "spx")
+        if value(params, "pqv"):
+            settings["mldsa65Verify"] = value(params, "pqv")
+        stream["security"] = "reality"
+        stream["realitySettings"] = settings
+    elif security == "none":
+        stream["security"] = "none"
+    else:
+        fail(f"security `{security}` needs --config")
+    return stream
+
+scheme, link, uuid_arg, network_arg = sys.argv[1:5]
+if scheme == "vless":
+    uuid, host, port, params, network, header = parse_uri(link, "vless")
+    cipher = ""
+else:
+    uuid, host, port, params, network, header, cipher = parse_vmess(link, uuid_arg, network_arg)
+stream = build_stream(params, host, network, header)
+if scheme == "vless":
+    user = {"id": uuid, "encryption": value(params, "encryption") or "none"}
+    if value(params, "flow") and value(params, "flow") != "none":
+        user["flow"] = value(params, "flow")
+else:
+    user = {"id": uuid, "security": cipher or "auto"}
+print(json.dumps({
+    "protocol": scheme if scheme == "vless" else "vmess",
+    "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]},
+    "streamSettings": stream,
+}))
+PY
+}
+
+trojan_outbound() {
+  python3 - "$TROJAN" "$PASSWORD" <<'PY'
+import json, sys
+hostport, password = sys.argv[1:3]
+host, _, port = hostport.rpartition(":")
+if not host or not port.isdigit():
+    sys.exit("--trojan wants HOST:PORT and --password PW")
+if not password:
+    sys.exit("--trojan needs --password PW as well, e.g. ferrox-cli up --trojan host:443 --password PW")
+print(json.dumps({
+    "protocol": "trojan",
+    "settings": {"servers": [{"address": host, "port": int(port), "password": password}]},
+}))
+PY
+}
+
+ss_outbound() {
+  python3 - "$SS" "$SS_METHOD" "$PASSWORD" <<'PY'
+import json, sys
+hostport, method, password = sys.argv[1:4]
+host, _, port = hostport.rpartition(":")
+if not host or not port.isdigit():
+    sys.exit("--ss wants HOST:PORT, --method and --password")
+if not password:
+    sys.exit("--ss needs --password PW as well, e.g. ferrox-cli up --ss host:8388 --password PW")
+print(json.dumps({
+    "protocol": "shadowsocks",
+    "settings": {"servers": [{"address": host, "port": int(port),
+                              "method": method, "password": password}]},
+}))
+PY
+}
+
+# ------------------------------------------------------------------- system proxy
+
+proxy_pac_line() { networksetup -getautoproxyurl "$1" 2>/dev/null; }
+proxy_auto_line() { networksetup -getproxyautodiscovery "$1" 2>/dev/null; }
+proxy_bypass_line() { networksetup -getproxybypassdomains "$1" 2>/dev/null; }
+
+proxy_bypass_join() {
+  printf '%s\n' "$1" | sed '/There aren.t any bypass domains/d; /^[[:space:]]*$/d' | paste -sd, -
+}
+
+system_proxy_preflight() {
+  local platform rc=0
+  platform="$(uname -s 2>/dev/null || true)"
+  case "$platform" in
+    Darwin) ;;
+    *) _system_proxy_preflight; return $? ;;
+  esac
+  proxy_lock || return 1
+  _system_proxy_preflight || rc=$?
+  proxy_unlock
+  return "$rc"
+}
+
+_system_proxy_preflight() {
+  local platform https="" all="" svc state
+  platform="$(uname -s 2>/dev/null || true)"
+  case "$platform" in
+    Darwin) ;;
+    *)
+      say "ferrox-cli: --vpn sets the macOS system proxy; on ${platform:-this platform} nothing was started." >&2
+      say "  point the app at the fronts instead: ferrox-cli ports" >&2
+      case ",$FRONTS," in *,http,*) https="http://127.0.0.1:$HTTP_PORT" ;; esac
+      case ",$FRONTS," in *,socks,*) all="socks5h://127.0.0.1:$SOCKS_PORT" ;; esac
+      case ",$FRONTS," in
+        *,mixed,*) https="http://127.0.0.1:$MIXED_PORT"; all="socks5h://127.0.0.1:$MIXED_PORT" ;;
+      esac
+      case "$platform" in
+        MINGW*|MSYS*|CYGWIN*|Windows*)
+          [ -n "$https" ] && say "  set HTTPS_PROXY=$https" >&2
+          [ -n "$all" ] && say "  set ALL_PROXY=$all" >&2
+          ;;
+        *)
+          local envs=""
+          [ -n "$https" ] && envs="HTTPS_PROXY=$https"
+          [ -n "$all" ] && envs="${envs:+$envs }ALL_PROXY=$all"
+          [ -n "$envs" ] && say "  export $envs" >&2
+          ;;
+      esac
+      return 1
+      ;;
+  esac
+  command -v networksetup >/dev/null 2>&1 || {
+    say "ferrox-cli: --vpn needs networksetup on PATH; nothing was started." >&2
+    return 1
+  }
+  command -v scutil >/dev/null 2>&1 || {
+    say "ferrox-cli: --vpn needs scutil on PATH to verify the proxy; nothing was started." >&2
+    return 1
+  }
+  svc="$(networksetup -listallnetworkservices 2>/dev/null | tail -n +2 | sed '/^\*/d' | head -n 1)"
+  [ -n "$svc" ] || {
+    say "ferrox-cli: --vpn found no network service to carry the proxy; nothing was started." >&2
+    return 1
+  }
+  state="$(proxy_auto_line "$svc" | sed -n 's/^Auto Proxy Discovery: //p' | head -n 1 | tr '[:upper:]' '[:lower:]')"
+  case "$state" in
+    on|yes) state=on ;;
+    off|no) state=off ;;
+    *)
+      say "ferrox-cli: --vpn cannot read the current auto discovery state; nothing was started." >&2
+      return 1
+      ;;
+  esac
+  if ! networksetup -setproxyautodiscovery "$svc" "$state" 2>/dev/null; then
+    say "ferrox-cli: --vpn needs administrator permission to change the system proxy; nothing was started." >&2
+    say "  run it with sudo, or point the app at the fronts: ferrox-cli ports" >&2
+    return 1
+  fi
+  return 0
+}
+
+proxy_readback_has() {
+  printf '%s\n' "$1" | grep -Eq "^[[:space:]]*$2[[:space:]]*:[[:space:]]*$3[[:space:]]*$"
+}
+
+proxy_readback_endpoint() {
+  printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2[[:space:]]*:[[:space:]]*//p" | head -n 1
+}
+
+proxy_service_armed() {
+  local svc="$1" socks="$2" http="$3" report
+  if [ -n "$socks" ]; then
+    report="$(networksetup -getsocksfirewallproxy "$svc" 2>/dev/null)" || return 1
+    [ "$(proxy_field "$report" Enabled | tr '[:upper:]' '[:lower:]')" = yes ] || return 1
+    [ "$(proxy_field "$report" Server)" = 127.0.0.1 ] || return 1
+    [ "$(proxy_field "$report" Port)" = "$socks" ] || return 1
+  fi
+  if [ -n "$http" ]; then
+    report="$(networksetup -getwebproxy "$svc" 2>/dev/null)" || return 1
+    [ "$(proxy_field "$report" Enabled | tr '[:upper:]' '[:lower:]')" = yes ] || return 1
+    [ "$(proxy_field "$report" Server)" = 127.0.0.1 ] || return 1
+    [ "$(proxy_field "$report" Port)" = "$http" ] || return 1
+    report="$(networksetup -getsecurewebproxy "$svc" 2>/dev/null)" || return 1
+    [ "$(proxy_field "$report" Enabled | tr '[:upper:]' '[:lower:]')" = yes ] || return 1
+    [ "$(proxy_field "$report" Server)" = 127.0.0.1 ] || return 1
+    [ "$(proxy_field "$report" Port)" = "$http" ] || return 1
+  fi
+  return 0
+}
+
+proxy_system_request() {
+  local endpoint="$1" url="$2"
+  env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy \
+    -u HTTPS_PROXY -u https_proxy -u NO_PROXY -u no_proxy \
+    ALL_PROXY="$endpoint" all_proxy="$endpoint" \
+    HTTP_PROXY="$endpoint" http_proxy="$endpoint" \
+    HTTPS_PROXY="$endpoint" https_proxy="$endpoint" NO_PROXY= no_proxy= \
+    curl -q -s --max-time "$PROBE_TIMEOUT" "$url" 2>/dev/null
+}
+
+proxy_system_probe() {
+  local readback="$1" socks="$2" http="$3" endpoint answer
+  if [ -n "$socks" ]; then
+    endpoint="socks5h://$(proxy_readback_endpoint "$readback" SOCKSProxy):$(proxy_readback_endpoint "$readback" SOCKSPort)"
+  else
+    endpoint="http://$(proxy_readback_endpoint "$readback" HTTPProxy):$(proxy_readback_endpoint "$readback" HTTPPort)"
+  fi
+  answer="$(proxy_system_request "$endpoint" https://www.cloudflare.com/cdn-cgi/trace)"
+  if printf '%s\n' "$answer" | grep -qE '^(ip|loc)='; then
+    return 0
+  fi
+  [ "$OUTBOUND" = veepn ] || return 1
+  answer="$(proxy_system_request "$endpoint" http://example.com/)"
+  printf '%s\n' "$answer" | grep -q 'Example Domain'
+}
+
+# Snapshot every field the arm can change, so down can put back exactly what was there.
+proxy_service_snapshot() {
+  local svc="$1" socks web secure pac auto bypass
+  local s_on s_server s_port s_auth w_on w_server w_port w_auth
+  local x_on x_server x_port x_auth p_on p_url a_on
+  socks="$(networksetup -getsocksfirewallproxy "$svc" 2>/dev/null)" || return 1
+  web="$(networksetup -getwebproxy "$svc" 2>/dev/null)" || return 1
+  secure="$(networksetup -getsecurewebproxy "$svc" 2>/dev/null)" || return 1
+  pac="$(proxy_pac_line "$svc")" || return 1
+  auto="$(proxy_auto_line "$svc")" || return 1
+  bypass="$(proxy_bypass_line "$svc")" || return 1
+  s_on="$(proxy_field "$socks" Enabled | tr '[:upper:]' '[:lower:]')"
+  [ "$s_on" = yes ] && s_on=on || s_on=off
+  s_server="$(proxy_field "$socks" Server)"
+  s_port="$(proxy_field "$socks" Port)"
+  s_auth="$(proxy_field "$socks" 'Authenticated Proxy Enabled')"
+  [ "$s_auth" = 1 ] && s_auth=on || s_auth=off
+  w_on="$(proxy_field "$web" Enabled | tr '[:upper:]' '[:lower:]')"
+  [ "$w_on" = yes ] && w_on=on || w_on=off
+  w_server="$(proxy_field "$web" Server)"
+  w_port="$(proxy_field "$web" Port)"
+  w_auth="$(proxy_field "$web" 'Authenticated Proxy Enabled')"
+  [ "$w_auth" = 1 ] && w_auth=on || w_auth=off
+  x_on="$(proxy_field "$secure" Enabled | tr '[:upper:]' '[:lower:]')"
+  [ "$x_on" = yes ] && x_on=on || x_on=off
+  x_server="$(proxy_field "$secure" Server)"
+  x_port="$(proxy_field "$secure" Port)"
+  x_auth="$(proxy_field "$secure" 'Authenticated Proxy Enabled')"
+  [ "$x_auth" = 1 ] && x_auth=on || x_auth=off
+  p_url="$(printf '%s\n' "$pac" | sed -n 's/^URL: //p' | head -n 1)"
+  case "$p_url" in "(null)"|"(empty)") p_url="" ;; esac
+  [ -n "$p_url" ] || p_url=-
+  p_on=off
+  case "$(printf '%s\n' "$pac" | sed -n 's/^Enabled: //p' | head -n 1 | tr '[:upper:]' '[:lower:]')" in yes|on) p_on=on ;; esac
+  a_on=off
+  case "$(printf '%s\n' "$auto" | sed -n 's/^Auto Proxy Discovery: //p' | head -n 1 | tr '[:upper:]' '[:lower:]')" in on|yes) a_on=on ;; esac
+  bypass="$(proxy_bypass_join "$bypass")"
+  [ -n "$bypass" ] || bypass=-
+  [ -n "$s_server" ] || s_server=-
+  [ -n "$s_port" ] || s_port=-
+  [ -n "$w_server" ] || w_server=-
+  [ -n "$w_port" ] || w_port=-
+  [ -n "$x_server" ] || x_server=-
+  [ -n "$x_port" ] || x_port=-
+  printf '0\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$svc" "$s_on" "$s_server" "$s_port" "$s_auth" \
+    "$w_on" "$w_server" "$w_port" "$w_auth" \
+    "$x_on" "$x_server" "$x_port" "$x_auth" \
+    "$p_on" "$p_url" "$a_on" "$bypass"
+}
+
+proxy_snapshot_write() {
+  local svc tmp
+  tmp="$(mktemp "$STATE_DIR/.system-proxy.state.XXXXXX")" || return 1
+  printf 'v1\n' > "$tmp" || { rm -f "$tmp"; return 1; }
+  while IFS= read -r svc; do
+    [ -z "$svc" ] && continue
+    case "$svc" in *\**) continue ;; esac
+    proxy_service_snapshot "$svc" >> "$tmp" || { rm -f "$tmp"; return 1; }
+  done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
+  mv "$tmp" "$PROXY_STATE" || { rm -f "$tmp"; return 1; }
+}
+
+proxy_mark_armed() {
+  local svc="$1" tmp
+  tmp="$(mktemp "$STATE_DIR/.system-proxy.state.XXXXXX")" || return 1
+  awk -F '\t' -v OFS='\t' -v svc="$svc" 'NR==1{print; next} $2==svc{$1="1"} {print}' "$PROXY_STATE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$PROXY_STATE" || { rm -f "$tmp"; return 1; }
+}
+
+# networksetup rejects an empty PAC URL, so a service that had none keeps it.
+proxy_pac_restore() {
+  local svc="$1" url="$2" on="$3"
+  if [ "$url" != - ] && [ -n "$url" ]; then
+    networksetup -setautoproxyurl "$svc" "$url" 2>/dev/null || return 1
+  fi
+  networksetup -setautoproxystate "$svc" "$on" 2>/dev/null || return 1
+}
+
+proxy_service_exists() {
+  networksetup -listallnetworkservices 2>/dev/null | tail -n +2 |
+    sed 's/^\*//; s/^[[:space:]]*//' | grep -Fxq "$1"
+}
+
+proxy_restore_one() {
+  local svc="$1" kind="$2" on="$3" server="$4" port="$5" auth="$6" set setstate
+  case "$kind" in
+    socks) set=-setsocksfirewallproxy; setstate=-setsocksfirewallproxystate ;;
+    web) set=-setwebproxy; setstate=-setwebproxystate ;;
+    secure) set=-setsecurewebproxy; setstate=-setsecurewebproxystate ;;
+  esac
+  if [ "$server" != - ] && [ "$port" != - ]; then
+    if [ "$auth" = on ]; then
+      networksetup "$set" "$svc" "$server" "$port" on 2>/dev/null || return 1
+    else
+      networksetup "$set" "$svc" "$server" "$port" 2>/dev/null || return 1
+    fi
+  fi
+  networksetup "$setstate" "$svc" "$on" 2>/dev/null || return 1
+}
+
+proxy_restore_service() {
+  local line="$1" armed svc s_on s_server s_port s_auth w_on w_server w_port w_auth
+  local x_on x_server x_port x_auth p_on p_url a_on bypass rc=0
+  IFS=$'\t' read -r armed svc s_on s_server s_port s_auth w_on w_server w_port w_auth \
+    x_on x_server x_port x_auth p_on p_url a_on bypass <<< "$line"
+  [ "$armed" = 1 ] || return 0
+  proxy_service_exists "$svc" || return 0
+  proxy_restore_one "$svc" socks "$s_on" "$s_server" "$s_port" "$s_auth" ||
+    { say "system proxy: could not restore SOCKS on '$svc'." >&2; rc=1; }
+  proxy_restore_one "$svc" web "$w_on" "$w_server" "$w_port" "$w_auth" ||
+    { say "system proxy: could not restore Web on '$svc'." >&2; rc=1; }
+  proxy_restore_one "$svc" secure "$x_on" "$x_server" "$x_port" "$x_auth" ||
+    { say "system proxy: could not restore Secure Web on '$svc'." >&2; rc=1; }
+  if [ "$bypass" = - ]; then
+    networksetup -setproxybypassdomains "$svc" Empty 2>/dev/null ||
+      { say "system proxy: could not clear the bypass list on '$svc'." >&2; rc=1; }
+  elif [ -n "$bypass" ]; then
+    local -a prior=()
+    IFS=, read -r -a prior <<< "$bypass"
+    networksetup -setproxybypassdomains "$svc" "${prior[@]}" 2>/dev/null ||
+      { say "system proxy: could not restore the bypass list on '$svc'." >&2; rc=1; }
+  fi
+  proxy_pac_restore "$svc" "$p_url" "$p_on" ||
+    { say "system proxy: could not restore the PAC state on '$svc'." >&2; rc=1; }
+  networksetup -setproxyautodiscovery "$svc" "$a_on" 2>/dev/null ||
+    { say "system proxy: could not restore auto discovery on '$svc'." >&2; rc=1; }
+  return "$rc"
+}
+
+proxy_restore_snapshot() {
+  local line armed=0 failed=0
+  while IFS= read -r line; do
+    case "$line" in v1|"") continue ;; esac
+    case "$line" in 1$'\t'*) armed=1 ;; esac
+    proxy_restore_service "$line" || failed=1
+  done < "$PROXY_STATE"
+  [ "$failed" = 0 ] || return 1
+  [ "$armed" = 1 ] && return 0
+  return 2
+}
+
+proxy_lock() {
+  local dir ready release old_int old_term old_hup
+  if [ "${PROXY_LOCK_DEPTH:-0}" -gt 0 ]; then
+    PROXY_LOCK_DEPTH=$((PROXY_LOCK_DEPTH + 1))
+    if [ "${PROXY_LOCK_ACQUIRING:-0}" = 1 ]; then
+      for _ in $(seq 1 300); do
+        [ -s "$PROXY_LOCK_READY" ] && break
+        kill -0 "$PROXY_LOCK_PID" 2>/dev/null || break
+        sleep 0.1
+      done
+      if [ ! -s "$PROXY_LOCK_READY" ]; then
+        PROXY_LOCK_DEPTH=$((PROXY_LOCK_DEPTH - 1))
+        return 1
+      fi
+    fi
+    return 0
+  fi
+  command -v python3 >/dev/null 2>&1 ||
+    { say "system proxy: python3 is needed to serialize proxy changes." >&2; return 1; }
+  dir="$(absolute_path "$STATE_DIR")/system-proxy.lock.d"
+  ( umask 077; mkdir -p "$dir" ) 2>/dev/null ||
+    { say "system proxy: cannot create $STATE_DIR." >&2; return 1; }
+  ready="$dir/ready.$$"
+  release="$dir/release.$$"
+  rm -f "$ready" "$release"
+  old_int="$(trap -p INT)"; old_term="$(trap -p TERM)"; old_hup="$(trap -p HUP)"
+  PROXY_LOCK_SIGNAL=""
+  trap 'PROXY_LOCK_SIGNAL=INT' INT
+  trap 'PROXY_LOCK_SIGNAL=TERM' TERM
+  trap 'PROXY_LOCK_SIGNAL=HUP' HUP
+  PROXY_LOCK_DEPTH=1
+  PROXY_LOCK_ACQUIRING=1
+  PROXY_LOCK_READY="$ready"
+  PROXY_LOCK_RELEASE="$release"
+  python3 -c '
+import os, signal, sys, time
+try:
+    import fcntl
+    def acquire(lock):
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+except ImportError:
+    import msvcrt
+    def acquire(lock):
+        while True:
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                return
+            except OSError:
+                time.sleep(0.1)
+lock = open(sys.argv[1], "a+b")
+if os.name == "nt":
+    lock.seek(0, os.SEEK_END)
+    if lock.tell() == 0:
+        lock.write(b"\0")
+        lock.flush()
+    lock.seek(0)
+def parent_alive(pid):
+    if os.name != "nt":
+        return os.getppid() == pid
+    import ctypes
+    handle = ctypes.windll.kernel32.OpenProcess(0x101000, False, pid)
+    if not handle:
+        return False
+    try:
+        return ctypes.windll.kernel32.WaitForSingleObject(handle, 0) == 0x102
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+    sig = getattr(signal, name, None)
+    if sig is not None:
+        signal.signal(sig, signal.SIG_IGN)
+parent = int(sys.argv[4])
+acquire(lock)
+if not parent_alive(parent):
+    sys.exit(0)
+with open(sys.argv[2], "w") as ready:
+    ready.write("locked\n")
+while parent_alive(parent) and not os.path.exists(sys.argv[3]):
+    time.sleep(0.1)
+ ' "$dir/lock" "$ready" "$release" "$$" &
+  PROXY_LOCK_PID=$!
+  if [ -n "$old_int" ]; then eval "$old_int"; else trap - INT; fi
+  if [ -n "$old_term" ]; then eval "$old_term"; else trap - TERM; fi
+  if [ -n "$old_hup" ]; then eval "$old_hup"; else trap - HUP; fi
+  if [ -n "$PROXY_LOCK_SIGNAL" ]; then
+    kill -s "$PROXY_LOCK_SIGNAL" "$$"
+    PROXY_LOCK_SIGNAL=""
+  fi
+  for _ in $(seq 1 300); do
+    [ -s "$ready" ] && break
+    kill -0 "$PROXY_LOCK_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [ ! -s "$ready" ]; then
+    : >"$release"
+    kill -KILL "$PROXY_LOCK_PID" 2>/dev/null || true
+    wait "$PROXY_LOCK_PID" 2>/dev/null || true
+    rm -f "$ready" "$release"
+    PROXY_LOCK_PID=""
+    PROXY_LOCK_DEPTH=0
+    PROXY_LOCK_ACQUIRING=0
+    say "system proxy: the lock owner did not start." >&2
+    return 1
+  fi
+  PROXY_LOCK_ACQUIRING=0
+  return 0
+}
+
+proxy_unlock() {
+  [ "${PROXY_LOCK_DEPTH:-0}" -gt 0 ] || return 0
+  PROXY_LOCK_DEPTH=$((PROXY_LOCK_DEPTH - 1))
+  if [ "$PROXY_LOCK_DEPTH" -eq 0 ] && [ -n "$PROXY_LOCK_PID" ]; then
+    : >"$PROXY_LOCK_RELEASE"
+    wait "$PROXY_LOCK_PID" 2>/dev/null || true
+    rm -f "$PROXY_LOCK_READY" "$PROXY_LOCK_RELEASE"
+    PROXY_LOCK_PID=""
+    PROXY_LOCK_READY=""
+    PROXY_LOCK_RELEASE=""
+  fi
+}
+
+system_proxy_on() {
+  local rc=0
+  proxy_lock || return 1
+  _system_proxy_on || rc=$?
+  proxy_unlock
+  return "$rc"
+}
+
+_system_proxy_on() {
+  command -v networksetup >/dev/null 2>&1 || { say "system proxy: no networksetup; nothing was armed." >&2; return 1; }
+  command -v scutil >/dev/null 2>&1 || { say "system proxy: no scutil to read the proxy back; nothing was armed." >&2; return 1; }
+  local owner_pidfile
+  if owner_pidfile="$(proxy_owner_pidfile)" && lane_running_at "$owner_pidfile" &&
+     [ "$(resolve_real "$owner_pidfile")" != "$(resolve_real "$PID_FILE")" ]; then
+    say "system proxy: owned by the lane at $owner_pidfile; nothing was armed." >&2
+    return 1
+  fi
+  mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
+  local any=0 svc want_socks="" want_http="" front bypass readback bad
+  for front in ${FRONTS//,/ }; do
+    case "$front" in
+      socks) want_socks="$SOCKS_PORT" ;;
+      http) want_http="$HTTP_PORT" ;;
+      mixed)
+        [ -n "$want_socks" ] || want_socks="$MIXED_PORT"
+        [ -n "$want_http" ] || want_http="$MIXED_PORT"
+        ;;
+    esac
+  done
+  [ -n "$want_socks$want_http" ] || { say "system proxy: --fronts names no socks, http or mixed front; nothing was armed." >&2; return 1; }
+  # Keep the first snapshot: a re-arm must still restore what the user had before any lane touched it.
+  if [ -f "$PROXY_STATE" ] && [ "$(head -n1 "$PROXY_STATE")" != v1 ]; then
+    system_proxy_off || return 1
+  fi
+  if [ ! -f "$PROXY_STATE" ]; then
+    [ -f "$PROXY_PORTS" ] && { system_proxy_off || return 1; }
+    if ! proxy_snapshot_write; then
+      say "system proxy: cannot read the current proxy settings; nothing was armed." >&2
+      rm -f "$PROXY_STATE"
+      return 1
+    fi
+  fi
+  while IFS= read -r svc; do
+    [ -z "$svc" ] && continue
+    case "$svc" in *\**) continue ;; esac
+    if ! proxy_mark_armed "$svc"; then
+      say "system proxy: cannot record the arm for '$svc'; nothing was armed." >&2
+      system_proxy_off
+      return 1
+    fi
+    if ! networksetup -setproxyautodiscovery "$svc" off 2>/dev/null; then
+      say "system proxy: cannot disable auto discovery on '$svc'; clearing." >&2
+      system_proxy_off
+      return 1
+    fi
+    if ! networksetup -setautoproxystate "$svc" off 2>/dev/null; then
+      say "system proxy: cannot disable PAC on '$svc'; clearing." >&2
+      system_proxy_off
+      return 1
+    fi
+    bypass="$(proxy_bypass_line "$svc")" || {
+      say "system proxy: cannot read the bypass list for '$svc'; nothing was armed." >&2
+      system_proxy_off
+      return 1
+    }
+    bypass="$(proxy_bypass_join "$bypass")"
+    local -a merged=(localhost 127.0.0.1 ::1 '*.local' 169.254.0.0/16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16)
+    local seen=" " entry
+    for entry in "${merged[@]}"; do seen="$seen$entry "; done
+    if [ -n "$bypass" ]; then
+      local -a prior=()
+      IFS=, read -r -a prior <<< "$bypass"
+      for entry in "${prior[@]}"; do
+        [ -z "$entry" ] && continue
+        case "$seen" in *" $entry "*) continue ;; esac
+        merged+=("$entry")
+        seen="$seen$entry "
+      done
+    fi
+    if ! networksetup -setproxybypassdomains "$svc" "${merged[@]}" 2>/dev/null; then
+      say "system proxy: cannot set the bypass list for '$svc'; nothing was armed." >&2
+      system_proxy_off
+      return 1
+    fi
+    if [ -n "$want_socks" ]; then
+      if ! networksetup -setsocksfirewallproxy "$svc" 127.0.0.1 "$want_socks" 2>/dev/null; then
+        say "system proxy: cannot set SOCKS on '$svc'; clearing." >&2
+        system_proxy_off
+        return 1
+      fi
+      if ! networksetup -setsocksfirewallproxystate "$svc" on 2>/dev/null; then
+        say "system proxy: cannot enable SOCKS on '$svc'; clearing." >&2
+        system_proxy_off
+        return 1
+      fi
+    fi
+    if [ -n "$want_http" ]; then
+      if ! networksetup -setwebproxy "$svc" 127.0.0.1 "$want_http" 2>/dev/null; then
+        say "system proxy: cannot set Web on '$svc'; clearing." >&2
+        system_proxy_off
+        return 1
+      fi
+      if ! networksetup -setwebproxystate "$svc" on 2>/dev/null; then
+        say "system proxy: cannot enable Web on '$svc'; clearing." >&2
+        system_proxy_off
+        return 1
+      fi
+      if ! networksetup -setsecurewebproxy "$svc" 127.0.0.1 "$want_http" 2>/dev/null; then
+        say "system proxy: cannot set Secure Web on '$svc'; clearing." >&2
+        system_proxy_off
+        return 1
+      fi
+      if ! networksetup -setsecurewebproxystate "$svc" on 2>/dev/null; then
+        say "system proxy: cannot enable Secure Web on '$svc'; clearing." >&2
+        system_proxy_off
+        return 1
+      fi
+    fi
+    if ! proxy_service_armed "$svc" "$want_socks" "$want_http"; then
+      say "system proxy: read-back for '$svc' did not show the armed host and port; clearing." >&2
+      system_proxy_off
+      return 1
+    fi
+    any=1
+  done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
+  [ "$any" = 1 ] || { system_proxy_off; say "no network service took the proxy" >&2; return 1; }
+  printf '%s %s\n' "${want_socks:--}" "${want_http:--}" > "$PROXY_PORTS"
+  printf '%s\n' "$(absolute_path "$PID_FILE")" > "$PROXY_OWNER"
+  readback="$(scutil --proxy 2>/dev/null)" || readback=""
+  bad=""
+  proxy_readback_has "$readback" ProxyAutoConfigEnable 0 || bad="PAC"
+  proxy_readback_has "$readback" ProxyAutoDiscoveryEnable 0 || bad="$bad auto discovery"
+  if [ -n "$want_socks" ]; then
+    proxy_readback_has "$readback" SOCKSEnable 1 || bad="$bad SOCKS"
+    { [ "$(proxy_readback_endpoint "$readback" SOCKSProxy)" = 127.0.0.1 ] &&
+      [ "$(proxy_readback_endpoint "$readback" SOCKSPort)" = "$want_socks" ]; } ||
+      bad="$bad SOCKS endpoint"
+  fi
+  if [ -n "$want_http" ]; then
+    proxy_readback_has "$readback" HTTPEnable 1 || bad="$bad HTTP"
+    proxy_readback_has "$readback" HTTPSEnable 1 || bad="$bad HTTPS"
+    { [ "$(proxy_readback_endpoint "$readback" HTTPProxy)" = 127.0.0.1 ] &&
+      [ "$(proxy_readback_endpoint "$readback" HTTPPort)" = "$want_http" ] &&
+      [ "$(proxy_readback_endpoint "$readback" HTTPSProxy)" = 127.0.0.1 ] &&
+      [ "$(proxy_readback_endpoint "$readback" HTTPSPort)" = "$want_http" ]; } ||
+      bad="$bad HTTP endpoint"
+  fi
+  if [ -n "$bad" ]; then
+    say "system proxy: the read-back did not show the armed state ($bad); clearing it." >&2
+    system_proxy_off
+    return 1
+  fi
+  if ! proxy_system_probe "$readback" "$want_socks" "$want_http"; then
+    say "system proxy: the armed proxy did not carry a trace; clearing it." >&2
+    system_proxy_off
+    return 1
+  fi
+  [ -n "$want_socks" ] && say "system proxy on: SOCKS 127.0.0.1:$want_socks"
+  [ -n "$want_http" ] && say "system proxy on: HTTP and HTTPS 127.0.0.1:$want_http"
+  say "scope: apps that honour the system proxy. There is no utun device, so"
+  say "apps that ignore it (and UDP) are not captured: ferrox-cli tun says why."
+}
+
+proxy_field() {
+  printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | head -n 1
+}
+
+# The loopback ports a lane of this config dir can own: its marker, the inbounds
+# of its served config, and the three defaults a lane with neither still uses.
+proxy_owned_ports() {
+  local ports=" " first="" second="" file from_config port from_lane=0
+  if [ -r "$PROXY_PORTS" ]; then
+    read -r first second < "$PROXY_PORTS" || true
+    for port in "$first" "$second"; do
+      [ -n "$port" ] && [ "$port" != "-" ] && ports="$ports$port "
+    done
+  fi
+  file="$CFG"
+  if [ -r "$file" ] && command -v python3 >/dev/null 2>&1; then
+    from_config="$(python3 - "$file" 2>/dev/null <<'PY'
+import json, sys
+try:
+    document = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+for inbound in document.get("inbounds", []):
+    if inbound.get("protocol") in ("socks", "http", "mixed"):
+        port = inbound.get("port")
+        if isinstance(port, int) and 0 < port < 65536:
+            print(port)
+PY
+)" || from_config=""
+    for port in $from_config; do ports="$ports$port "; from_lane=1; done
+  fi
+  [ "$from_lane" = 1 ] || ports="$ports$SOCKS_PORT $HTTP_PORT $MIXED_PORT "
+  printf '%s' "$ports"
+}
+
+system_proxy_off() {
+  local rc=0
+  proxy_lock || return 1
+  _system_proxy_off "${1:-0}" || rc=$?
+  proxy_unlock
+  return "$rc"
+}
+
+_system_proxy_off() {
+  local svc kind get set line enabled server port owned owner_pidfile failed=0 cleared=0 restored=0
+  local pac_on pac_url auto_on bypass force="${1:-0}"
+  owned="$(proxy_owned_ports)"
+  if [ "$force" != 1 ] && owner_pidfile="$(proxy_owner_pidfile)"; then
+    if lane_running_at "$owner_pidfile" &&
+       [ "$(resolve_real "$owner_pidfile")" != "$(resolve_real "$PID_FILE")" ]; then
+      say "system proxy: owned by the lane at $owner_pidfile; leaving it armed." >&2
+      return 0
+    fi
+  fi
+  if ! command -v networksetup >/dev/null 2>&1; then
+    rm -f "$PROXY_PORTS" "$PROXY_STATE" "$PROXY_OWNER"
+    return 0
+  fi
+  if [ -e "$PROXY_STATE" ] && [ ! -r "$PROXY_STATE" ]; then
+    say "system proxy: $PROXY_STATE is unreadable; probing the services." >&2
+  fi
+  if [ -r "$PROXY_STATE" ] && [ "$(head -n1 "$PROXY_STATE")" = v1 ]; then
+    proxy_restore_snapshot
+    case $? in
+      0)
+        say "system proxy cleared."
+        rm -f "$PROXY_PORTS" "$PROXY_STATE" "$PROXY_OWNER"
+        return 0 ;;
+      2)
+        say "system proxy: no ferrox endpoint was armed."
+        rm -f "$PROXY_PORTS" "$PROXY_STATE" "$PROXY_OWNER"
+        return 0 ;;
+      *)
+        say "system proxy: the restore failed; $PROXY_STATE is kept for a retry." >&2
+        return 1 ;;
+    esac
+  fi
+  if [ -r "$PROXY_STATE" ]; then
+    while IFS=$'\t' read -r svc pac_on pac_url auto_on bypass; do
+      [ -z "$svc" ] && continue
+      case "$svc" in *\**) continue ;; esac
+      proxy_service_exists "$svc" || continue
+      [ "$pac_url" = - ] && pac_url=""
+      if ! proxy_pac_restore "$svc" "${pac_url:--}" "$pac_on"; then
+        say "system proxy: could not restore the PAC state on '$svc'." >&2
+        failed=1
+      fi
+      if [ "$auto_on" = on ]; then
+        networksetup -setproxyautodiscovery "$svc" on 2>/dev/null ||
+          { say "system proxy: could not restore auto discovery on '$svc'." >&2; failed=1; }
+      else
+        networksetup -setproxyautodiscovery "$svc" off 2>/dev/null ||
+          { say "system proxy: could not clear auto discovery on '$svc'." >&2; failed=1; }
+      fi
+      if [ "$bypass" = - ]; then
+        networksetup -setproxybypassdomains "$svc" Empty 2>/dev/null ||
+          { say "system proxy: could not clear the bypass list on '$svc'." >&2; failed=1; }
+      elif [ -n "$bypass" ]; then
+        local -a prior=()
+        IFS=, read -r -a prior <<< "$bypass"
+        networksetup -setproxybypassdomains "$svc" "${prior[@]}" 2>/dev/null ||
+          { say "system proxy: could not restore the bypass list on '$svc'." >&2; failed=1; }
+      fi
+      restored=1
+    done < "$PROXY_STATE"
+  fi
+  while IFS= read -r svc; do
+    [ -z "$svc" ] && continue
+    case "$svc" in *\**) continue ;; esac
+    for kind in socks web secureweb; do
+      case "$kind" in
+        socks) get=-getsocksfirewallproxy; set=-setsocksfirewallproxystate ;;
+        web) get=-getwebproxy; set=-setwebproxystate ;;
+        secureweb) get=-getsecurewebproxy; set=-setsecurewebproxystate ;;
+      esac
+      line="$(networksetup "$get" "$svc" 2>/dev/null)" ||
+        { say "system proxy: could not read $kind on '$svc'." >&2; failed=1; continue; }
+      enabled="$(proxy_field "$line" Enabled | tr '[:upper:]' '[:lower:]')"
+      [ "$enabled" = yes ] || continue
+      server="$(proxy_field "$line" Server)"
+      port="$(proxy_field "$line" Port)"
+      case "$server" in 127.*|localhost|::1) ;; *) continue ;; esac
+      case "$owned" in *" $port "*) ;; *) continue ;; esac
+      if networksetup "$set" "$svc" off 2>/dev/null; then
+        cleared=1
+      else
+        say "system proxy: could not clear $kind on '$svc'." >&2
+        failed=1
+      fi
+    done
+  done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
+  if [ "$failed" = 1 ]; then
+    say "system proxy: the clear failed; $PROXY_PORTS is kept for a retry." >&2
+    return 1
+  fi
+  if [ "$cleared" = 1 ] || [ "$restored" = 1 ]; then
+    say "system proxy cleared."
+  else
+    say "system proxy: no ferrox endpoint was armed."
+  fi
+  rm -f "$PROXY_PORTS" "$PROXY_STATE" "$PROXY_OWNER"
+}
+
+stale_proxy_endpoint() {
+  command -v networksetup >/dev/null 2>&1 || return 1
+  local svc kind get line enabled server port owned
+  owned="$(proxy_owned_ports)"
+  while IFS= read -r svc; do
+    [ -z "$svc" ] && continue
+    case "$svc" in *\**) continue ;; esac
+    for kind in socks web secureweb; do
+      case "$kind" in
+        socks) get=-getsocksfirewallproxy ;;
+        web) get=-getwebproxy ;;
+        secureweb) get=-getsecurewebproxy ;;
+      esac
+      line="$(networksetup "$get" "$svc" 2>/dev/null)" || continue
+      enabled="$(proxy_field "$line" Enabled | tr '[:upper:]' '[:lower:]')"
+      [ "$enabled" = yes ] || continue
+      server="$(proxy_field "$line" Server)"
+      port="$(proxy_field "$line" Port)"
+      case "$server" in 127.*|localhost|::1) ;; *) continue ;; esac
+      case "$owned" in *" $port "*) ;; *) continue ;; esac
+      printf '%s %s:%s\n' "$kind" "$server" "$port"
+      return 0
+    done
+  done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
+  return 1
+}
+
+lane_pid_runs() {
+  local pid="$1" cfg="$2" command
+  command="$(ps -p "$pid" -ww -o command= 2>/dev/null)" || return 1
+  case "$command" in
+    *"${BIN##*/}"*"${cfg##*/}"*) return 0 ;;
+  esac
+  return 1
+}
+
+lane_running_at() {
+  local pidfile="$1" pid
+  [ -f "$pidfile" ] || return 1
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+proxy_owner_pidfile() {
+  local owner
+  owner="$(cat "$PROXY_OWNER" 2>/dev/null || true)"
+  [ -n "$owner" ] || return 1
+  [ -d "$owner" ] && owner="$owner/lane.pid"
+  printf '%s\n' "$owner"
+}
+
+reconcile_stale_proxy() {
+  lane_running && return 0
+  local owner_pidfile
+  if owner_pidfile="$(proxy_owner_pidfile)" && lane_running_at "$owner_pidfile"; then
+    return 0
+  fi
+  # A marker left by a lane that is not alive is a dead arm: restore it before
+  # anything else, whether or not the services still show the endpoint.
+  if [ -e "$PROXY_STATE" ] || [ -e "$PROXY_PORTS" ]; then
+    say "system proxy: no lane owns the armed endpoint; clearing it."
+    system_proxy_off
+    return
+  fi
+  stale_proxy_endpoint >/dev/null || return 0
+  say "system proxy: no lane owns the armed endpoint; clearing it."
+  system_proxy_off
+}
+
+# ---------------------------------------------------------------------- lane
+
+# Every lane owns its config, pid, log and remembered exit; the account and the
+# edge catalogue stay shared. The unnamed lane keeps the names it always had.
+apply_instance() {
+  local suffix=""
+  [ -n "$INSTANCE" ] && suffix="-$INSTANCE"
+  CFG="$CONF_DIR/lane$suffix.json"
+  PID_FILE="$CONF_DIR/lane$suffix.pid"
+  META_FILE="$CONF_DIR/lane$suffix.meta"
+  LOG="$CONF_DIR/lane$suffix.log"
+  WARP_CFG="$CONF_DIR/warp-hop$suffix.json"
+  WARP_PID_FILE="$CONF_DIR/warp-hop$suffix.pid"
+  WARP_LOG="$CONF_DIR/warp-hop$suffix.log"
+  WARP_PORT_FILE="$CONF_DIR/warp-hop$suffix.port"
+  PROXY_PORTS="$STATE_DIR/system-proxy$suffix.ports"
+  PROXY_STATE="$STATE_DIR/system-proxy$suffix.state"
+  SUPERVISOR_FILE="$STATE_DIR/system-proxy$suffix.supervisor"
+  SUPERVISOR_PID_FILE="$STATE_DIR/system-proxy$suffix.supervisor.pid"
+  local lane="${OUTBOUND:-foxy}"
+  LOCATION_FILE="$CONF_DIR/$lane-location$suffix"
+  LOCATIONS_FILE="$CONF_DIR/$lane-locations.jsonl"
+}
+
+lane_running() {
+  [ -f "$PID_FILE" ] || return 1
+  local pid; pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+lane_pid() { cat "$PID_FILE" 2>/dev/null || true; }
+
+# The supervisor outlives `up`: it owns the armed proxy until the lane it watched
+# exits, and a newer lane's pid file makes it stand down instead of clearing.
+supervise_clear() {
+  local watched="$1" current
+  current="$(lane_pid)"
+  if [ -z "$current" ] || [ "$current" = "$watched" ]; then
+    system_proxy_off >/dev/null 2>&1 || true
+    if [ "$(lane_pid)" = "$watched" ]; then rm -f "$PID_FILE"; fi
+  fi
+  if [ "$(cat "$SUPERVISOR_FILE" 2>/dev/null)" = "$$" ]; then
+    rm -f "$SUPERVISOR_FILE" "$SUPERVISOR_PID_FILE"
+  fi
+  return 0
+}
+
+supervise_terminate() {
+  local watched="$1" current
+  current="$(lane_pid)"
+  if [ -z "$current" ] || [ "$current" = "$watched" ]; then
+    kill "$watched" 2>/dev/null || true
+  fi
+  supervise_clear "$watched"
+}
+
+action_supervise() {
+  local watched="$SUPERVISE_PID"
+  [ -n "$watched" ] || exit 0
+  trap 'supervise_terminate "$watched"; exit 0' HUP INT TERM
+  printf '%s\n' "$$" > "$SUPERVISOR_FILE" 2>/dev/null || true
+  while kill -0 "$watched" 2>/dev/null; do sleep 1; done
+  supervise_clear "$watched"
+  exit 0
+}
+
+# Only a foxy lane has an allowance to report, and its own config says so without asking the plane.
+foxy_lane_configured() {
+  [ -f "$CFG" ] && grep -q '"protocol"[[:space:]]*:[[:space:]]*"foxy"' "$CFG" 2>/dev/null
+}
+
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && exec 3>&- ; }
+
+wait_fronts() {
+  local front port
+  for front in ${FRONTS//,/ }; do
+    case "$front" in
+      socks) port="$SOCKS_PORT" ;;
+      http) port="$HTTP_PORT" ;;
+      mixed) port="$MIXED_PORT" ;;
+      *) continue ;;
+    esac
+    for _ in $(seq 1 90); do
+      port_open "$port" && break
+      lane_running || return 1
+      sleep 1
+    done
+    port_open "$port" || return 1
+  done
+  return 0
+}
+
+port_map() {
+  local front
+  for front in ${FRONTS//,/ }; do
+    case "$front" in
+      socks) printf '  SOCKS5        socks5://127.0.0.1:%s   (curl --socks5-hostname, UDP-aware)\n' "$SOCKS_PORT" ;;
+      http)  printf '  HTTP + HTTPS  http://127.0.0.1:%s     (CONNECT tunnels, plain forwards)\n' "$HTTP_PORT" ;;
+      mixed) printf '  mixed         http://127.0.0.1:%s     (SOCKS5 and HTTP on one port)\n' "$MIXED_PORT" ;;
+    esac
+  done
+}
+
+# One converter, one sentence: a refusal says what is missing and prints no
+# second line restating it.
+build_outbound() {
+  local lane="$1" json
+  json="$("${lane}_outbound" 2>&1)" || die "$json"
+  printf '%s' "$json"
+}
+
+build_config() {
+  BUILT_UDP_OUTBOUND=""
+  BUILT_UDP_TAG=""
+  case "$OUTBOUND" in
+    foxy)
+      read_credentials
+      load_lane_location
+      # A session already signed in is the account: the credentials file only
+      # has to exist for the first sign-in, and a resume needs no password.
+      if [ -z "$EMAIL" ]; then EMAIL="$(stored_email)"; fi
+      if [ -z "$EMAIL" ] || { [ -z "$PASSWORD" ] && ! same_stored_account; }; then
+        [ -t 0 ] || die "no account: run 'ferrox-cli login' first, or pass --email and --password"
+        say "Foxy needs a Firefox account — an email and a password, no server to name."
+        LOGIN_QUIET=1 action_login
+        say "account saved to $CREDS (owner-only); connecting."
+        read_credentials
+      fi
+      # WARP first: the hop egresses the account plane and the carrier, so a
+      # region block on FxA or the catalogue sees a WARP exit. An explicit
+      # --upstream is the user's own hop and wins.
+      if [ "$WANT_WARP" = 1 ] && [ -z "$UPSTREAM" ]; then
+        require_bin
+        start_warp_hop || die "the warp hop did not start; nothing was chained."
+      fi
+      BUILT_OUTBOUND="$(build_outbound foxy)" || exit 1
+      save_lane_location
+      if [ -n "$UDP_VIA" ] && [ "$UDP_VIA" != foxy ]; then
+        BUILT_UDP_OUTBOUND="$(udp_outbound 2>&1)" || die "$BUILT_UDP_OUTBOUND"
+        BUILT_UDP_TAG="udp-$UDP_VIA"
+        case "$UDP_VIA" in
+          warp) say "udp: WARP is a second lane in this config; TCP stays on foxy." ;;
+          psiphon|psiphon-cdn) say "udp: Psiphon's udpgw is a second lane in this config; TCP stays on foxy." ;;
+          direct) say "udp: direct egress (unencrypted) for datagrams; TCP stays on foxy." ;;
+          block) say "udp: dropped at the lane; TCP stays on foxy." ;;
+        esac
+      fi
+      ;;
+    vless)
+      case "$VLESS" in
+        vless://*) ;;
+        *) die "--vless wants a vless:// share link, got '$VLESS'; nothing was started.
+  example: ferrox-cli up --vless 'vless://uuid@host:443?type=ws&security=tls&sni=host&path=/ws'" ;;
+      esac
+      BUILT_OUTBOUND="$(build_outbound vless)" || exit 1
+      ;;
+    veepn)
+      load_lane_location
+      BUILT_OUTBOUND="$(build_outbound veepn)" || exit 1
+      save_lane_location
+      ;;
+    psiphon)
+      load_lane_location
+      BUILT_OUTBOUND="$(build_outbound psiphon)" || exit 1
+      save_lane_location
+      ;;
+    vmess)
+      case "$VMESS" in
+        vmess://*) ;;
+        *:*)
+          [ -n "$VMESS_ID" ] || die "--vmess wants a vmess:// share link, or HOST:PORT with --uuid ID; nothing was started."
+          ;;
+        *) die "--vmess wants a vmess:// share link, or HOST:PORT with --uuid ID, got '$VMESS'; nothing was started.
+  example: ferrox-cli up --vmess 'vmess://base64-json'
+  or: ferrox-cli up --vmess host:443 --uuid UUID" ;;
+      esac
+      BUILT_OUTBOUND="$(build_outbound vmess)" || exit 1
+      ;;
+    trojan) BUILT_OUTBOUND="$(build_outbound trojan)" || exit 1 ;;
+    ss) BUILT_OUTBOUND="$(build_outbound ss)" || exit 1 ;;
+    config)
+      [ -f "$CONFIG_FILE" ] || die "no such config: $CONFIG_FILE"
+      CFG="$CONFIG_FILE"
+      return 0
+      ;;
+    *)
+      cat >&2 <<EOF
+ferrox-cli: no outbound chosen; nothing was started.
+  --foxy                 account only, no server to name (asks once)
+  --veepn                anonymous: no account and no server
+  --psiphon              native OSSH/SSH, no client binary
+  --vless 'vless://...'  a share link
+  --vmess 'vmess://...'  a share link, or HOST:PORT with --uuid ID
+  --trojan HOST:PORT --password PW
+  --ss HOST:PORT --method METHOD --password PW
+  --config FILE          any JSON config this binary serves
+Run 'ferrox-cli up --foxy --vpn' for the shortest path, or --help for the menu.
+EOF
+      exit 2
+      ;;
+  esac
+}
+
+# The carrier is a choice, not a default: h2 is the rung auto opens on and h3 is
+# the only one that carries UDP. Asked once on a terminal, never of a pipe, and
+# an empty answer or an unreadable one takes auto rather than stopping the lane.
+choose_carrier() {
+  if [ "$OUTBOUND" != foxy ] || [ "$CARRIER_SET" = 1 ] || [ ! -t 0 ]; then
+    return 0
+  fi
+  say "carrier: where the lane sends its flows (name --carrier to skip this):"
+  say "  1) auto  h2, then h1, then h3 — the fastest that answers (default)"
+  say "  2) h2    HTTPS/2 on a session reused across flows"
+  say "  3) h1    one TLS connection per flow"
+  say "  4) h3    QUIC; also carries UDP. Falls back to h2, then h1"
+  printf 'carrier [auto]: '
+  local answer=""
+  IFS= read -r answer || true
+  case "$(printf '%s' "$answer" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" in
+    ""|1|auto) CARRIER=auto ;;
+    2|h2) CARRIER=h2 ;;
+    3|h1) CARRIER=h1 ;;
+    4|h3) CARRIER=h3 ;;
+    *) say "carrier: '$answer' is not one of the four; using auto."; CARRIER=auto ;;
+  esac
+}
+
+start_lane() {
+  local new_cfg new_fronts old_exit lane_pid reg_dir status=0 start_epoch final_cfg warp_port
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
+  start_epoch="$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)"
+  LOGIN_GUARD_SET=1; LOGIN_GUARD_EPOCH="$start_epoch"
+  WARP_SELECTED=0
+  final_cfg="$CFG"; CFG_STAGE=""
+  # Validate first: an invocation that cannot start must not stop a healthy lane,
+  # and a bad link must not send the user to a build before saying what is wrong.
+  old_exit="$(trap -p EXIT)"
+  trap 'status=$?; [ "$WARP_STARTED" = 1 ] && stop_owned_warp; exit $status' EXIT
+  build_config
+  require_bin
+  if [ -n "$old_exit" ]; then eval "$old_exit"; else trap - EXIT; fi
+  proxy_lock || {
+    [ -n "$CFG_STAGE" ] && rm -f "$CFG_STAGE"
+    [ "$OUTBOUND" = config ] || CFG="$final_cfg"
+    return 1
+  }
+  if [ "$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)" != "$start_epoch" ]; then
+    [ "$WARP_STARTED" = 1 ] && stop_owned_warp
+    [ "$OUTBOUND" = config ] || CFG="$final_cfg"
+    proxy_unlock
+    say "a concurrent down or logout cancelled this start; try again." >&2
+    return 1
+  fi
+  if [ "$WARP_SELECTED" = 1 ]; then
+    warp_port="$(cat "$WARP_PORT_FILE" 2>/dev/null || true)"
+    if ! warp_hop_running || [ "$UPSTREAM" != "socks5://127.0.0.1:$warp_port" ]; then
+      [ "$OUTBOUND" = config ] || CFG="$final_cfg"
+      proxy_unlock
+      say "the warp hop was stopped by a concurrent down; try again." >&2
+      return 1
+    fi
+  fi
+  save_lane_location
+  reg_dir="$(resolve_real "$CONF_DIR")"
+  if ! { touch "$LANES_FILE" &&
+         { grep -Fxq "$reg_dir" "$LANES_FILE" || printf '%s\n' "$reg_dir" >> "$LANES_FILE"; }; }; then
+    proxy_unlock
+    say "lane: cannot record $reg_dir in $LANES_FILE." >&2
+    return 1
+  fi
+  if [ "$OUTBOUND" != config ]; then
+    CFG_STAGE="$(dirname "$final_cfg")/.$(basename "$final_cfg").stage.$$"
+    rm -f "$CFG_STAGE"
+    CFG="$CFG_STAGE"
+    if ! write_config "$BUILT_OUTBOUND" "$BUILT_UDP_OUTBOUND" "$BUILT_UDP_TAG"; then
+      rm -f "$CFG_STAGE"; CFG_STAGE=""
+      CFG="$final_cfg"
+      proxy_unlock
+      say "cannot write $final_cfg" >&2
+      return 1
+    fi
+    CFG="$final_cfg"
+  fi
+  # stop_lane reads the old meta to name the process it must kill, so keep the
+  # new lane's settings aside until that process is gone.
+  new_cfg="$CFG"; new_fronts="$FRONTS"
+  if lane_running; then
+    say "a lane${INSTANCE:+ '$INSTANCE'} is already running (pid $(lane_pid)); stopping it first."
+    stop_lane 0
+  fi
+  CFG="$new_cfg"; FRONTS="$new_fronts"
+  if ! write_lane_meta; then
+    [ -n "$CFG_STAGE" ] && rm -f "$CFG_STAGE"
+    proxy_unlock
+    return 1
+  fi
+  if [ "$OUTBOUND" != config ]; then
+    if ! mv -f "$CFG_STAGE" "$final_cfg"; then
+      rm -f "$CFG_STAGE"; CFG_STAGE=""
+      proxy_unlock
+      say "cannot publish $final_cfg" >&2
+      return 1
+    fi
+    CFG_STAGE=""
+  fi
+  if [ "$DEBUG" = 1 ]; then
+    FOXY_DEBUG=1 "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
+  else
+    "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
+  fi
+  lane_pid=$!
+  if ! echo "$lane_pid" > "$PID_FILE"; then
+    kill "$lane_pid" 2>/dev/null || true
+    wait "$lane_pid" 2>/dev/null || true
+    proxy_unlock
+    return 1
+  fi
+  proxy_unlock
+}
+
+supervise_lane() {
+  local pid; pid="$(lane_pid)"
+  [ -n "$pid" ] || return 0
+  local -a sup=("${BASH:-/bin/bash}" "$SELF" __supervise "$pid")
+  [ -n "$INSTANCE" ] && sup+=(--instance "$INSTANCE")
+  "${sup[@]}" </dev/null >/dev/null 2>&1 &
+  printf '%s\n' "$!" > "$SUPERVISOR_PID_FILE" 2>/dev/null || true
+}
+
+stop_lane() {
+  local clear="${1:-1}" supervisor waited=0 pid
+  load_lane_meta || true
+  if lane_running; then
+    pid="$(lane_pid)"
+    if lane_pid_runs "$pid" "$CFG"; then
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      lane_running && lane_pid_runs "$pid" "$CFG" && kill -9 "$pid" 2>/dev/null || true
+    fi
+  fi
+  if [ "$clear" = 1 ]; then
+    supervisor="$(cat "$SUPERVISOR_PID_FILE" 2>/dev/null || true)"
+    [ -n "$supervisor" ] || supervisor="$(cat "$SUPERVISOR_FILE" 2>/dev/null || true)"
+    if [ -n "$supervisor" ]; then
+      while kill -0 "$supervisor" 2>/dev/null && [ "$waited" -lt 100 ]; do
+        sleep 0.05
+        waited=$((waited + 1))
+      done
+      rm -f "$SUPERVISOR_FILE" "$SUPERVISOR_PID_FILE"
+    fi
+  fi
+  rm -f "$PID_FILE"
+  local rc=0
+  if [ "$clear" = 1 ]; then
+    stop_warp_hop
+    system_proxy_off || rc=$?
+  fi
+  return "$rc"
+}
+
+# The config is ours only when we generated it: a --config file belongs to its owner.
+stop_and_forget() {
+  stop_lane 1
+  [ "$OUTBOUND" = config ] || rm -f "$CFG"
+}
+
+# A WARP hop is a lane of its own: a loopback socks front over a warp outbound
+# that registers once and keeps the identity, so the foxy plane egresses through
+# WARP and a region block sees a WARP exit instead of this machine.
+warp_hop_running() {
+  local pid port
+  pid="$(cat "$WARP_PID_FILE" 2>/dev/null || true)"
+  port="$(cat "$WARP_PORT_FILE" 2>/dev/null || true)"
+  [ -n "$pid" ] && [ -n "$port" ] && kill -0 "$pid" 2>/dev/null &&
+    lane_pid_runs "$pid" "$WARP_CFG" && port_open "$port"
+}
+
+start_warp_hop() {
+  WARP_STARTED=0
+  WARP_SELECTED=0
+  WARP_OWN_PID=""
+  if warp_hop_running; then
+    UPSTREAM="socks5://127.0.0.1:$(cat "$WARP_PORT_FILE")"
+    WARP_SELECTED=1
+    say "warp hop already up (pid $(cat "$WARP_PID_FILE")); the lane chains through it."
+    return 0
+  fi
+  stop_warp_hop
+  local port pid
+  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')" || return 1
+  [ -n "$port" ] || return 1
+  ( umask 077
+    python3 - "$WARP_CFG" "$port" "$CONF_DIR/warp-identity.json" <<'PY'
+import json, os, sys
+cfg, port, identity = sys.argv[1:4]
+doc = {
+    "inbounds": [{"protocol": "socks", "listen": "127.0.0.1", "port": int(port)}],
+    "outbounds": [{"protocol": "warp", "settings": {
+        "identityFile": identity, "register": True, "mode": "auto"}}],
+}
+fd = os.open(cfg, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.chmod(cfg, 0o600)
+with os.fdopen(fd, "w") as handle:
+    json.dump(doc, handle, indent=2)
+PY
+  ) || return 1
+  chmod 600 "$WARP_CFG"
+  say "warp hop: registering once and racing WireGuard against MASQUE..."
+  "$BIN" run -c "$WARP_CFG" >"$WARP_LOG" 2>&1 &
+  pid=$!
+  WARP_STARTED=1
+  WARP_OWN_PID="$pid"
+  echo "$pid" > "$WARP_PID_FILE"
+  echo "$port" > "$WARP_PORT_FILE"
+  for _ in $(seq 1 120); do
+    port_open "$port" && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  if ! port_open "$port"; then
+    say "the warp hop did not open; last lines of $WARP_LOG:"
+    tail -n 20 "$WARP_LOG" 2>/dev/null || true
+    stop_owned_warp
+    return 1
+  fi
+  UPSTREAM="socks5://127.0.0.1:$port"
+  WARP_SELECTED=1
+  say "warp hop up (pid $pid) on 127.0.0.1:$port; the account plane and the carrier egress through it."
+}
+
+stop_warp_hop() {
+  local pid
+  pid="$(cat "$WARP_PID_FILE" 2>/dev/null || true)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && lane_pid_runs "$pid" "$WARP_CFG"; then
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$WARP_PID_FILE" "$WARP_PORT_FILE" "$WARP_CFG"
+}
+
+stop_owned_warp() {
+  local pid="${WARP_OWN_PID:-}"
+  [ -n "$pid" ] || return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  fi
+  if [ "$(cat "$WARP_PID_FILE" 2>/dev/null || true)" = "$pid" ]; then
+    rm -f "$WARP_PID_FILE" "$WARP_PORT_FILE" "$WARP_CFG"
+  fi
+  WARP_OWN_PID=""; WARP_STARTED=0
+}
+
+forget_lane_config() {
+  [ "${GENERATED:-0}" = 1 ] && rm -f "$CFG"
+  rm -f "$META_FILE"
+}
+
+bump_stop_epoch() {
+  local n
+  n="$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || echo 0)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s\n' "$((n + 1))" >"$STATE_DIR/stop-epoch"
+}
+
+# The account is shared, so signing out ends every lane; each owns its pid and config.
+# The registry makes a lane armed under a moved FERROX_CONF_DIR visible here.
+stop_all_lanes() {
+  local saved_conf="$CONF_DIR" saved_instance="$INSTANCE" dir pidfile base rc=0
+  local -a forget=()
+  local pending="$STATE_DIR/logout.pending" pending_tmp
+  proxy_lock || return 1
+  if ! bump_stop_epoch; then
+    proxy_unlock
+    say "cannot record the stop generation; nothing was stopped." >&2
+    return 1
+  fi
+  if [ -r "$pending" ]; then
+    while IFS= read -r dir; do
+      [ -n "$dir" ] && forget+=("$(resolve_real "$dir")")
+    done <"$pending"
+  fi
+  if [ -r "$LANES_FILE" ]; then
+    while IFS= read -r dir; do
+      [ -n "$dir" ] || continue
+      CONF_DIR="$(resolve_real "$dir")"
+      for pidfile in "$CONF_DIR"/lane*.pid; do
+        [ -f "$pidfile" ] || continue
+        base="${pidfile##*/}"; base="${base#lane}"; base="${base%.pid}"
+        INSTANCE="${base#-}"
+        apply_instance
+        GENERATED=0
+        load_lane_meta || true
+        [ "$GENERATED" = 1 ] && forget+=("$CFG")
+        forget+=("$META_FILE")
+      done
+      for pidfile in "$CONF_DIR"/lane.meta "$CONF_DIR"/lane-*.meta; do
+        [ -f "$pidfile" ] || continue
+        base="${pidfile##*/}"; base="${base#lane}"; base="${base%.meta}"
+        INSTANCE="${base#-}"
+        apply_instance
+        GENERATED=0
+        load_lane_meta || true
+        [ "$GENERATED" = 1 ] && forget+=("$CFG")
+        forget+=("$META_FILE")
+      done
+      for staged in "$CONF_DIR"/.lane*.json.stage.*; do
+        [ -e "$staged" ] && forget+=("$staged")
+      done
+    done < "$LANES_FILE"
+  fi
+  CONF_DIR="$(resolve_real "$saved_conf")"
+  for pidfile in "$CONF_DIR"/lane*.pid; do
+    [ -f "$pidfile" ] || continue
+    base="${pidfile##*/}"; base="${base#lane}"; base="${base%.pid}"
+    INSTANCE="${base#-}"
+    apply_instance
+    GENERATED=0
+    load_lane_meta || true
+    [ "$GENERATED" = 1 ] && forget+=("$CFG")
+    forget+=("$META_FILE")
+  done
+  for pidfile in "$CONF_DIR"/lane.meta "$CONF_DIR"/lane-*.meta; do
+    [ -f "$pidfile" ] || continue
+    base="${pidfile##*/}"; base="${base#lane}"; base="${base%.meta}"
+    INSTANCE="${base#-}"
+    apply_instance
+    GENERATED=0
+    load_lane_meta || true
+    [ "$GENERATED" = 1 ] && forget+=("$CFG")
+    forget+=("$META_FILE")
+  done
+  for staged in "$CONF_DIR"/.lane*.json.stage.*; do
+    [ -e "$staged" ] && forget+=("$staged")
+  done
+  if [ "${#forget[@]}" -gt 0 ]; then
+    pending_tmp="$pending.$$"
+    if ! { printf '%s\n' "${forget[@]}" >"$pending_tmp" && mv -f "$pending_tmp" "$pending"; }; then
+      rm -f "$pending_tmp"
+      proxy_unlock
+      say "cannot record the configs to remove; nothing was stopped." >&2
+      return 1
+    fi
+  fi
+  if [ -r "$LANES_FILE" ]; then
+    while IFS= read -r dir; do
+      [ -n "$dir" ] || continue
+      CONF_DIR="$(resolve_real "$dir")"
+      INSTANCE=""
+      apply_instance
+      for pidfile in "$CONF_DIR"/lane*.pid; do
+        [ -f "$pidfile" ] || continue
+        base="${pidfile##*/}"; base="${base#lane}"; base="${base%.pid}"
+        INSTANCE="${base#-}"
+        apply_instance
+        stop_lane 0 || rc=1
+      done
+      for pidfile in "$CONF_DIR"/warp-hop*.pid; do
+        [ -f "$pidfile" ] || continue
+        base="${pidfile##*/}"; base="${base#warp-hop}"; base="${base%.pid}"
+        INSTANCE="${base#-}"
+        apply_instance
+        stop_warp_hop
+      done
+    done < "$LANES_FILE"
+  fi
+  CONF_DIR="$(resolve_real "$saved_conf")"
+  INSTANCE=""
+  apply_instance
+  for pidfile in "$CONF_DIR"/lane*.pid; do
+    [ -f "$pidfile" ] || continue
+    base="${pidfile##*/}"; base="${base#lane}"; base="${base%.pid}"
+    INSTANCE="${base#-}"
+    apply_instance
+    stop_lane 0 || rc=1
+  done
+  for pidfile in "$CONF_DIR"/warp-hop*.pid; do
+    [ -f "$pidfile" ] || continue
+    base="${pidfile##*/}"; base="${base#warp-hop}"; base="${base%.pid}"
+    INSTANCE="${base#-}"
+    apply_instance
+    stop_warp_hop
+  done
+  INSTANCE=""
+  apply_instance
+  system_proxy_off 1 || rc=1
+  if [ "$rc" -eq 0 ]; then
+    if [ "${#forget[@]}" -gt 0 ] && ! rm -f "${forget[@]}"; then
+      rc=1
+    fi
+    if [ "$rc" -eq 0 ]; then
+      rm -f "$pending"
+    fi
+  fi
+  bump_stop_epoch || rc=1
+  proxy_unlock
+  CONF_DIR="$saved_conf"
+  INSTANCE="$saved_instance"
+  apply_instance
+  return "$rc"
+}
+
+other_lanes() {
+  local pidfile base pid
+  for pidfile in "$CONF_DIR"/lane-*.pid; do
+    [ -f "$pidfile" ] || continue
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || continue
+    base="${pidfile##*/}"; base="${base#lane-}"; base="${base%.pid}"
+    printf '  %s (pid %s)\n' "$base" "$pid"
+  done
+}
+
+# -------------------------------------------------------------------- actions
+
+# One trace through the first front: a lane that listens but cannot dial is not
+# connected, and saying so here is cheaper than a browser that times out.
+probe_front() {
+  local front="$1" port="$2" wait="${3:-$PROBE_TIMEOUT}"
+  if [ "$front" = socks ]; then
+    curl -s --noproxy '' --max-time "$wait" --socks5-hostname "127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null
+  else
+    curl -s --noproxy '' --max-time "$wait" -x "http://127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null
+  fi
+}
+
+# A VeePN edge is a free pool with its own blocklist, so a refused trace host is
+# not proof about the lane: a plain 200 is what says the flow got through.
+probe_plain() {
+  local front="$1" port="$2" wait="${3:-$PROBE_TIMEOUT}"
+  if [ "$front" = socks ]; then
+    curl -s --noproxy '' --max-time "$wait" --socks5-hostname "127.0.0.1:$port" http://example.com/ 2>/dev/null
+  else
+    curl -s --noproxy '' --max-time "$wait" -x "http://127.0.0.1:$port" http://example.com/ 2>/dev/null
+  fi
+}
+
+# Why a lane that listens still carries nothing: read the lane's own words, and
+# if it said nothing, ask it again with the dial trace on.
+diagnose() {
+  local quiet=0
+  if ! grep -q . "$LOG" 2>/dev/null; then quiet=1; fi
+  if [ "$quiet" = 1 ] && [ "$DEBUG" = 0 ]; then
+    say "the lane log is empty: it refuses a flow without saying why. Re-running"
+    say "it once with the dial trace on to get the reason."
+    DEBUG=1
+    start_lane >/dev/null 2>&1
+    wait_fronts >/dev/null 2>&1
+    probe_front "${FRONTS%%,*}" "$(front_port_of "${FRONTS%%,*}")" >/dev/null 2>&1
+  fi
+  if grep -q . "$LOG" 2>/dev/null; then
+    say "the lane's own words, last lines of $LOG:"
+    tail -n 8 "$LOG"
+  else
+    say "the lane log stayed empty even with the trace on: nothing was dialled,"
+    say "so the front refused the request before any carrier was tried."
+    return 0
+  fi
+  # The Psiphon lane owns its transport: its refusals are about the signed list,
+  # a server entry, or the SSH dial, and its own lines already name which.
+  if [ "$OUTBOUND" = psiphon ]; then
+    if grep -qE "signature|key digest|server list key|server list .*HTTP" "$LOG"; then
+      say "diagnosis: the signed server list was refused. Check the network path to"
+      say "--psiphon-server-list, and the publisher key behind --psiphon-list-key."
+    elif grep -qE "no usable server entries|server list holds no SSH entries" "$LOG"; then
+      say "diagnosis: the list yielded no SSH entry. Name a list with --psiphon-entries"
+      say "or --psiphon-server-list; the lines above name the fetch or parse failure."
+    elif grep -qE "no server accepted the tunnel|was not reachable" "$LOG"; then
+      say "diagnosis: entries were found but no SSH server answered. That is this"
+      say "network reaching the Psiphon servers: try another --psiphon-region or a"
+      say "server-entry list from a network where the lane already works."
+    elif grep -qE "listen|is not an address" "$LOG"; then
+      say "diagnosis: the local SOCKS address was refused; --psiphon-listen names the"
+      say "address and port the lane binds."
+    else
+      say "diagnosis: the lane opened no tunnel this flow can use; the lines above"
+      say "are its own notices."
+    fi
+    return 0
+  fi
+  # The VeePN lane has no account and no edge it configures: every refusal it
+  # writes is about the plane or the region, so its three shapes are its own.
+  if [ "$OUTBOUND" = veepn ]; then
+    if grep -q "answers 422" "$LOG"; then
+      say "diagnosis: the plane does not list the region that was named. Its free pool"
+      say "uses lowercase ids (nl, us-va, gb-lnd); leaving --region off lets the plane"
+      say "name the fastest one it serves."
+    elif grep -q "refuses its pairs" "$LOG"; then
+      say "diagnosis: an edge refused the pair the plane listed, so the lane dropped"
+      say "the region's list; run up again, or move the exit with --region CC."
+    elif grep -q "refused by the edge" "$LOG"; then
+      say "diagnosis: the edge answered that it will not carry this target. The pair"
+      say "and the region are healthy; the host is what was refused."
+    elif grep -q "relay forward ended after" "$LOG" && ! grep -qE "relay backward ended after [1-9]" "$LOG"; then
+      say "diagnosis: an edge granted the CONNECT and then closed the tunnel without"
+      say "returning a byte, so the plane, the region and the pair are healthy: this"
+      say "network's path to the edge's relay is what drops the flow."
+    elif grep -q "declined" "$LOG"; then
+      say "diagnosis: every upstream the region listed declined. That is this network"
+      say "failing to reach the plane's edges, not an account: try another region, or"
+      say "--domains with an origin this network reaches."
+    else
+      say "diagnosis: the plane answered no list this lane can dial; the lines above"
+      say "name the region and the reason."
+    fi
+    return 0
+  fi
+  if grep -q "handshake with the edge failed" "$LOG"; then
+    say "diagnosis: TLS to the edge never completed. That is the network, not"
+    say "the account: chain the dial through a proxy this network does allow:"
+    say "  ferrox-cli up --foxy --upstream socks5://127.0.0.1:PORT"
+    if grep -q "the edge closed the stream" "$LOG"; then
+      say "the QUIC carrier got a handshake and the edge closed the stream, so"
+      say "UDP reaches the edge while TCP is dropped: force --carrier h3 to see"
+      say "whether the pass itself is refused, or keep --upstream for TCP."
+    fi
+  elif grep -q "the carrier io failed" "$LOG"; then
+    say "diagnosis: a carrier's path answered no datagram. Many networks drop UDP"
+    say "and QUIC while TCP works, so a named h3 has already walked h2 and h1; if"
+    say "every rung is in the lines above, the edge or the hop drops both."
+  elif grep -q "the edge closed the stream" "$LOG"; then
+    say "diagnosis: the QUIC carrier reached the edge and HTTP/2 answered the same"
+    say "pass with 401, so the edge refuses the pass this lane signed in for. The"
+    say "account is not entitled here: check the subscription and its devices at"
+    say "https://vpn.mozilla.org, or move the exit with --country."
+  elif grep -qE "did not sign in|token was refused" "$LOG"; then
+    say "diagnosis: the lane never signed in, so it has no pass to dial with. The"
+    say "account or password in $CREDS is refused, or the account wants a"
+    say "two-factor code: ferrox-cli up --foxy --code 123456."
+  elif grep -qE "no quota left|answered 429" "$LOG"; then
+    say "diagnosis: the plane is refusing this account for quota, and it names when"
+    say "that resets. Wait for it; signing in again does not buy bytes back."
+  else
+    say "diagnosis: none of the known shapes; the lines above are all there is."
+  fi
+}
+
+front_port_of() {
+  case "$1" in
+    socks) printf '%s' "$SOCKS_PORT" ;;
+    mixed) printf '%s' "$MIXED_PORT" ;;
+    *) printf '%s' "$HTTP_PORT" ;;
+  esac
+}
+
+verify_flow() {
+  local front port answer got want deadline step
+  front="${FRONTS%%,*}"
+  port="$(front_port_of "$front")"
+  # The front listens before a carrier finishes dialling; re-ask within the
+  # budget instead of calling a lane that is about to answer dead.
+  step=20
+  [ "$PROBE_TIMEOUT" -lt "$step" ] && step="$PROBE_TIMEOUT"
+  deadline=$(( $(date +%s) + PROBE_TIMEOUT ))
+  while :; do
+    answer="$(probe_front "$front" "$port" "$step")"
+    printf '%s\n' "$answer" | grep -qE '^(ip|loc)=' && break
+    if [ "$OUTBOUND" = veepn ] && probe_plain "$front" "$port" "$step" | grep -q 'Example Domain'; then
+      say "exit through $front: a plain HTTP flow answered."
+      return 0
+    fi
+    lane_running || break
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep 3
+  done
+  if ! printf '%s\n' "$answer" | grep -qE '^(ip|loc)='; then
+    say "NOT CONNECTED: the fronts are up, but no flow got through them."
+    diagnose
+    return 1
+  fi
+  say "exit through $front: $(printf '%s\n' "$answer" | grep -E '^(ip|loc)=' | tr '\n' ' ')"
+  # Any answer at all is not proof: this machine's own exit answers the same trace.
+  want="$(printf '%s' "$COUNTRY" | tr '[:lower:]' '[:upper:]')"
+  got="$(printf '%s\n' "$answer" | sed -n 's/^loc=//p' | tr '[:lower:]' '[:upper:]')"
+  # The plane's free pool may route outside the region it lists, so a pinned
+  # region that reads otherwise is named and the flow still counts as carried.
+  if [ "$OUTBOUND" = veepn ]; then
+    want="$(effective_region)"
+    got="$(printf '%s' "$got" | tr '[:upper:]' '[:lower:]')"
+    if [ -n "$want" ] && [ "$got" != "$want" ]; then
+      say "note: the exit reads ${got:-unreadable}, not the pinned $want; the plane's"
+      say "pool can route elsewhere, so the front is carrying the flow either way."
+    fi
+  fi
+  if [ "$OUTBOUND" = foxy ] && [ "$want" != REC ] && [ "$got" != "$want" ]; then
+    say "the exit reads ${got:-unreadable}, not the pinned $want: that is either another"
+    say "country's edge or this machine's own address, so the lane is not carrying it."
+    diagnose
+    return 1
+  fi
+  return 0
+}
+
+# A region block names itself 451 in the lane's log; WARP is the hop that moves
+# the exit, and the ladder takes it once before anything is reported refused.
+warp_ladder() {
+  [ "$OUTBOUND" = foxy ] || return 1
+  [ -z "$UPSTREAM" ] || return 1
+  [ "$WANT_WARP" = 0 ] || return 1
+  grep -q "the account plane answered 451" "$LOG" 2>/dev/null || return 1
+  stop_and_forget
+  say "the account plane answered 451 from this region: the lane retries once through"
+  say "a WARP hop (register an identity, race WireGuard against MASQUE, sign in through"
+  say "it). Pass '--warp' to make that the first move next time."
+  WANT_WARP=1
+}
+
+# An interruption before the lane exists can still leave the warp hop this
+# attempt started; stop only that, never a lane that was already running.
+interrupt_before_lane() {
+  [ "$WARP_STARTED" = 1 ] && stop_owned_warp
+  say "interrupted: the attempt was stopped; the log stays at $LOG."
+}
+
+action_up() {
+  reconcile_stale_proxy || die "the stale system proxy could not be cleared; run ferrox-cli down."
+  if [ "$WANT_VPN" = 1 ] && ! system_proxy_preflight; then exit 1; fi
+  choose_carrier
+  for _ in 1 2; do
+    trap 'interrupt_before_lane; exit 130' INT TERM
+    if ! start_lane; then
+      [ "$WARP_STARTED" = 1 ] && stop_owned_warp
+      exit 1
+    fi
+    # An attempt cut short is not a lane: Ctrl-C before it proves a flow removes what it started.
+    trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
+    if [ -n "$FRONTS" ] && ! wait_fronts; then
+      if warp_ladder; then continue; fi
+      say "the lane did not open its fronts; last lines of $LOG:"
+      tail -n 20 "$LOG" 2>/dev/null || true
+      stop_and_forget
+      say "the lane was stopped and its config removed; the log stays at $LOG."
+      exit 1
+    fi
+    say "lane${INSTANCE:+ '$INSTANCE'} up (pid $(lane_pid)), fronts:"
+    if [ "$OUTBOUND" = config ]; then
+      say "  the ones $CONFIG_FILE names (served verbatim)"
+    fi
+    port_map
+    [ "$OUTBOUND" = foxy ] && say "carrier: $CARRIER"
+    local ok=0
+    if [ -n "$FRONTS" ]; then verify_flow || ok=1; fi
+    if [ "$ok" = 1 ]; then
+      # A lane that carries no flow is a leftover, not a result: end it here.
+      if warp_ladder; then continue; fi
+      stop_and_forget
+      say "the lane was stopped and its config removed; nothing is routed, and the"
+      say "log stays at $LOG."
+      exit 3
+    fi
+    break
+  done
+  # Route the machine only at a lane that proved it carries a flow: an armed
+  # system proxy over a dead lane takes the network down with it.
+  if [ "$WANT_VPN" = 1 ]; then
+    if ! system_proxy_on; then
+      stop_and_forget
+      say "the system proxy was not armed; the lane was stopped and its config removed."
+      exit 1
+    fi
+    supervise_lane
+  fi
+  say "log:  $LOG"
+  say "stop: ferrox-cli down"
+}
+
+action_serve() {
+  reconcile_stale_proxy || die "the stale system proxy could not be cleared; run ferrox-cli down."
+  if [ "$WANT_VPN" = 1 ] && ! system_proxy_preflight; then exit 1; fi
+  choose_carrier
+  for _ in 1 2; do
+    trap 'interrupt_before_lane; exit 130' INT TERM
+    if ! start_lane; then
+      [ "$WARP_STARTED" = 1 ] && stop_owned_warp
+      exit 1
+    fi
+    # A serve that never proved a flow is an attempt too: the same interruption cleanup applies.
+    trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
+    if [ -n "$FRONTS" ] && ! wait_fronts; then
+      if warp_ladder; then continue; fi
+      say "the lane did not open its fronts; last lines of $LOG:"
+      tail -n 20 "$LOG" 2>/dev/null || true
+      stop_and_forget
+      say "the lane was stopped and its config removed; the log stays at $LOG."
+      exit 1
+    fi
+    say "lane${INSTANCE:+ '$INSTANCE'} up, fronts:"
+    if [ "$OUTBOUND" = config ]; then
+      say "  the ones $CONFIG_FILE names (served verbatim)"
+    fi
+    port_map
+    [ "$OUTBOUND" = foxy ] && say "carrier: $CARRIER"
+    local ok=0
+    if [ -n "$FRONTS" ]; then verify_flow || ok=1; fi
+    if [ "$ok" = 1 ]; then
+      if warp_ladder; then continue; fi
+      stop_and_forget
+      say "the lane was stopped and its config removed; nothing is routed, and the"
+      say "log stays at $LOG."
+      exit 3
+    fi
+    break
+  done
+  if [ "$WANT_VPN" = 1 ] && ! system_proxy_on; then
+    stop_and_forget
+    say "the system proxy was not armed; the lane was stopped and its config removed."
+    exit 1
+  fi
+  say "Ctrl-C stops it."
+  trap 'stop_and_forget; exit 0' INT TERM
+  local pid; pid="$(lane_pid)"
+  while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; do sleep 2; done
+  say "the lane exited; last lines of $LOG:"
+  tail -n 15 "$LOG" 2>/dev/null || true
+  stop_and_forget
+}
+
+action_status() {
+  reconcile_stale_proxy || true
+  if ! lane_running; then
+    say "lane${INSTANCE:+ '$INSTANCE'} not running."
+    local stale others
+    if stale="$(stale_proxy_endpoint)"; then
+      say "system proxy points at $stale but no lane owns it; run 'ferrox-cli down' to clear it."
+    fi
+    others="$(other_lanes)"
+    if [ -n "$others" ]; then
+      say "instances running:"
+      printf '%s\n' "$others"
+      say "read one with: ferrox-cli status --instance NAME"
+    fi
+    [ -f "$TOKEN_FILE" ] && say "foxy session stored in $TOKEN_FILE: the next up --foxy resumes it without a sign-in mail."
+    return 1
+  fi
+  say "lane${INSTANCE:+ '$INSTANCE'} pid $(lane_pid), fronts:"
+  port_map
+  local pid uptime chosen quota
+  pid="$(lane_pid)"
+  uptime="$(ps -o etime= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$uptime" ] && say "up for $uptime"
+  chosen="$(sed -n 's/^foxy: carrier //p' "$LOG" 2>/dev/null | tail -n 1)"
+  [ -n "$chosen" ] && say "carrier: $chosen"
+  quota="$(sed -n 's/^foxy: allowance //p' "$LOG" 2>/dev/null | tail -n 1)"
+  if [ -n "$quota" ]; then
+    say "quota left: $quota"
+  elif [ -n "$chosen" ]; then
+    say "quota: the plane named no allowance for the pass this lane carries: that is silence, not zero."
+  elif foxy_lane_configured; then
+    say "quota: this lane's binary names neither the carrier nor the allowance; 'down' then 'up' restarts it on the binary this script runs."
+  fi
+  local front port mode answer
+  front="${FRONTS%%,*}"
+  case "$front" in
+    socks) port="$SOCKS_PORT"; mode=socks ;;
+    mixed) port="$MIXED_PORT"; mode=http ;;
+    *) port="$HTTP_PORT"; mode=http ;;
+  esac
+  say "exit through $front ($port):"
+  if [ "$mode" = socks ]; then
+    answer="$(curl -s --noproxy '' --max-time 30 --socks5-hostname "127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
+  else
+    answer="$(curl -s --noproxy '' --max-time 30 -x "http://127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
+  fi
+  printf '%s\n' "$answer" | grep -E '^(ip|loc)=' || say "no answer through the front; see $LOG"
+}
+
+action_ports() {
+  rule
+  say "local fronts (127.0.0.1 only):"
+  port_map
+  if [ -n "$INSTANCE" ]; then
+    rule
+    [ -f "$CFG" ] || say "instance '$INSTANCE' has not started: these are the defaults it moves off if they are taken."
+    say "point the app you want at these fronts: the macOS system proxy is one"
+    say "machine-wide setting, so an instance never arms it (--vpn belongs to the"
+    say "unnamed lane)."
+    return 0
+  fi
+  local front want_socks="" want_http=""
+  for front in ${FRONTS//,/ }; do
+    case "$front" in
+      socks) want_socks="$SOCKS_PORT" ;;
+      http) want_http="$HTTP_PORT" ;;
+      mixed)
+        [ -n "$want_socks" ] || want_socks="$MIXED_PORT"
+        [ -n "$want_http" ] || want_http="$MIXED_PORT" ;;
+    esac
+  done
+  rule
+  say "macOS, System Settings > Network > <service> > Details... > Proxies:"
+  [ -n "$want_http" ] && say "  Web proxy (HTTP)     127.0.0.1:$want_http"
+  [ -n "$want_http" ] && say "  Secure web proxy     127.0.0.1:$want_http"
+  [ -n "$want_socks" ] && say "  SOCKS proxy          127.0.0.1:$want_socks"
+  say "Turn on the fronts listed above, leave \"Proxy server requires password\" off (the fronts are"
+  say "unauthenticated and loopback-only), and put local names in \"Bypass proxy"
+  say "settings for these hosts and domains\":  *.local, 169.254/16"
+  say
+  say "One app instead of the whole system:"
+  [ -n "$want_socks" ] && say "  curl --socks5-hostname 127.0.0.1:$want_socks https://example.com"
+  [ -n "$want_http" ] && say "  curl -x http://127.0.0.1:$want_http https://example.com"
+  if [ -n "$want_http" ] && [ -n "$want_socks" ]; then
+    say "  HTTPS_PROXY=http://127.0.0.1:$want_http ALL_PROXY=socks5h://127.0.0.1:$want_socks git clone ..."
+  elif [ -n "$want_http" ]; then
+    say "  HTTPS_PROXY=http://127.0.0.1:$want_http git clone ..."
+  elif [ -n "$want_socks" ]; then
+    say "  ALL_PROXY=socks5h://127.0.0.1:$want_socks git clone ..."
+  fi
+  return 0
+}
+
+action_version() {
+  require_bin
+  say "ferrox-cli at $SCRIPT_DIR"
+  "$BIN" version
+}
+
+action_tun() {
+  cat <<EOF
+TUN mode is refused by this binary, by name, not by silence.
+
+What TUN would be: a virtual network device (utun on macOS) that takes every IP
+packet, so apps that ignore proxies are captured too, UDP included. That needs
+a device driver, a userspace IP stack, and root or a signed entitlement.
+
+What this binary has: no tun/utun inbound and no tun2socks engine (README rows
+29 and 58). A config naming one is refused with that reason, and \`--tun\` here
+refuses before anything starts.
+
+What you get instead:
+  * ferrox-cli up --vpn      the macOS system proxy: TCP apps that honour it
+  * ferrox-cli up --fronts socks   UDP for apps that speak SOCKS5 (browsers do
+                             not send UDP to a SOCKS proxy, so their QUIC goes
+                             around the lane)
+EOF
+}
+
+# ---------------------------------------------------------------------- parse
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    up|serve|down|status|ports|tun|login|logout|version) ACTION="$1"; shift ;;
+    __supervise)
+      ACTION=__supervise; shift
+      if [ $# -gt 0 ]; then SUPERVISE_PID="$1"; shift; fi ;;
+    locations)
+      ACTION=locations; shift
+      # Both spellings: `locations --ping US` and `locations US --ping`.
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --ping) LOC_PING=1; shift ;;
+          --foxy|--veepn|--psiphon) OUTBOUND="${1#--}"; shift ;;
+          -*) break ;;
+          *) LOC_FILTER="$1"; shift ;;
+        esac
+      done ;;
+    location)
+      ACTION=location; shift
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --foxy|--veepn|--psiphon) OUTBOUND="${1#--}"; shift ;;
+          -*) break ;;
+          *)
+            if [ -z "$LOC_COUNTRY" ]; then LOC_COUNTRY="$1"
+            elif [ -z "$LOC_CITY" ]; then LOC_CITY="$1"
+            else break
+            fi
+            shift ;;
+        esac
+      done ;;
+    --foxy) OUTBOUND=foxy; shift ;;
+    --veepn) OUTBOUND=veepn; shift ;;
+    --psiphon) OUTBOUND=psiphon; shift ;;
+    --psiphon-bin) need_value --psiphon-bin "the psiphon-tunnel-core path" "$#" "${2:-}"; PSIPHON_BIN="$2"; shift 2 ;;
+    --psiphon-region) need_value --psiphon-region "a two-letter region" "$#" "${2:-}"; PSIPHON_REGION="$2"; shift 2 ;;
+    --psiphon-mode)
+      need_value --psiphon-mode "auto, cdn, conduit or direct" "$#" "${2:-}"
+      case "$2" in
+        auto|cdn|conduit|direct) PSIPHON_SHAPE="$2" ;;
+        *) die "--psiphon-mode wants auto, cdn, conduit or direct, got '$2'; nothing was started." ;;
+      esac; shift 2 ;;
+    --psiphon-listen) need_value --psiphon-listen "an address and port" "$#" "${2:-}"; PSIPHON_LISTEN="$2"; shift 2 ;;
+    --psiphon-http) need_value --psiphon-http "an address and port, or off" "$#" "${2:-}"; PSIPHON_HTTP="$2"; shift 2 ;;
+    --psiphon-dir) need_value --psiphon-dir "a data directory" "$#" "${2:-}"; PSIPHON_DIR="$2"; shift 2 ;;
+    --psiphon-ready) need_value --psiphon-ready "a number of seconds" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*) die "--psiphon-ready wants seconds, got '$2'; nothing was started." ;; esac; PSIPHON_READY="$2"; shift 2 ;;
+    --psiphon-base) need_value --psiphon-base "a JSON config path" "$#" "${2:-}"; PSIPHON_BASE="$2"; shift 2 ;;
+    --psiphon-entries) need_value --psiphon-entries "a server-entry file" "$#" "${2:-}"; PSIPHON_ENTRIES="$2"; shift 2 ;;
+    --psiphon-split) PSIPHON_SPLIT=1; shift ;;
+    --psiphon-split-region) need_value --psiphon-split-region "country codes" "$#" "${2:-}"; PSIPHON_SPLIT_REGIONS="$2"; shift 2 ;;
+    --psiphon-user) need_value --psiphon-user "a username" "$#" "${2:-}"; PSIPHON_USER="$2"; shift 2 ;;
+    --psiphon-pass) need_value --psiphon-pass "a password" "$#" "${2:-}"; PSIPHON_PASS="$2"; shift 2 ;;
+    --psiphon-pool) need_value --psiphon-pool "a tunnel count" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*) die "--psiphon-pool wants a number, got '$2'; nothing was started." ;; esac; PSIPHON_POOL="$2"; shift 2 ;;
+    --psiphon-workers) need_value --psiphon-workers "a worker count" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*) die "--psiphon-workers wants a number, got '$2'; nothing was started." ;; esac; PSIPHON_WORKERS="$2"; shift 2 ;;
+    --psiphon-aggressive) PSIPHON_AGGRESSIVE=1; PSIPHON_AGGRESSIVE_SET=1; shift ;;
+    --psiphon-no-aggressive) PSIPHON_AGGRESSIVE=0; PSIPHON_AGGRESSIVE_SET=1; shift ;;
+    --psiphon-conduit-mode)
+      need_value --psiphon-conduit-mode "auto, private or public" "$#" "${2:-}"
+      case "$2" in
+        auto|public|private) PSIPHON_CONDUIT_MODE="$2" ;;
+        *) die "--psiphon-conduit-mode wants auto, private or public, got '$2'; nothing was started." ;;
+      esac; shift 2 ;;
+    --psiphon-conduit-timeout) need_value --psiphon-conduit-timeout "seconds, at least 1" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*|0) die "--psiphon-conduit-timeout wants seconds, at least 1, got '$2'; nothing was started." ;; esac; PSIPHON_CONDUIT_TIMEOUT="$2"; shift 2 ;;
+    --psiphon-share) PSIPHON_SHARE=1; shift ;;
+    --psiphon-server-list) need_value --psiphon-server-list "server-list URLs" "$#" "${2:-}"; PSIPHON_SERVER_LISTS="$2"; shift 2 ;;
+    --psiphon-osl) need_value --psiphon-osl "obfuscated server-list root URLs" "$#" "${2:-}"; PSIPHON_OSL="$2"; shift 2 ;;
+    --psiphon-entry-key) need_value --psiphon-entry-key "a server-entry public key" "$#" "${2:-}"; PSIPHON_ENTRY_KEY="$2"; shift 2 ;;
+    --psiphon-list-key) need_value --psiphon-list-key "a list publisher key" "$#" "${2:-}"; PSIPHON_LIST_KEY="$2"; shift 2 ;;
+    --psiphon-exchange-key) need_value --psiphon-exchange-key "an exchange obfuscation key" "$#" "${2:-}"; PSIPHON_EXCHANGE_KEY="$2"; shift 2 ;;
+    --psiphon-feature) need_value --psiphon-feature "client features" "$#" "${2:-}"; PSIPHON_FEATURES="$2"; shift 2 ;;
+    --psiphon-latency) need_value --psiphon-latency "a multiplier of at least 1" "$#" "${2:-}"; PSIPHON_LATENCY="$2"; shift 2 ;;
+    --psiphon-disable-timeouts) PSIPHON_DISABLE_TIMEOUTS=1; shift ;;
+    --psiphon-cdn|--psiphon-fronted) OUTBOUND=psiphon; PSIPHON_CDN_PROFILE=fronted; PSIPHON_AGGRESSIVE=1; PSIPHON_AGGRESSIVE_SET=1; PSIPHON_SHAPE=cdn; shift ;;
+    --psiphon-cdn-profile) need_value --psiphon-cdn-profile "fronted, legacy, android or off" "$#" "${2:-}"; case "$2" in fronted|legacy|android|off) PSIPHON_CDN_PROFILE="$2" ;; *) die "--psiphon-cdn-profile wants fronted, legacy, android or off, got '$2'; nothing was started." ;; esac; shift 2 ;;
+    --psiphon-cdn-ip) need_value --psiphon-cdn-ip "CDN edge addresses" "$#" "${2:-}"; PSIPHON_CDN_IPS="$2"; shift 2 ;;
+    --psiphon-cdn-sni) need_value --psiphon-cdn-sni "CDN edge names" "$#" "${2:-}"; PSIPHON_CDN_SNI="$2"; shift 2 ;;
+    --psiphon-cdn-set) need_value --psiphon-cdn-set "built-in CDN set names" "$#" "${2:-}"; PSIPHON_CDN_SETS="$2"; shift 2 ;;
+    --psiphon-unsafe-alerts) PSIPHON_UNSAFE_ALERTS=1; shift ;;
+    --psiphon-location-precision) need_value --psiphon-location-precision "a precision above zero" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*) die "--psiphon-location-precision wants a number above zero, got '$2'; nothing was started." ;; esac; PSIPHON_LOCATION_PRECISION="$2"; shift 2 ;;
+    --psiphon-share-port) need_value --psiphon-share-port "a port" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*|0) die "--psiphon-share-port wants a port, got '$2'; nothing was started." ;; esac; PSIPHON_SHARE_PORT="$2"; PSIPHON_SHARE=1; shift 2 ;;
+    --psiphon-share-http) need_value --psiphon-share-http "a port" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*|0) die "--psiphon-share-http wants a port, got '$2'; nothing was started." ;; esac; PSIPHON_SHARE_HTTP="$2"; PSIPHON_SHARE=1; shift 2 ;;
+    --psiphon-geoip) need_value --psiphon-geoip "a MaxMind database" "$#" "${2:-}"; PSIPHON_GEOIP="$2"; shift 2 ;;
+    --psiphon-reject-censored) PSIPHON_REJECT_CENSORED=1; shift ;;
+    --psiphon-reject-country) need_value --psiphon-reject-country "country codes" "$#" "${2:-}"; PSIPHON_REJECT_COUNTRIES="$2"; shift 2 ;;
+    --psiphon-compartment) need_value --psiphon-compartment "a compartment id" "$#" "${2:-}"; PSIPHON_COMPARTMENT="$2"; shift 2 ;;
+    --psiphon-dns) need_value --psiphon-dns "resolver addresses" "$#" "${2:-}"; PSIPHON_DNS_ALTERNATE="$2"; shift 2 ;;
+    --psiphon-device-location) need_value --psiphon-device-location "a geohash" "$#" "${2:-}"; PSIPHON_DEVICE_LOCATION="$2"; shift 2 ;;
+    --psiphon-device-region) need_value --psiphon-device-region "a two-letter region" "$#" "${2:-}"; PSIPHON_DEVICE_REGION="$2"; shift 2 ;;
+    --psiphon-network-id) need_value --psiphon-network-id "a network id" "$#" "${2:-}"; PSIPHON_NETWORK_ID="$2"; shift 2 ;;
+    --psiphon-additional-params) need_value --psiphon-additional-params "base64 parameters" "$#" "${2:-}"; PSIPHON_ADDITIONAL_PARAMS="$2"; shift 2 ;;
+    --psiphon-establish-timeout) need_value --psiphon-establish-timeout "seconds, at least 1" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*|0) die "--psiphon-establish-timeout wants seconds, at least 1, got '$2'; nothing was started." ;; esac; PSIPHON_ESTABLISH_TIMEOUT="$2"; shift 2 ;;
+    --psiphon-emit-bytes) PSIPHON_EMIT_BYTES=1; shift ;;
+    --vless) need_value --vless "a vless:// share link" "$#" "${2:-}"; OUTBOUND=vless; VLESS="$2"; shift 2 ;;
+    --vmess) need_value --vmess "a vmess:// share link or HOST:PORT" "$#" "${2:-}"; OUTBOUND=vmess; VMESS="$2"; shift 2 ;;
+    --uuid) need_value --uuid "the VMess user id" "$#" "${2:-}"; VMESS_ID="$2"; shift 2 ;;
+    --network) need_value --network "tcp or ws" "$#" "${2:-}"; VMESS_NETWORK="$2"; shift 2 ;;
+    --trojan) need_value --trojan "HOST:PORT" "$#" "${2:-}"; OUTBOUND=trojan; TROJAN="$2"; shift 2 ;;
+    --ss) need_value --ss "HOST:PORT" "$#" "${2:-}"; OUTBOUND=ss; SS="$2"; shift 2 ;;
+    --method) need_value --method "a shadowsocks method" "$#" "${2:-}"; SS_METHOD="$2"; shift 2 ;;
+    --config) need_value --config "a JSON config path" "$#" "${2:-}"; OUTBOUND=config; CONFIG_FILE="$2"; shift 2 ;;
+    --email) need_value --email "an email address" "$#" "${2:-}"; EMAIL="$2"; shift 2 ;;
+    --password) need_value --password "a password" "$#" "${2:-}"; PASSWORD="$2"; shift 2 ;;
+    --code) need_value --code "a two-factor code" "$#" "${2:-}"; CODE="$2"; shift 2 ;;
+    --country) need_value --country "a country code" "$#" "${2:-}"; COUNTRY="$2"; COUNTRY_SET=1; shift 2 ;;
+    --region) need_value --region "a region id" "$#" "${2:-}"; REGION="$2"; shift 2 ;;
+    --domains) need_value --domains "comma-separated origins" "$#" "${2:-}"; VEEPN_DOMAINS="$2"; shift 2 ;;
+    --udid) need_value --udid "a device id" "$#" "${2:-}"; VEEPN_UDID="$2"; shift 2 ;;
+    --city) need_value --city "a city code" "$#" "${2:-}"; CITY="$2"; CITY_SET=1; shift 2 ;;
+    --carrier)
+      need_value --carrier "auto, h1, h2 or h3" "$#" "${2:-}"
+      case "$2" in
+        auto|h1|h2|h3) CARRIER="$2" ;;
+        *) die "--carrier wants auto, h1, h2 or h3, got '$2'; nothing was started." ;;
+      esac
+      CARRIER_SET=1; shift 2 ;;
+    --fxa-user-agent)
+      need_value --fxa-user-agent "a printable ASCII User-Agent" "$#" "${2:-}"
+      printable_ascii "$2" || die "--fxa-user-agent wants printable ASCII only; nothing was started."
+      FXA_USER_AGENT="$2"; shift 2 ;;
+    --upstream) need_value --upstream "an http:// or socks5:// URL" "$#" "${2:-}"; UPSTREAM="$2"; shift 2 ;;
+    --warp) WANT_WARP=1; shift ;;
+    --udp-via)
+      need_value --udp-via "foxy, warp, psiphon, psiphon-cdn, direct or block" "$#" "${2:-}"
+      case "$2" in
+        foxy|warp|psiphon|psiphon-cdn|direct|block) UDP_VIA="$2" ;;
+        *) die "--udp-via wants foxy, warp, psiphon, psiphon-cdn, direct or block, got '$2'; nothing was started." ;;
+      esac; shift 2 ;;
+    --exclude-domains) need_value --exclude-domains "comma-separated domain suffixes" "$#" "${2:-}"; EXCLUDE_DOMAINS="$2"; shift 2 ;;
+    --exclude-ports) need_value --exclude-ports "comma-separated ports" "$#" "${2:-}"; EXCLUDE_PORTS="$2"; shift 2 ;;
+    --fronts) need_value --fronts "a comma-separated front list" "$#" "${2:-}"; FRONTS="$2"; FRONTS_SET=1; shift 2 ;;
+    --socks) need_port --socks "$#" "${2:-}"; SOCKS_PORT="$2"; SOCKS_SET=1; shift 2 ;;
+    --http) need_port --http "$#" "${2:-}"; HTTP_PORT="$2"; HTTP_SET=1; shift 2 ;;
+    --mixed) need_port --mixed "$#" "${2:-}"; MIXED_PORT="$2"; MIXED_SET=1; shift 2 ;;
+    --instance)
+      need_value --instance "a name of letters, digits, - or _" "$#" "${2:-}"
+      case "$2" in
+        *[!A-Za-z0-9_-]*) die "--instance wants letters, digits, - or _, got '$2'; nothing was started." ;;
+      esac
+      [ "${#2}" -le 32 ] || die "an --instance name is at most 32 characters; nothing was started."
+      INSTANCE="$2"; shift 2 ;;
+    --all) ALL=1; shift ;;
+    --vpn) WANT_VPN=1; shift ;;
+    --debug) DEBUG=1; shift ;;
+    --ping) LOC_PING=1; shift ;;
+    --tun) ACTION=tun; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -V|--version) ACTION=version; shift ;;
+    *) die "unknown argument: $1 (see --help)" ;;
+  esac
+done
+
+# A measurement flag belongs to the listing: a lane started by a typo is not one.
+if [ "$LOC_PING" = 1 ] && [ "$ACTION" != locations ]; then
+  die "--ping belongs to 'locations' (ferrox-cli locations --ping); nothing was started."
+fi
+
+# One country spelling for every lane: --country and --region both name the
+# Psiphon egress region, and --psiphon-region still wins when all three appear.
+if [ "$OUTBOUND" = psiphon ] && [ -z "$PSIPHON_REGION" ]; then
+  if [ -n "$REGION" ]; then
+    PSIPHON_REGION="$REGION"
+  elif [ "$COUNTRY_SET" = 1 ]; then
+    PSIPHON_REGION="$COUNTRY"
+  fi
+fi
+
+# Excluded targets leave the tunnel unencrypted, so the lists are foxy-only and refused before a lane is touched.
+if [ -n "$EXCLUDE_DOMAINS$EXCLUDE_PORTS" ] && [ "$OUTBOUND" != foxy ]; then
+  die "--exclude-domains and --exclude-ports belong to the foxy lane; nothing was started."
+fi
+if [ -n "$FXA_USER_AGENT" ] && [ "$OUTBOUND" != foxy ]; then
+  die "--fxa-user-agent belongs to the foxy lane; nothing was started."
+fi
+if [ "$WANT_WARP" = 1 ] && [ "$OUTBOUND" != foxy ]; then
+  die "--warp chains the foxy lane through WARP (up --foxy --warp); nothing was started."
+fi
+case "$UDP_VIA" in
+  ""|foxy) ;;
+  warp|psiphon|psiphon-cdn|direct|block)
+    [ "$OUTBOUND" = foxy ] || die "--udp-via splits the foxy lane (up --foxy --udp-via ...); nothing was started." ;;
+esac
+if [ "$UDP_VIA" = psiphon-cdn ]; then
+  [ -z "$PSIPHON_CDN_PROFILE" ] && PSIPHON_CDN_PROFILE=fronted
+  [ "$PSIPHON_AGGRESSIVE_SET" = 0 ] && PSIPHON_AGGRESSIVE=1
+  [ -z "$PSIPHON_SHAPE" ] && PSIPHON_SHAPE=cdn
+fi
+if [ "$OUTBOUND" = psiphon ] || [ "$UDP_VIA" = psiphon ]; then
+  [ -z "$PSIPHON_SHAPE" ] && PSIPHON_SHAPE=auto
+  [ "$PSIPHON_AGGRESSIVE_SET" = 0 ] && PSIPHON_AGGRESSIVE=1
+  [ -z "$PSIPHON_DNS_ALTERNATE" ] && PSIPHON_DNS_ALTERNATE="$(printf '%s.%s.%s.%s,%s.%s.%s.%s,%s.%s.%s.%s,%s.%s.%s.%s' 1 1 1 1 1 0 0 1 8 8 8 8 8 8 4 4)"
+fi
+
+if [ "$ALL" = 1 ]; then
+  [ "$ACTION" = down ] || die "--all belongs to 'down' (ferrox-cli down --all); nothing was started."
+  [ -z "$INSTANCE" ] || die "--all stops every lane, so it takes no --instance; nothing was started."
+fi
+
+# The macOS system proxy is one machine-wide setting: two lanes cannot share it.
+if [ -n "$INSTANCE" ] && [ "$WANT_VPN" = 1 ]; then
+  die "the system proxy points at one lane: run '$INSTANCE' without --vpn and point the app at its fronts (ferrox-cli ports --instance $INSTANCE), or arm --vpn on the unnamed lane; nothing was started."
+fi
+
+apply_instance
+case "$ACTION" in
+  up|serve)
+    scan=0
+    if [ "$OUTBOUND" = config ]; then
+      CFG="$CONFIG_FILE"
+      FRONTS="$(config_fronts 2>&1)" || die "$FRONTS"
+      # The file is served verbatim, so its ports win over the flags.
+      SOCKS_SET=0; HTTP_SET=0; MIXED_SET=0
+    else
+      [ -n "$INSTANCE" ] && scan=1
+    fi
+    planned="$(plan_ports "$scan")" || die "the lane's ports could not be chosen; nothing was started."
+    read -r SOCKS_PORT HTTP_PORT MIXED_PORT <<<"$planned"
+    seen=""
+    for front in ${FRONTS//,/ }; do
+      case "$front" in
+        socks) port="$SOCKS_PORT" ;;
+        http) port="$HTTP_PORT" ;;
+        mixed) port="$MIXED_PORT" ;;
+        *) continue ;;
+      esac
+      case " $seen " in *" $port "*) die "two fronts cannot share port $port; nothing was started." ;; esac
+      seen="$seen $port"
+    done ;;
+  status|ports) load_lane_meta || true; adopt_lane_ports || true ;;
+esac
+
+# A VeePN flow pays a launch and a list before bytes move, so its first probe
+# waits longer than a lane that configures the server it dials.
+[ "$OUTBOUND" = veepn ] && PROBE_TIMEOUT=45
+# Psiphon downloads a signed server list and completes an SSH handshake before its
+# local SOCKS answers, so its first probe waits longer than a configured lane.
+if [ "$OUTBOUND" = psiphon ]; then
+  PROBE_TIMEOUT=200
+  if [ -n "$PSIPHON_READY" ] && [ "$PSIPHON_READY" -gt 180 ]; then
+    PROBE_TIMEOUT=$((PSIPHON_READY + 20))
+  fi
+fi
+
+# Only up, serve and version need the binary: down, status and login must
+# still work when it was never fetched.
+require_bin() {
+  local profile
+  resolve_bin
+  [ -x "$BIN" ] && return 0
+  # In a checkout the binary is a build, not a download. The release profile is
+  # the slow one: every dependency optimised, the app in one codegen unit, and a
+  # thin-LTO link (minutes cold, ~4 minutes after an app edit). The dev profile
+  # reuses the test cycle's warm dependencies and finishes in seconds, so `up`
+  # defaults to it; FERROX_PROFILE=release (or FERROX_RELEASE=1) builds the
+  # measured binary.
+  if [ -f "$ROOT/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+    profile="${FERROX_PROFILE:-debug}"
+    if [ -z "${FERROX_PROFILE:-}" ] && [ "${FERROX_RELEASE:-0}" = 1 ]; then profile=release; fi
+    case "$profile" in
+      release)
+        say "building ferrox-app (release; minutes, not seconds)..."
+        ( cd "$ROOT" && cargo build --locked --release -p ferrox-app ) >&2 || die "the build failed" ;;
+      debug)
+        say "building ferrox-app (dev profile; seconds)..."
+        ( cd "$ROOT" && cargo build --locked -p ferrox-app ) >&2 || die "the build failed"
+        say "running the dev binary; FERROX_PROFILE=release builds the measured one." ;;
+      *) die "FERROX_PROFILE must be debug or release, not '$profile'" ;;
+    esac
+    # The first resolve parked BIN on the profile that was missing; a build that
+    # just created the other one has to be seen.
+    [ -n "${FERROX_BIN:-}" ] || BIN=""
+    resolve_bin
+    [ -x "$BIN" ] || die "the build finished but $BIN is still missing"
+    return 0
+  fi
+  die "no binary at $BIN: unpack a release package beside this script (https://github.com/FerroxCo/ferrox/releases), or build one: cargo build -p ferrox-app (add --release for the measured binary)"
+}
+
+case "$ACTION" in
+  up) require_tools; action_up ;;
+  serve) require_tools; action_serve ;;
+  __supervise) action_supervise ;;
+  login) action_login ;;
+  logout) action_logout ;;
+  locations) require_tools; action_locations ;;
+  location) require_tools; action_location ;;
+  down)
+    down_rc=0
+    if [ "$ALL" = 1 ]; then
+      stop_all_lanes || down_rc=$?
+    else
+      stop_lane 1 || down_rc=$?
+      forget_lane_config
+    fi
+    if [ "$down_rc" -ne 0 ]; then
+      say "lane${INSTANCE:+ '$INSTANCE'} stopped, but the system proxy was not cleared; run 'ferrox-cli down' again." >&2
+      exit "$down_rc"
+    fi
+    if [ "$ALL" = 1 ]; then
+      say "every lane is stopped and its config removed. The stored foxy session is kept; 'ferrox-cli logout' forgets it."
+    else
+      say "lane${INSTANCE:+ '$INSTANCE'} stopped; the lane config is removed. The stored foxy session is kept; 'ferrox-cli logout' forgets it."
+    fi ;;
+  status) require_tools; action_status ;;
+  ports) require_tools; action_ports ;;
+  tun) action_tun ;;
+  version) action_version ;;
+esac
