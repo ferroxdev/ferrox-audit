@@ -521,4 +521,138 @@ fn refuse_source(
     true
 }
 
-/// Whether this inb
+/// Whether this inbound's xHTTP carrier is the QUIC one, decided the way the listener decides it:
+/// xHTTP, TLS with a loadable identity, and an ALPN list of exactly `h3`. Only then does the
+/// dispatcher register a stop the listener will actually signal.
+fn inbound_is_xhttp_h3(inbound: &Json) -> bool {
+    if !matches!(inbound_carrier(inbound), Carrier::Xhttp { .. })
+        || crate::config::stream_security(inbound) != "tls"
+        || crate::config::inbound_tls_identity(inbound).is_none()
+    {
+        return false;
+    }
+    let alpn = inbound
+        .get("streamSettings")
+        .and_then(|stream| stream.get("tlsSettings"))
+        .and_then(|tls| tls.get("alpn"));
+    let names: Vec<&str> = match alpn {
+        Some(Json::Str(single)) if !single.is_empty() => vec![single],
+        Some(Json::Arr(items)) => items
+            .iter()
+            .filter_map(Json::as_str)
+            .filter(|name| !name.is_empty())
+            .collect(),
+        _ => return false,
+    };
+    names.as_slice() == ["h3"]
+}
+
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+fn serve_inbounds_counted(
+    label: &str,
+    root: &Json,
+    outbound: Option<&Outbound>,
+    route: Option<&Arc<RouteShared>>,
+    prove: bool,
+    freedom: bool,
+    portals: &crate::reverse::Portals,
+    api: Option<&crate::commander::Api>,
+    seed: Option<&crate::xray_pb::Seed>,
+    test: bool,
+    fallible: bool,
+) -> usize {
+    let routed =
+        |inbound: &Json, source_known: bool| routed_out(outbound, route, inbound, source_known);
+    let mut inbounds = 0;
+    let configured = configured_emails(root);
+    if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
+        for inbound in list {
+            let protocol =
+                canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""));
+            // The reference expands a port list and datagram carrier to one listener per port.
+            let Some(addresses) = serve_addresses(inbound, protocol) else {
+                continue;
+            };
+            // `-test` takes an ephemeral loopback port so the one a running instance holds is never touched.
+            let listening = test.then(|| {
+                addresses
+                    .iter()
+                    .map(|address| {
+                        if address.is_empty() {
+                            String::new()
+                        } else {
+                            "127.0.0.1:0".to_owned()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let bind = listening.as_ref().unwrap_or(&addresses);
+            if !inbound_served(protocol) {
+                refuse_inbound(protocol, label, inbound);
+                continue;
+            }
+            if prove {
+                if let Some(shared) = route {
+                    prove_server_route(shared, inbound, label);
+                }
+            }
+            register_inbound_sniffing(inbound, label, &addresses);
+            let handler_stop = api.map(|_| Arc::new(Stop::new()));
+            let handler_tag = inbound_tag(inbound);
+            let handler_raw = seed.and_then(|seed| {
+                let tag = handler_tag.as_deref().unwrap_or_default();
+                seed.inbounds
+                    .iter()
+                    .find(|(candidate, _)| candidate == tag)
+                    .map(|(_, raw)| raw.clone())
+            });
+            let mut handler_stops: Vec<(Arc<Stop>, String)> = Vec::new();
+            let vmess_users = (protocol == "vmess").then(|| {
+                let make = || inbound_vmess_users(inbound);
+                let users = match (route, handler_tag.as_deref()) {
+                    (Some(shared), Some(tag)) => shared.vmess_users(tag, make),
+                    _ => make(),
+                };
+                if let Some(shared) = route {
+                    shared.restrict_user_portals(handler_tag.as_deref(), &users);
+                }
+                users
+            });
+            let before = inbounds;
+            let h3_stop = if inbound_is_xhttp_h3(inbound) {
+                handler_stop.as_ref()
+            } else {
+                None
+            };
+            for address in bind {
+                match protocol {
+                    "vless" => {
+                        if serve_vless_inbound(
+                            address,
+                            inbound,
+                            freedom,
+                            label,
+                            portals,
+                            handler_stop.as_ref(),
+                        ) {
+                            if let Some(stop) = h3_stop {
+                                handler_stops.push((Arc::clone(stop), address.clone()));
+                            }
+                            inbounds += 1;
+                        }
+                    }
+                    "trojan" => {
+                        if serve_trojan_inbound(address, inbound, freedom, handler_stop.as_ref()) {
+                            if let Some(stop) = h3_stop {
+                                handler_stops.push((Arc::clone(stop), address.clone()));
+                            }
+                            inbounds += 1;
+                        }
+                    }
+                    "vmess" => {
+                        let users = vmess_users.as_ref().expect("a vmess table");
+                        
