@@ -1,0 +1,412 @@
+# Exact instruction counts, one function per line: `symbol ir`.
+#
+# Measured by `scripts/count-ops.sh check` under the test filter ops.yml
+# passes (currently quic::tests::pem_wraps_at_sixty_four_columns). `ir` is
+# retired instructions under callgrind, exact across machines. A row whose
+# value is UNBLESSED fails the check while printing the measured count: copy
+# that number here only after reading the diff it came from and deciding the
+# added or removed instructions are the change intended — never to silence
+# the gate. Nearby code growth can shift a row by a few instructions under
+# thin-LTO without touching the function; that re-bless names the nearby
+# diff as its cause, same as any other. Symbols must be unique substrings
+# (see count-ops.sh); tiny helpers vanish into their callers under release
+# inlining even with line tables, so gate the caller that survives, not the
+# leaf that does not. The syscall table the script prints alongside is
+# information, not a gate.
+# Re-blessed 2653 by 37eeb71: its loopback ladder test is one more test in the
+# same ferrox-app bin, putting back the 13 Ir that 08949a2's took out; quic.rs untouched.
+# Re-blessed 2653 by adf4a10: the Foxy lane's loopback module grows four tests
+# and their edge helpers, the lane's two carriers being a stack in the same
+# ferrox-app bin whose release layout `der_to_pem` is measured in, so the row
+# moves by the 13 Ir a test count moves it by, without `der_to_pem` changing:
+# quic.rs is untouched, and `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2653 by muse-ferrox: the TLS-first server accept adds five
+# serve_session_* helpers, session_halves, SessionSink and one production
+# loopback test to the same ferrox-app bin, putting back the 13 Ir that
+# 3c878f5's took out; quic.rs untouched.
+
+# Re-blessed 2653 by opt-ss3: the downlink window and its bulk-read gate join
+# the same ferrox-app bin, putting back the 13 Ir the H2 landing took out;
+# quic.rs untouched.
+
+# Re-blessed 2640 by opt-grpc-writev: the gRPC lane gains one pointer-identity
+# witness test in the same ferrox-app bin, taking the 13 Ir the release layout
+# put at 2653 back out; `der_to_pem` and quic.rs are untouched.
+# Re-blessed 2653 by vmess-auto-aes: the VMess lane gains one header/flow
+# cipher-consistency test in the same ferrox-app bin, putting the 13 Ir the
+# release layout moves with a test count back in; `der_to_pem` and quic.rs are
+# untouched, and `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2640 by hunt-trojan-deadline: the raw Trojan handshake bound and its
+# parked-peer test join the same ferrox-app bin, taking the 13 Ir the release
+# layout put at 2653 back out; `der_to_pem` and quic.rs are untouched, and
+# `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2653 by hunt-vmess-deadline: the raw VMess handshake bound and its
+# parked-peer test join the same ferrox-app bin, putting the 13 Ir the release
+# layout moves with a code/test count back in; `der_to_pem` and quic.rs are
+# untouched, and `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2640 by hunt-h2-headcap: the header-block reassembly guard and its
+# overflow gate test join the same ferrox-app bin, taking the 13 Ir the release
+# layout put at 2653 back out; `der_to_pem` and quic.rs are untouched, and
+# `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2653 by hpack-fused-probe: the HPACK Huffman decoder fuses its
+# per-length first/count tables into one probe in ferrox-core, which the
+# ferrox-app bin links, so the release layout shifts by the 13 Ir a code move
+# costs it; `der_to_pem` and quic.rs are untouched, and
+# `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2680 by wip-mux-quic: the QUIC server role joins the ferrox-app
+# bin with serve_vless_quic, serve_vless_quic_inbound and send_credit_wait plus
+# their pooled-connection loopback tests, shifting the thin-LTO release layout
+# by ~two code/test-count moves; the `der_to_pem` body is byte-for-byte
+# unchanged from main, and `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2667 by foxy-signin-trim: the Foxy sign-in trim in login() and its
+# one loopback witness test join the same ferrox-app bin, taking the 13 Ir the
+# thin-LTO release layout moves with a code/test count back out; `der_to_pem`
+# and quic.rs are byte-for-byte untouched, and
+# `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2680 by foxy-signin-normalize: the identity/code normalizers and
+# their one extra loopback witness test join the same ferrox-app bin, putting
+# the 13 Ir the thin-LTO release layout moves with a code/test count back in;
+# `der_to_pem` and quic.rs are byte-for-byte untouched, and
+# `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2667 by xhttp-extra: the `extra` precedence block in `from_json` and
+# its one witness test join the same ferrox-app bin, taking the 13 Ir the
+# thin-LTO release layout moves with a code/test count back out; `der_to_pem`
+# and quic.rs are byte-for-byte untouched, and
+# `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2680 by hunt-reality-client-auth: the REALITY client pump and its
+# one withheld-answer witness test join the same ferrox-app bin, putting the
+# 13 Ir the thin-LTO release layout moves with a code/test count back in;
+# `der_to_pem` and quic.rs are byte-for-byte untouched, and
+# `pem_wraps_at_sixty_four_columns` still passes.
+# Row moves from `der_to_pem` to `append_pem` by opt-der-pem-capacity: after the
+# exact-capacity reservation `der_to_pem` is a thin wrapper (`Vec::with_capacity
+# (pem_capacity(..))`, one call, return) that release inlines away, so no
+# callgrind frame carries its name; the PEM body survives as
+# `ferrox_app::quic::append_pem`, which is what `pem_wraps_at_sixty_four_columns`
+# now executes through it.
+# Re-blessed 1205 by opt-der-pem-capacity: the fill loop lost the log(n) growth
+# reallocs and their repeated prefix re-copies, because `Vec::with_capacity
+# (pem_capacity(..))` in the caller opens the buffer to its exact length and the
+# `reserve` inside `append_pem` is then a no-op; `base64_encode_block` and the
+# wire bytes are unchanged, and the three witnesses (capacity==len,
+# pointer-identity append, pad/wrap round-trip) all pass on every OS. The frame
+# is smaller than the old `der_to_pem 2680` also because the `with_capacity`
+# alloc now sits in the caller (inlined into the test), so the blessed count
+# measures only the fill — the two facts together explain the drop.
+
+# Re-blessed 665 by opt-b64-encode-block: base64_encode_block stopped building
+# each group's word through a serial shift-and-or chain and stopped running a
+# four-iteration slot loop that re-multiplied 18-6*slot and branched on the pad
+# count per sextet. A full three-byte group is four fixed-shift stores now, and
+# the wrapped line is sixteen of them, so append_pem loses the loop control, the
+# per-slot multiply, the pad branch and the serial shifts it no longer pays for.
+# der_to_pem and the wire bytes are unchanged; base64_matches_the_rfc_vectors
+# (empty, one-byte, two-byte, full and wrapped-tail groups) plus
+# pem_survives_the_pad_and_wrap_boundaries pass on linux, macos and windows.
+# Re-blessed 615 by opt-b64-fullline: base64_encode_block gained a `bytes.len()
+# == 48` fast path for the full PEM line (every chunk but the last), a fixed-range
+# `for gi in 0..16` whose byte and output indices are provable in-bounds induction
+# variables, so the line encodes with no per-access bounds check and no per-group
+# slice re-slicing. The 48-byte input yields the same 64 output bytes in the same
+# order; pem_wraps_at_sixty_four_columns (a single 48-byte chunk) is the driver,
+# and base64_matches_the_rfc_vectors still walks the short tail through the general
+# path, all green on linux, macos and windows.
+# Re-blessed 591 by opt-append-pem-no-rescan: append_pem dropped its own
+# `pem.reserve(pem_capacity(..))`. Every caller opens the buffer first (der_to_pem
+# at the exact pem_capacity, the QUIC chain and CA bundle at the summed capacity
+# of all their blocks), so the per-block reserve only recomputed pem_capacity's
+# integer arithmetic and hit a no-op capacity check inside the measured frame. The
+# fill lands in already-live capacity either way, so no realloc fires and the bytes
+# are the same concatenation; a_pem_buffer_is_reserved_to_its_exact_length
+# (len == capacity over 12 lengths) and appending_into_a_reserved_buffer_does_not_move_it
+# (pointer identity across two appends) witness it, green on linux, macos and windows.
+# Re-blessed 562 by tls-own-the-list: `der_to_pem` is test-only now, so its
+# test-only instantiation inlines the same `append_pem` body at 562 instead of
+# 591; the bytes, `pem_wraps_at_sixty_four_columns`, and every base64 vector are
+# unchanged.
+
+append_pem 562
+
+# Re-blessed 47810992 by the once-per-question fold: the decide probe's frame is
+# 4096 walks of one direct forward, one rule return, two hijacks and one
+# malformed name. The inline question and rule buffers moved it from 55544745
+# (c6099e2) to 60123580; folding the name once per question instead of once per
+# domain rule moved it to 47810992, the ops run on 86e28e9.
+# Re-blessed 51892686 by the vless-encryption module: dns.rs is untouched. The
+# new module moved `decide` into the probe's own frame under thin LTO, so the
+# probe now carries the five calls it makes per turn (4096 turns) instead of
+# pricing them as callees; the bytes and decisions are unchanged.
+# Re-blessed 51892694 by the VLESS record-buffer reuse, which moves the same
+# frame's inlining by eight instructions; the bytes and decisions are unchanged.
+# Re-blessed 51892734 by the b64 one-pass decoder and raw encoder: dns.rs is
+# untouched; the same test binary's thin-LTO inlining moved the frame 54
+# instructions from 51892680, and the bytes and decisions are unchanged.
+# Re-blessed 51892686 by the VLESS record-header timeout fix: dns.rs is untouched;
+# the same test binary's thin-LTO inlining moved the frame 48 instructions back.
+# Re-blessed 51892734 by the TLS identity layout (#934): dns.rs is untouched; the
+# same thin-LTO frame moved 48 instructions forward again, bytes and decisions unchanged.
+# Re-blessed 51892694 by the sealed-record read side (89df8114) and the head
+# walk's signed cast (533fbb29): dns.rs is byte-identical to main's and the probe
+# still walks its five decisions 4096 times, so the 40 retired instructions are
+# not a multiple of that walk -- the loop that decides is unchanged and the move
+# is in the frame's own setup, the layout drift this row has recorded before.
+# Re-blessed 51892686 by the foxy growing-head resume: dns.rs is untouched; the same
+# test binary's thin-LTO inlining moved the frame eight instructions back, bytes and
+# decisions unchanged.
+# Re-blessed 51892694 by the sliced Vision seal: dns.rs is untouched; the same
+# ferrox-core lib test binary gained the sliced-record tests, and thin-LTO moved the
+# frame eight instructions forward; the five decisions and bytes are unchanged.
+# Re-blessed 51892686 by the ferrox-core landings after that blessing (masque,
+# the tun checksum walk, the quic/vision findings): dns.rs is untouched and the
+# probe still walks its five decisions 4096 times, so the eight instructions are
+# not a multiple of that walk -- the loop that decides is unchanged and the move
+# is in the frame's setup, measured in the pinned userspace below.
+# Re-blessed 51893400 by p2-socks: the SOCKS4 request writer and its witness test
+# join ferrox-core, shifting this probe's thin-LTO frame; dns.rs is untouched and
+# the five decisions still walk 4096 times.
+# The 51893400 is not reproduced on main 675c21a3d: the same tree measures
+# 51893352 twice, and 48 is not a multiple of the 4096-turn walk, so the five
+# decisions are unchanged and the move is in the frame's setup.
+# Re-blessed 51893190 by p2-ech: the in-place HPKE seal and its witness test in
+# ferrox-core shift this probe's thin-LTO frame back; dns.rs is untouched and
+# the five decisions still walk 4096 times.
+# Re-blessed 51893352 by the grpc re-base: the tls version bounds (#1555) shift
+# this probe's thin-LTO frame back to the pre-ech 51893352; dns.rs is untouched
+# and the five decisions still walk 4096 times. ops.yml run 43329638157.
+# Re-blessed 51893238 on p2-socks: the SOCKS address and datagram writes move this
+# probe back under the grpc re-base; dns.rs is untouched and the five decisions
+# still walk 4096 times. ops.yml run 43344587778.
+# Measured with Rust 1.99.1, Ubuntu 24.04, glibc 2.39 and Valgrind 3.22.0;
+# the identical binary reproduces CI in that userspace; other profiling userspaces differ.
+# Re-blessed 51893400 on main 96d147c9: the carried vless-encryption layout moved it; dns.rs is untouched. ops.yml run 43373102520.
+# Re-blessed 51893238 by the cover re-base: the in-place cover shifts this
+# probe's frame back; dns.rs is untouched and the five decisions still walk
+# 4096 times. ops.yml run 43378506875.
+# Re-blessed 51893360 on e12773a6 with the clean-target ops job: an empty target
+# (cache-targets: false) reproduces this frame, as the cached runs did; dns.rs is
+# untouched and the five decisions still walk 4096 times. ops.yml run 43430333461.
+# The audit's added code moved this frame back to the e12773a6 pair: dns.rs is untouched
+# and the five decisions still walk 4096 times. ops.yml run 43548610074.
+# Re-blessed 51893198 by p2-kcp-mkcp: the receive guard, the rejected-payload
+# recycle and their witness tests move the same ferrox-core test binary's
+# thin-LTO layout; dns.rs is untouched and the five decisions still walk 4096
+# times. ops.yml run 43603010310.
+# Re-blessed 51893400 by the ferrox-core re-land (#38, #39): the added modules moved this
+# test binary's thin-LTO layout by forty instructions; dns.rs is untouched and the five
+# decisions still walk 4096 times. ops.yml run 43806222498.
+# Re-blessed 52343912 by main's SOCKS guards and mux header initialization
+# (aa2db45, feb11e7): the added code moved this test binary's thin-LTO layout;
+# dns.rs is untouched and the five decisions still walk 4096 times. ops.yml run
+# 44015809956.
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 52343912 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+# Re-blessed 16896 by the Vision walk's local state: the parser probe (512
+# empty frames) read and wrote every Walk field through self each turn and
+# loaded the five header bytes one at a time. It now keeps the cursor and the
+# Walk in registers and writes them back once, and parses the header as one
+# slice; the bytes, commands and frames are unchanged.
+# Re-blessed 30208 by the whole-frame vision walk: the probe now carries six
+# content bytes and four padding bytes per frame, with the filter spent and no
+# caller buffer, because the empty-frame probe walked no content and could not
+# see the one-pass delivery. The same probe priced the old walk at 35584 in the
+# same binary: 5376 fewer, 15.1%. The frames, commands and bytes are unchanged.
+# Re-blessed 30848 by the empty-Continue yield: pump stops at a content-free
+# Continue frame so the shared read returns Interrupted and drops the session
+# lock. The probe walks 512 content frames, so the two held==0 checks add 1216;
+# the frames, commands and bytes are unchanged.
+# Re-blessed 26240 by the hoisted caller window: the frame loop reads the
+# caller buffer's length once instead of matching the Option per frame, and one
+# at/next pair advances the cursor where two dot updates stood. The probe drops
+# 4608 (14.9%); the frames, commands and bytes are unchanged.
+# Re-blessed 26304 by the PR 31/44 landing (e92912b) on main, not by this
+# branch: the probe measures that tree's frame walk. ops.yml run 44245430676.
+ferrox_app::vision::tests::Fake::pump 26304 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
+
+# Blessed 1170 by the mux rendezvous: the domain arm compares the host against
+# `v1.mux.cool` before the resolver, which is three instructions on every domain
+# header and lets a mux request skip resolution. The frame was 1167 after the
+# byte-level IPv4 reader, 1315 after the literal arm and key fold, 80397/80812
+# before them; the reads, wire bytes, leading-zero refusal and the resolver path
+# for a real name are unchanged.
+# The stats landing (#1722) split the parser into `decode_trojan_request_index`, so
+# the wrapper the probe names now pays one call and a destructure: 1170 -> 1182.
+# Re-blessed 1292 by the proxy landings on main (a737c11, 4f4658a, ce26e56),
+# not by this branch: main's own ops is red on this row. ops.yml run 44245430676.
+proxy::decode_trojan_request 1292 proxy::tests::the_trojan_header_costs_two_reads_not_seven
+
+# Blessed 73251 by grpc-common-varint: the probe's one-byte varints and sub-128
+# envelope lengths now take a straight path instead of the loop; the same row
+# read 86563 on the same base, so the loops took 13312 (15.4%) out. This probe's
+# messages do not walk the two-byte envelope path; the wide probe below does.
+# The messages, offsets, prefixes and bytes are unchanged.
+grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else 73251 grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
+# The wide probe reads the 16375-byte envelope and Hunk a relay read carries,
+# where both lengths take two bytes. Blessed 332283 by grpc-read-straight
+# (ops.yml run 43313013240): 4096 two-byte Hunk lengths of 16375 take the
+# straight read, against 430587
+# for the field walk in run 43298148854, so 98304 (22.8%) came out. The fast
+# read is compiled only into the wide monomorph, so the one-byte row above
+# keeps its 73251 walk.
+grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else 332283 grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else
+# Blessed 102414 by grpc-common-varint-write: 4096 two-byte Hunk lengths of
+# 16375 now take the direct write, against 118798 for the byte loop on the same
+# run, so the loop took 16384 (13.8%) out. The read keeps its loop: a direct
+# two/three-byte read moved the one-byte probe above to 84003, so that rewrite
+# did not land. The bytes, lengths and the 73251 row are unchanged.
+grpc::tests::direct_write_probe 102414 grpc::tests::the_direct_write_costs_the_second_byte_and_nothing_else
+# Blessed 147461 by grpc-multi-payload-fit: the multi writer's payload fit was a
+# one-byte walk; the closed form lands on the same payload with two length
+# lookups. The walk reads 311301 on the same probe (run 43408759589), so 163840
+# (52.6%) came out; the chosen payload is equal at every cap 8..=70000 and the
+# bytes, frames and window splits are unchanged.
+grpc::tests::multi_payload_probe 147461 grpc::tests::the_multi_payload_fixed_point_costs_less_than_the_walk
+# sniff::Sniffing::inspect is reported in scripts/method-ops.txt, not gated:
+# its loopback probe's frame has read 1228 and 1231 on the same source, so an
+# exact row here would be a coin flip. The probe test still asserts the domain
+# and the allocation ceiling; the page's number is the latest report.
+# The wireguard routing test runs both lookups over 512 peers: the peer-by-peer
+# scan and the prefix table for the same destination. Both rows come from one
+# test and one binary, so their difference is the lookup and not the build.
+ferrox_app::wg::tests::route_scan_once 68609 wg::tests::a_prefix_table_picks_the_peer_the_scan_picks
+ferrox_app::wg::tests::route_table_once 585 wg::tests::a_prefix_table_picks_the_peer_the_scan_picks
+# The same eight-octet QUIC varint decoded 4096 times: the one-load read reports
+# 131079 and the byte walk 360460, so the load takes 229381 (63.6%) out. The
+# values, offsets and refusals are unchanged.
+# (The byte row stays in scripts/method-ops.txt as the comparison.)
+ferrox_app::psiphon_quic::tests::word_varint_probe 131079 psiphon_quic::tests::the_word_varint_read_costs_the_load_and_nothing_else
+# The four-slice SSH packet sealed 4096 times through the direct write reports
+# 47483770; flattening the same slices into one and sealing that reports
+# 47621526 on the current base. The direct probe is 137756 (0.29%) lower, a net
+# that includes the flatten copy and the four-slices-versus-one effect, not the
+# previous writer's framing loop. The bytes and their order are unchanged; the
+# direct row moved by 8192 (two instructions per write) when removing the udp
+# serve wrappers changed the thin-LTO inlining of the multi-slice branch, and
+# the flattened row by 12 in its setup. Both moves are in this test binary's
+# layout, not in the source of `write_slices`.
+# Re-blessed 47483770 by the rebase onto main: the shadowsocks reply grace
+# (#1536) joins the same ferrox-app bin and puts the 8192 back in the direct
+# row's multi-slice branch; psiphon_shadowsocks.rs is untouched.
+# The rebase onto 4d472b16 takes the 8192 back out of that branch: the h3 xhttp,
+# browser-dialer and finalmask merges join the same bin; psiphon_shadowsocks.rs
+# is untouched. ops.yml run 43555173581.
+# The rebase onto 72406110 puts the 8192 back in: the GSO read and the psiphon
+# timeouts join the same bin; psiphon_shadowsocks.rs is untouched. ops.yml run
+# 43558930890.
+# Retired as a gate: one tree measured 47475578 (ops.yml run 43704006483, on
+# 73d2d9652) and 47483770 (run 43706561000, on 73d2d9652 plus documentation
+# only), the same 8192 the row's history above tracks. The 8192 is two
+# instructions per write in the multi-slice branch, so the probe follows each
+# build's memcpy path, not a change in `write_slices`; a number two runs of one
+# tree disagree on is not a gate. The page carries both measurements.
+# Re-blessed 47621538: the xhttp size-line probe adds one test to the same
+# ferrox-app bin, and the release layout puts the 12 Ir back that removing the
+# udp serve wrappers took out; psiphon_shadowsocks.rs is untouched.
+# Re-blessed 47621526 by p2-socks: the SOCKS front's borrowed account and the
+# client datagram's two-part send change the same ferrox-app bin's layout;
+# psiphon_shadowsocks.rs is untouched.
+# Re-blessed 47621538 by p2-ech: the in-place HPKE seal and its witness test
+# change the same ferrox-app bin's layout; psiphon_shadowsocks.rs is untouched.
+# Re-blessed 47621526 by the grpc wide read: the straight read changes the same
+# ferrox-app bin's layout; psiphon_shadowsocks.rs is untouched. ops.yml run
+# 43329638157.
+# Re-blessed 47621538 on p2-socks: the SOCKS address and datagram writes move this
+# probe forward under the grpc wide read; psiphon_shadowsocks.rs is untouched.
+# ops.yml run 43344587778.
+# Re-blessed 47621526 on main 96d147c9: the carried vless-encryption layout moved it; psiphon_shadowsocks.rs is untouched. ops.yml run 43373102520.
+# Re-blessed 47621538 by the cover re-base: the same frame shift in the
+# ferrox-app bin; psiphon_shadowsocks.rs is untouched. ops.yml run 43378506875.
+# Re-blessed 47621526 on e12773a6 with the clean-target ops job: the same frame
+# shift in the ferrox-app bin, reproduced from an empty target; psiphon_shadowsocks.rs
+# is untouched. ops.yml run 43430333461.
+# The same added code moved this ferrox-app frame back to the e12773a6 pair;
+# psiphon_shadowsocks.rs is untouched. ops.yml run 43548610074.
+# Re-blessed 47621538 by p2-kcp-mkcp: the KCP receive path and its witness tests
+# link into the same ferrox-app bin, moving its thin-LTO layout;
+# psiphon_shadowsocks.rs is untouched. ops.yml run 43603010310.
+# Re-blessed 47810162 by the KCP sockopt and ack-batch tests: the added code
+# links into the same ferrox-app bin, moving its thin-LTO layout;
+# psiphon_shadowsocks.rs is untouched. ops.yml run 43968877918.
+# Re-blessed 47810192 on main df177ae: the rebase moved the same ferrox-app
+# thin-LTO layout another thirty instructions; psiphon_shadowsocks.rs is
+# untouched. ops.yml run 43989485702.
+ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47810192 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
+# The fused size-line walk: 256 turns over a twelve-byte line, the first digit
+# changed each turn so the call is not hoisted. The hex run is parsed in place
+# and only a non-closing terminator pays a second, CRLF-only pass; the line is
+# never copied. Nothing on the wire moves. Re-blessed 33046 by that rewrite.
+ferrox_app::xhttp::tests::xhttp_line_probe 33046 xhttp::tests::the_chunk_line_costs_one_walk
+# The merged hello: 256 fixed 300-octet hellos cut at widths 11 and 37 through
+# one stage with a single zero delay, over a sink that takes a whole gathered
+# write and keeps nothing. 345889 is 1351.1 per turn; the two widths and the
+# zero delay never draw, so the probe prices the cuts and the 32-record gather.
+# The record bytes are the same as the merge-copy path this replaced.
+# Re-blessed from 317726 by main's finalmask range fix (aa2db45) and xmc write
+# and length contracts (7678f98): the zero delay still selects the low bound and
+# the cuts are unchanged, while the widened span and the added code moved this
+# test binary's thin-LTO layout. ops.yml run 44009241010.
+# Re-blessed 345889 by the sni-mode branch in `Fragment::write`: the width path
+# still answers 256 * whole.len and draws the same cuts, while the extra arm
+# moved this test binary's thin-LTO layout. ops.yml run 44032106261.
+# Re-blessed 348194 by the hello gate: 256 turns now test `hello_done` and ask
+# `hello_shape` once before the dispatch, so the cuts, the gather and the bytes
+# are unchanged and the probe still resets both counters per turn. The probe
+# times one hello per stream, as the gate intends. ops.yml run 44120794571.
+# Re-blessed 349989 by `hello_skip`, the counter that keeps a forwarded record's
+# continuation out of the cutter: one branch per turn, no new draw, copy or
+# write, and the probe still resets every counter it uses. ops.yml run
+# 44130371666.
+# Re-blessed 347940 by two removals in the hello path: the gate hands the parsed
+# record length to the cutter instead of asking `hello_shape` twice, and the
+# label cuts are shifted and filtered in their own vec instead of collected into
+# a second one. Eight instructions and one allocation fewer per hello, same
+# bytes, same draws, same writes. ops.yml run 44215224558.
+# Re-blessed 347421 after the decoy scan moved out of the merged path and the
+# branch rebased onto ce26e56: 256 hellos, 10 instructions fewer than the 349989
+# the hello gate left, same bytes, same draws, same writes. ops.yml run
+# 44245430676.
+ferrox_core::finalmask::tests::merged_hello_probe 347421 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
+# The client request built by `request`: one address type byte, the address and
+# the port, written in one match with the vector's room reserved exactly once,
+# through `spare_capacity_mut` and one `copy_nonoverlapping` per field so no
+# reference is formed over uninitialized memory and no byte loop runs. The copy
+# stays one pass, a block per field; the oracle test replays the pinned Go
+# writer's bytes.
+# Re-blessed 895 by main's SOCKS name-length guards (#145): the assert in
+# `Target::Name` adds six instructions over the oracle's six lines, and every
+# byte still matches the pinned Go writer. ops.yml run 44015809956.
+ferrox_core::socks::request 895 socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
+# The sealed record write: 256 turns over a four-part Vision frame (uuid, five-byte
+# head, seven 8 KiB payload records, trailer) through an AES engine and a discard
+# sink. A record wholly inside the payload part is sealed from that part, so only
+# the two records that cross a part boundary are copied; 50874900 is 198730.1 per turn.
+# Re-blessed from 50871336 by the KCP sockopt and ack-batch tests: the added code
+# links into the same ferrox-core test binary, moving its thin-LTO layout;
+# vless_encryption.rs is untouched and the seal still copies only the two
+# crossing records. ops.yml run 43968877918.
+# Re-blessed to 50874900 on main df177ae by the KCP sockopt and ack-batch tests:
+# the rebase moved the same ferrox-core test binary's thin-LTO layout again;
+# vless_encryption.rs is untouched and the seal still copies only the two
+# crossing records. ops.yml run 43989485702.
+ferrox_core::vless_encryption::tests::sealed_write_probe 50874900 vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy
+# The mux decode probe: 4096 decodes of one fixed New/domain frame, so the row
+# prices the frame walk and nothing else. The probe branch built from origin/main
+# read 634880 (155 a call); splitting the frame once and fusing the status with
+# the target question read 618496 (151 a call). Main's mux identity fix (aa2db45)
+# then let `decode` ask the target alone for the UDP identity instead of also
+# requiring DATA, reading 610304 (149 a call). Every status, option and target
+# shape is held by the decoder's own sweep, so the bytes do not move.
+# Re-blessed by that fix in ops.yml run 44009241010.
+ferrox_core::mux::decode 610304 mux::tests::the_decode_probe_costs_the_frame_walk_and_nothing_else
+# The two encode probes landed with the decode change, so these rows are the
+# code they found, not a before/after pair: the first attempt to fuse the fixed
+# head and skip `clear`/`reserve` measured 884736 and 409600, 2 and 4 Ir a call
+# dearer than these, and was reverted rather than blessed. Main's header
+# initialization (feb11e7) made `encode_header_into` a frame: the probe reads
+# 507904 (124 a call), the zero fill the safe form added, in ops.yml run
+# 44015809956.
+ferrox_core::mux::Outgoing::encode_into 876544 mux::tests::the_frame_probe_costs_the_metadata_and_payload_write_and_nothing_else
+ferrox_core::mux::Outgoing::encode_header_into 507904 mux::tests::the_header_probe_costs_the_metadata_write_and_nothing_else
+# The tun render had no blessed row: this is the first, 691 for the v4 and v6
+# gso renders in ops.yml run 44345699821 that named the number as UNBLESSED.
+# Not a before/after pair -- the pseudo-header scratch buffer and the vector
+# kernel's setup on a four-octet address had already gone when it was taken.
+ferrox_app::tun::render_tcp_headers_ip 691 tun::tests::a_gso_frame_carries_the_folded_pseudo_sum

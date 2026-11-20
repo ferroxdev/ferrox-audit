@@ -1,0 +1,1254 @@
+# One row per claim a method page makes: `doc key value checker`.
+#
+# `scripts/check-method-docs.sh` requires each `docs/function/<doc>.md` counts
+# block to hold exactly these rows for `<doc>`, with the same value and the
+# same checker. A number edited in a page without editing here fails; a row
+# here with no page fails.
+#
+# `UNBLESSED` is the value this repository already uses for an instruction
+# count nobody has measured yet. `scripts/count-ops.sh` prints the real number
+# on the next Linux run; the claim stays open until it has been read, and it is
+# blessed into `scripts/expected-ops.txt` only after the diff that moved it has
+# been read. It is not a number and must never be quoted as one.
+#
+# doc key value checker
+
+# --- the rung every AEAD method sits on -------------------------------------
+record-layer ops-retired-instructions UNBLESSED scripts/count-ops.sh
+record-layer syscalls-per-megabyte UNBLESSED scripts/count-ops.sh
+record-layer user-space-copies-per-megabyte UNBLESSED no copy checker yet
+record-layer seconds-per-megabyte UNBLESSED CI bench.yml (gate 3)
+record-layer discarded-keystream-blocks 0 ferrox-bench-gate-2
+record-layer allocations-per-fill 0 ferrox-bench-gate-2
+record-layer zero-filled-bytes-per-fill 0 ferrox-bench-gate-2
+record-layer blocks-per-byte 1/64 ferrox-bench-gate-2
+record-layer blocks-per-iteration 8 ferrox-core-chacha::backend
+record-layer blocks-per-iteration-on-avx512 16 ferrox-core-chacha::backend
+record-layer fused-head-blocks 1 ferrox-core-record::tests::the_head_is_the_references_own_first_block_and_the_rest_is_unshifted
+record-layer backends-a-differential-test-cannot-lie-to 6 ferrox-bench-gate-1
+
+# --- TUIC v5 ----------------------------------------------------------------
+tuic ops-retired-instructions UNBLESSED scripts/count-ops.sh
+tuic syscalls-per-connect UNBLESSED scripts/count-ops.sh
+tuic single-fragment-payload-copies-per-packet 0 ferrox-app-tuic::tests::a_single_fragment_packet_payload_is_not_copied
+tuic nanoseconds-per-packet 13.8 .github/workflows/bench.yml
+tuic burst-walk-ns-per-frame 9.7 .github/workflows/bench.yml
+tuic address-families 3 ferrox-core-tuic::tests::the_three_address_families_match_the_wire
+tuic outbound-spellings-parsed 1 ferrox-app-tuic::tests::a_tuic_outbound_reads_the_reference_spellings
+anytls ops-retired-instructions UNBLESSED scripts/count-ops.sh
+anytls syscalls-per-connect UNBLESSED scripts/count-ops.sh
+anytls payload-copies-per-frame UNBLESSED scripts/count-ops.sh
+anytls nanoseconds-per-frame UNBLESSED .github/workflows/bench.yml
+anytls address-families 3 ferrox-app-anytls::tests::addresses_round_trip
+anytls padding-scheme-md5 75cff2ad89aadf5e257059ee571ebe11 ferrox-app-anytls::tests::the_default_padding_md5_is_the_reference_one
+anytls outbound-spellings-parsed 2 ferrox-app-anytls::tests::outbound_spellings_parse
+
+# --- Shadowsocks AEAD -------------------------------------------------------
+shadowsocks ops-retired-instructions UNBLESSED scripts/count-ops.sh
+shadowsocks aead-calls-per-chunk 2 ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
+shadowsocks maximum-payload-per-chunk 16383 ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
+shadowsocks write-syscalls-per-64KiB-relay-read 1 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
+shadowsocks payload-chunks-per-64KiB-relay-read 4 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
+shadowsocks read-syscalls-per-64KiB-relay-read 1 ferrox-app-shadowsocks::tests::one_relay_read_asks_for_every_slot_of_a_batch
+shadowsocks target-write-syscalls-per-opened-batch 1 ferrox-app-shadowsocks::tests::a_bulk_read_serves_every_buffered_chunk
+shadowsocks reads-spent-waiting-for-an-incomplete-chunk 0 ferrox-app-shadowsocks::tests::a_batch_never_waits_for_a_chunk_that_has_not_arrived
+shadowsocks user-space-copies-per-byte-written 0 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
+shadowsocks user-space-copies-per-byte-read 0 ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage
+shadowsocks chunk-buffer-allocations-per-connection 1 ferrox-app-shadowsocks::tests::a_bulk_read_serves_every_buffered_chunk
+shadowsocks udp-payload-buffers-per-datagram 1 ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes
+shadowsocks udp-datagram-reallocations-after-the-first 0 ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes
+shadowsocks subkey-heap-buffers-per-connection 1 ferrox-core-shadowsocks::tests::a_cipher_is_one_heap_buffer
+shadowsocks udp-datagram-heap-buffers-per-datagram 0 ferrox-core-shadowsocks::tests::a_rekeyed_cipher_streams_datagrams_without_heap_traffic
+shadowsocks stream-iv-bytes-per-handshake 16 ferrox-app-shadowsocks::tests::stream_relays_an_echo
+shadowsocks stream-write-syscalls-per-relay-read 1 ferrox-app-shadowsocks::tests::stream_relay_read_becomes_one_write
+shadowsocks stream-crypt-allocations-per-call 0 ferrox-core-shadowsocks::tests::rc4_crypt_is_in_place_and_allocates_nothing
+shadowsocks stream-crypt-copies-per-byte 0 ferrox-core-shadowsocks::tests::rc4_crypt_is_in_place_and_allocates_nothing
+shadowsocks downlink-stage-bytes-per-connection 0 ferrox-app-shadowsocks::tests::the_carrier_and_the_window_ask_the_socket_as_one
+shadowsocks stream-downlink-stage-bytes-per-connection 0 ferrox-app-shadowsocks::tests::the_stream_downlink_asks_its_own_chunk_of_the_socket
+shadowsocks stream-udp-payload-buffers-per-datagram 1 ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes
+shadowsocks stream-udp-datagram-reallocations-after-the-first 0 ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes
+
+# --- Shadowsocks 2022 -------------------------------------------------------
+shadowsocks-2022 ops-retired-instructions UNBLESSED scripts/count-ops.sh
+shadowsocks-2022 seconds-per-megabyte UNBLESSED CI benchmark-matrix.yml (no per-cipher cell)
+shadowsocks-2022 aead-calls-per-chunk 2 ferrox-core-shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
+shadowsocks-2022 maximum-payload-per-chunk 65535 ferrox-core-shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
+shadowsocks-2022 write-syscalls-per-16KiB-relay-read 1 ferrox-app-shadowsocks2022::tests::one_relay_read_becomes_one_write_and_reads_back_whole
+shadowsocks-2022 client-handshake-write-syscalls 1 ferrox-app-shadowsocks2022::tests::a_client_handshake_leaves_in_one_write
+shadowsocks-2022 response-head-segments-before-the-payload 1 ferrox-app-shadowsocks2022::tests::the_response_salt_and_fixed_header_leave_in_one_write
+shadowsocks-2022 payload-chunks-per-16KiB-relay-read 1 ferrox-app-shadowsocks2022::tests::one_relay_read_becomes_one_write_and_reads_back_whole
+shadowsocks-2022 user-space-copies-per-byte-written 0 ferrox-app-shadowsocks2022::tests::one_relay_read_becomes_one_write_and_reads_back_whole
+shadowsocks-2022 user-space-copies-per-byte-read 0 ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage
+shadowsocks-2022 zero-filled-bytes-per-chunk 0 ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage
+shadowsocks-2022 chunk-buffer-allocations-per-connection 1 ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage
+shadowsocks-2022 downlink-stage-bytes-per-connection 0 ferrox-app-shadowsocks2022::tests::the_carrier_and_the_window_ask_the_socket_as_one
+shadowsocks-2022 downlink-chunks-per-opened-batch 8 ferrox-app-shadowsocks2022::tests::a_bulk_read_serves_every_buffered_chunk
+shadowsocks-2022 target-write-syscalls-per-opened-batch 1 ferrox-app-shadowsocks2022::tests::a_bulk_read_serves_every_buffered_chunk
+shadowsocks-2022 reads-spent-waiting-for-an-incomplete-chunk 0 ferrox-app-shadowsocks2022::tests::a_batch_never_waits_for_a_chunk_that_has_not_arrived
+shadowsocks-2022 udp-payload-buffers-per-datagram 0 ferrox-app-shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes
+shadowsocks-2022 subkey-heap-buffers-per-connection-aes 1 ferrox-core-shadowsocks2022::tests::a_cipher_holds_one_heap_buffer_for_aes_and_none_for_chacha
+shadowsocks-2022 subkey-heap-buffers-per-connection-chacha 0 ferrox-core-shadowsocks2022::tests::a_cipher_holds_one_heap_buffer_for_aes_and_none_for_chacha
+shadowsocks-2022 subkey-heap-buffers-per-derivation 0 ferrox-core-shadowsocks2022::tests::deriving_a_session_subkey_costs_no_heap_buffer
+shadowsocks-2022 udp-multi-user-eih-bytes-per-packet 16 ferrox-app-shadowsocks2022::tests::udp_multi_user_packs_one_eih_and_opens_with_the_pinned_psk
+shadowsocks-2022 udp-relay-header-bytes-stripped-per-packet 16 ferrox-app-shadowsocks2022::tests::udp_relay_strips_one_header_and_still_opens
+shadowsocks-2022 udp-relay-forward-reallocations-after-the-first 0 ferrox-app-shadowsocks2022::tests::a_forwarded_datagram_is_written_into_a_buffer_that_stops_growing
+shadowsocks-2022 udp-relay-reply-reallocations-after-the-first 0 ferrox-app-shadowsocks2022::tests::a_reply_body_is_opened_into_a_buffer_that_stops_growing
+shadowsocks-2022 udp-server-reply-client-session-bytes 8 ferrox-app-shadowsocks2022::tests::udp_server_replies_are_server_typed_and_stay_with_their_session
+
+# --- VMess AEAD -------------------------------------------------------------
+vmess ops-retired-instructions UNBLESSED scripts/count-ops.sh
+vmess maximum-payload-per-frame 8192 ferrox-app-vmess::tests::frames_seal_to_stable_bytes
+vmess frames-per-write-syscall 16 ferrox-app-vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time
+vmess write-syscalls-per-128KiB-batch 1 ferrox-app-vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time
+vmess frame-buffer-allocations-per-relay-write 0 ferrox-app-vmess::tests::frames_reuse_the_callers_buffers
+vmess frames-per-plain-write 16 ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write
+vmess plain-write-syscalls-per-16-frame-batch 1 ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write
+vmess carrier-reads-per-two-max-batches 2 ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write
+vmess pump-buffer-allocations-per-batch 0 ferrox-app-vmess::tests::the_pump_gathers_into_its_own_buffer_and_never_moves_it
+vmess first-frame-moves-per-batch 0 ferrox-app-vmess::tests::the_pump_gathers_into_its_own_buffer_and_never_moves_it
+vmess frame-moves-per-vectored-batch 0 ferrox-app-vmess::tests::a_batch_hands_each_frame_back_where_it_landed
+vmess web-socket-staging-copies-per-batch 0 ferrox-app-vmess::tests::a_sealed_batch_reaches_a_web_socket_carrier_where_it_lies
+vmess web-socket-carrier-bytes-opened-at-most 1024 ferrox-app-vmess::tests::a_web_socket_carrier_opens_no_batch_buffer
+vmess counters-per-frame 1 ferrox-app-vmess::tests::counters_advance_one_per_frame_at_any_offset
+vmess replay-keys-held-at-most 131072 ferrox-app-vmess::tests::the_window_holds_two_rotations_at_most
+vmess zero-filled-bytes-per-flow 404609 ferrox-app-vmess::tests::the_flows_windows_are_zeroed_once
+vmess response-header-allocations-per-read 0 ferrox-app-vmess::tests::a_response_header_reads_without_allocating
+vmess carrier-reads-per-full-window-of-datagram-frames-at-most 2 ferrox-app-vmess::tests::the_datagram_pump_reads_the_carrier_through_its_window
+shadowsocks host-port-strings-per-datagram 0 ferrox-app-shadowsocks::tests::a_datagram_target_is_resolved_without_a_host_port_string
+
+# --- VLESS ------------------------------------------------------------------
+vless ops-retired-instructions UNBLESSED scripts/count-ops.sh
+vless syscalls-per-request UNBLESSED no syscall checker yet
+vless request-header-allocations 0 ferrox-bench-gate-2
+vless request-header-bytes-zero-filled 0 ferrox-bench-gate-2
+vless address-families-encoded 4 ferrox-core-vless::tests::header_address_families_encode_stably
+vless reality-outbound-rows-dialled 6 ferrox-app-proxy::tests::vless_outbound_with_reality_dials_raw_and_every_carrier
+vless vision-header-targets-matching-core 2 ferrox-app-proxy::tests::vision_header_matches_the_core_encoder
+vless dial-header-reallocations 0 ferrox-app-proxy::tests::dial_headers_are_sized_to_the_bytes_they_hold
+vless dial-header-allocations 0 ferrox-app-proxy::tests::the_vless_dial_header_allocates_nothing
+vless request-header-reads 4 ferrox-app-proxy::tests::the_vless_request_header_costs_four_reads_not_six
+vless request-parse-allocations 0 ferrox-core-vless::tests::the_request_parse_allocates_nothing_and_borrows_the_name
+vless request-parse-name-copies 0 ferrox-core-vless::tests::the_request_parse_allocates_nothing_and_borrows_the_name
+vless request-flow-decisions 1 ferrox-core-vless::tests::the_flow_is_named_without_building_a_string
+vless handshake-pump-buffer-reallocations 0 ferrox-app-proxy::tests::the_pump_forwards_its_buffer_by_pointer_and_holds_capacity_steady
+vless sealed-relay-min-window-bytes 16384 ferrox-app-proxy::tests::a_sealed_relay_reads_at_least_one_record
+vless sealed-record-read-buffers 1 ferrox-core-vless::tests::a_record_is_opened_in_the_buffer_it_landed_in
+vless sealed-record-buffer-moves 0 ferrox-core-vless::tests::a_record_is_opened_in_the_buffer_it_landed_in
+vless sealed-record-buffer-growth 0 ferrox-core-vless::tests::a_record_is_opened_in_the_buffer_it_landed_in
+vless sealed-record-sizes-swept 12 ferrox-core-vless::tests::a_record_of_any_size_reads_back_the_octets_that_were_written
+vless sealed-record-writes-per-batch 1 ferrox-core-vless::tests::a_batched_record_write_is_one_call_and_the_same_bytes
+vless sealed-record-copies 2 ferrox-core-vless::tests::a_record_inside_one_part_is_sealed_from_that_part
+vless sealed-record-write-instructions 50874900 scripts/count-ops.sh
+
+# --- Trojan -----------------------------------------------------------------
+trojan ops-retired-instructions 1292 scripts/count-ops.sh
+trojan syscalls-per-handshake UNBLESSED scripts/count-ops.sh
+trojan trojan-tls-raw-down-8-ubuntu-x86-64-mib-per-second 2814.1 CI benchmark-matrix.yml trojan-tls-raw-down-8
+trojan password-bytes-on-the-wire 56 ferrox-app-proxy::tests::trojan_key_is_sha224_hex
+trojan framing-bytes-added-after-the-header 0 ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers
+trojan udp-length-prefix-bytes-per-datagram 2 ferrox-app-proxy::tests::trojan_udp_frames_carry
+trojan udp-carriers-holding-an-association 7 ferrox-app-proxy::tests::a_trojan_udp_association_crosses_every_carrier
+trojan reality-tcp-carriers-holding-an-echo 6 ferrox-app-proxy::tests::a_trojan_reality_inbound_answers_every_tcp_carrier
+trojan reality-kcp-pairs-holding-an-echo 1 ferrox-app-proxy::tests::a_trojan_reality_kcp_inbound_answers_the_session
+trojan mux-tcp-carriers-holding-a-stream 21 ferrox-app-proxy::tests::a_trojan_mux_carries_a_tcp_stream_over_every_carrier
+trojan mux-udp-carriers-holding-an-association 4 ferrox-app-proxy::tests::a_trojan_mux_carries_a_udp_association_over_raw_and_reality
+
+# --- XTLS Vision ------------------------------------------------------------
+xtls-vision ops-retired-instructions 26304 scripts/count-ops.sh
+xtls-vision syscalls-per-framed-read UNBLESSED scripts/count-ops.sh
+xtls-vision seconds-per-framed-read UNBLESSED CI bench.yml (no cell yet)
+xtls-vision padding-command-bytes 5 ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid
+xtls-vision first-frame-uuid-bytes 16 ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid
+xtls-vision largest-framed-block-bytes 8171 ferrox-app-vision::tests::a_bulk_write_frames_every_block_inside_the_bound
+xtls-vision tls-buffers-inspected-before-the-switch 8 ferrox-app-vision::tests::both_directions_spend_the_same_filter_budget
+xtls-vision feed-bytes-zeroed-per-steady-read 0 ferrox-app-vision::tests::a_steady_read_builds_no_feed
+xtls-vision user-space-copies-per-byte-while-framed 1 ferrox-app-vision::tests::the_framing_switch_ends_the_staging
+xtls-vision user-space-copies-per-byte-after-the-switch 0 ferrox-app-vision::tests::the_framing_switch_ends_the_staging
+xtls-vision user-space-copies-per-byte-written-while-framed 0 ferrox-app-vision::tests::the_writer_hands_the_callers_payload_by_pointer
+xtls-vision uuid-bytes-copied-per-link 0 ferrox-app-vision::tests::the_writer_hands_the_uuid_by_pointer_on_the_first_frame
+xtls-vision framed-staging-buffer-bytes 16384 ferrox-app-vision::tests::the_framed_staging_buffers_stay_at_one_record
+xtls-vision framed-staging-bytes-held-after-the-switch 0 ferrox-app-vision::tests::the_framed_staging_buffers_stay_at_one_record
+xtls-vision parked-prefix-copies-into-the-walk 0 ferrox-app-vision::tests::a_preloaded_prefix_is_the_walk_window_without_a_copy
+xtls-vision command-bytes-validated-per-frame 1 ferrox-app-vision::tests::a_frame_validates_its_command_once
+xtls-vision sealed-write-allocations 0 ferrox-core-vless::tests::a_sliced_record_write_allocates_nothing_after_warmup
+xtls-vision commands-the-validator-accepts 3 ferrox-core-vless::tests::the_command_validator_accepts_three_commands
+xtls-vision seal-open-staging-allocations 0 ferrox-bench-gate-2
+xtls-vision coalesce-segment-allocations 0 ferrox-core-tls::rustls_backend::tests::the_framer_path_coalesces_without_a_heap_buffer
+xtls-vision vision-read-waits-outside-the-lock 0 ferrox-app-proxy::tests::a_vision_read_waits_outside_the_lock
+xtls-vision driven-session-opens-per-steady-read 1 ferrox-app-proxy::tests::a_steady_read_opens_the_session_once
+xtls-vision shared-state-acquisitions-per-steady-framed-write 1 ferrox-app-vision::tests::a_steady_framed_write_takes_the_shared_state_once
+xtls-vision shared-state-acquisitions-per-spent-direct-read 0 ferrox-app-vision::tests::a_spent_direct_read_takes_no_shared_state
+
+# --- Mux.Cool ---------------------------------------------------------------
+mux-cool ops-retired-instructions 610304 scripts/count-ops.sh
+mux-cool seconds-per-framed-megabyte UNBLESSED CI parity.yml
+mux-cool frame-encode-ops-retired-instructions 876544 scripts/count-ops.sh
+mux-cool header-encode-ops-retired-instructions 507904 scripts/count-ops.sh
+mux-cool maximum-frame-payload-bytes 8192 ferrox-core-mux::tests::the_decoder_refuses_only_what_it_cannot_frame
+mux-cool downlink-copies-per-byte-written 0 ferrox-app-proxy::tests::a_two_part_write_hands_the_payload_over_by_pointer
+mux-cool xudp-uplink-copies-per-byte-written 0 ferrox-app-proxy::tests::xudp_uplink_hands_the_payload_over_by_pointer
+mux-cool xudp-reply-copies-per-byte-written 0 ferrox-app-proxy::tests::a_udp_reply_hands_the_payload_over_by_pointer
+mux-cool downlink-writes-per-read-batch 1 ferrox-app-proxy::tests::a_mux_downlink_hands_a_batch_of_frames_over_in_one_call
+mux-cool demux-read-room-bytes 65536 ferrox-app-muxpool::tests::a_demux_read_asks_for_a_whole_batch_of_frames
+mux-cool codec-copies-per-byte-written 1 ferrox-core-mux::tests::a_header_plus_a_patched_length_is_the_whole_frame
+mux-cool mux-frame-allocations 0 ferrox-bench-gate-6
+mux-cool client-session-cap 8 ferrox-core-mux::tests::the_concurrency_cap_counts_live_sessions_and_not_the_ids_used
+mux-cool xudp-frame-layout-matches-upstream 1 ferrox-app-proxy::tests::xudp_frames_match_the_upstream_layout
+mux-cool sessions-per-carrier 128 ferrox-app-muxpool::tests::a_pool_runs_a_hundred_and_twenty_eight_flows_on_one_carrier
+mux-cool carrier-staging-header-reallocations 0 ferrox-app-muxpool::tests::the_frame_header_holds_its_staging_across_a_push_drain_cycle
+mux-cool datagram-sessions-freed-on-peer-end 1 ferrox-app-muxpool::tests::a_peer_end_frees_a_datagram_session
+mux-cool id-reuses-before-end 0 ferrox-app-muxpool::tests::an_id_is_not_reused_before_its_end_is_written
+mux-cool answer-head-reads-before-the-first-frame 0 ferrox-app-proxy::tests::vless_mux_opener_does_not_wait_for_the_answer_head
+mux-cool uplink-frames-per-write 8 ferrox-app-muxpool::tests::a_bulk_uplink_frames_eight_keeps_in_one_write
+
+# --- Mux variants (smux/yamux/h2mux) ----------------------------------------
+mux-variants ops-retired-instructions UNBLESSED scripts/count-ops.sh
+mux-variants syscalls-per-session UNBLESSED scripts/count-ops.sh
+mux-variants user-space-copies-per-byte-written UNBLESSED no copy checker yet
+mux-variants seconds-per-megabyte UNBLESSED CI parity.yml (no cell yet)
+mux-variants tcp-protocols-round-trip 3 ferrox-app-singmux::tests::streams_round_trip_over_each_protocol
+mux-variants udp-protocols-round-trip 3 ferrox-app-singmux::tests::datagrams_round_trip_over_each_protocol
+mux-variants padding-protocols-round-trip 3 ferrox-app-singmux::tests::padding_round_trips_over_each_protocol
+mux-variants packet-addr-protocols-round-trip 3 ferrox-app-singmux::tests::packet_addr_frames_each_datagram_with_its_destination
+mux-variants carrier-protocols-round-trip 3 ferrox-app-proxy::tests::a_vless_singmux_carries_a_tcp_stream_on_each_protocol
+mux-variants absent-protocol-keeps-mux-cool 1 ferrox-app-proxy::tests::an_absent_mux_protocol_keeps_mux_cool_and_an_explicit_one_selects_singmux
+
+# --- carriers ---------------------------------------------------------------
+carrier-websocket ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-websocket read-syscalls-per-64-frames 1 ferrox-app-ws::tests::a_read_covers_a_window_not_one_frame_header
+carrier-websocket read-ahead-window-bytes 32768 ferrox-app-ws::tests::a_read_covers_a_window_not_one_frame_header
+carrier-websocket write-syscalls-per-frame 1 ferrox-app-ws::tests::frames_round_trip_masked_and_plain
+carrier-websocket user-space-copies-per-byte-unmasked-write 0 ferrox-app-ws::tests::frames_round_trip_masked_and_plain
+carrier-websocket user-space-copies-per-byte-masked-write 1 ferrox-app-ws::tests::frames_round_trip_masked_and_plain
+carrier-websocket user-space-copies-per-byte-read 1 ferrox-app-ws::tests::a_read_covers_a_window_not_one_frame_header
+carrier-websocket relay-window-copies-per-byte 0 ferrox-app-ws::tests::the_relay_window_is_the_readers_own_buffer
+carrier-websocket relay-window-max-bytes 65536 ferrox-app-ws::tests::a_frame_larger_than_the_relay_window_keeps_its_remainder
+carrier-websocket read-calls-per-two-buffered-frames 1 ferrox-app-ws::tests::two_buffered_frames_leave_in_one_read
+carrier-websocket relay-window-messages-per-handoff 3 ferrox-app-ws::tests::small_frames_fill_one_window
+carrier-websocket transport-reads-after-a-ready-message 0 ferrox-app-ws::tests::a_partial_next_frame_does_not_hold_the_ready_message
+carrier-websocket request-buffer-reallocations-per-dial 0 ferrox-app-ws::tests::the_request_is_sized_for_its_bytes
+carrier-websocket response-buffer-reallocations-per-accept 0 ferrox-app-ws::tests::the_101_is_the_key_and_the_echoed_subprotocol
+carrier-websocket early-data-copies-of-the-pipelined-bytes 0 ferrox-app-ws::tests::the_pipelined_prefix_is_the_readers_own_buffer
+carrier-websocket head-tail-read-syscalls 0 ferrox-app-ws::tests::a_frame_that_rode_in_with_the_head_costs_no_syscall
+carrier-websocket head-tail-allocations 0 ferrox-app-ws::tests::the_record_head_hands_over_the_buffer_it_filled
+carrier-websocket early-data-encode-allocations-per-line 0 ferrox-bench-gate-8
+carrier-websocket early-data-encode-buffers-grown-per-2048-byte-line 0 ferrox-core-transport::tests::the_early_data_line_costs_the_encode_and_nothing_else
+carrier-websocket accept-key-allocations-per-connection 0 ferrox-app-ws::tests::the_keys_are_not_allocated
+carrier-websocket fresh-key-allocations-per-dial 0 ferrox-app-ws::tests::the_keys_are_not_allocated
+carrier-websocket pinned-threads-per-silent-vless-request 0 ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_ws_handshake
+carrier-websocket pinned-threads-per-silent-vmess-request 0 ferrox-app-vmess::tests::a_silent_peer_cannot_pin_a_ws_vmess_request
+
+carrier-httpupgrade ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-httpupgrade framing-bytes-after-the-101 0 ferrox-app-httpupgrade::tests::upgrade_carries_an_echo_over_loopback
+carrier-httpupgrade user-space-copies-per-byte-relayed 1 ferrox-app-httpupgrade::tests::upgrade_carries_an_echo_over_loopback
+carrier-httpupgrade writes-per-upgraded-dial-with-a-payload 2 ferrox-app-httpupgrade::tests::the_payload_leaves_after_the_request_in_its_own_write
+carrier-httpupgrade writes-per-upgraded-dial-without-a-payload 1 ferrox-app-httpupgrade::tests::the_payload_leaves_after_the_request_in_its_own_write
+carrier-httpupgrade request-reallocations-per-dial 0 ferrox-app-httpupgrade::tests::the_request_buffer_holds_its_capacity_over_a_dial_cycle
+carrier-httpupgrade host-check-allocations-per-served-connection 0 ferrox-app-httpupgrade::tests::the_host_check_allocates_nothing
+carrier-httpupgrade accept-answer-allocations-per-served-connection 0 ferrox-app-httpupgrade::tests::a_keyed_answer_is_written_without_an_allocation
+carrier-httpupgrade round-trips-per-upgraded-dial 1 ferrox-app-httpupgrade::tests::a_payload_waits_for_a_switch_that_dropped_what_rode_behind_it
+carrier-httpupgrade head-reads-per-window 1 ferrox-app-httpupgrade::tests::a_head_costs_one_read_per_window
+carrier-httpupgrade head-tail-allocations 0 ferrox-app-httpupgrade::tests::the_record_head_hands_over_the_buffer_it_filled
+carrier-httpupgrade inner-reads-per-pipelined-prefix 0 ferrox-app-httpupgrade::tests::the_pipelined_prefix_reaches_the_reader_without_a_socket_read
+carrier-httpupgrade prefix-bytes-held-after-walk 0 ferrox-app-httpupgrade::tests::the_pipelined_prefix_reaches_the_reader_without_a_socket_read
+carrier-httpupgrade sweep-head-cases 108 ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split
+carrier-httpupgrade sweep-head-lengths 93 ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split
+carrier-httpupgrade sweep-head-end-offsets-that-differ 0 ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split
+carrier-httpupgrade sweep-head-verdicts-that-differ 0 ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split
+carrier-httpupgrade sweep-served-cases 13 ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head
+carrier-httpupgrade sweep-served-verdicts-that-differ 0 ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head
+carrier-httpupgrade sweep-served-answers-that-differ 0 ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head
+carrier-httpupgrade sweep-tails-the-reference-dropped 2 ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head
+carrier-httpupgrade sweep-dialled-cases 9 ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer
+carrier-httpupgrade sweep-dialled-verdicts-that-differ 2 ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer
+carrier-httpupgrade sweep-dialled-payload-orders-that-differ 1 ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer
+carrier-httpupgrade sweep-dialled-payload-bytes-that-differ 0 ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer
+carrier-httpupgrade sweep-request-header-lines-the-reference-adds-per-dial 3 ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer
+carrier-httpupgrade pinned-threads-per-silent-vmess-request 0 ferrox-app-vmess::tests::a_silent_peer_cannot_pin_an_httpupgrade_vmess_request
+carrier-xdrive ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-xdrive connections-per-five-templated-asks 1 ferrox-app-xdrive::tests::the_templated_store_sends_the_reference_bytes
+carrier-xdrive connections-per-five-drive-asks 1 ferrox-app-xdrive::tests::the_drive_service_asks_in_the_reference_shape
+carrier-xdrive token-asks-per-two-oauth2-uploads 1 ferrox-app-xdrive::tests::an_oauth2_template_fetches_its_token_once_and_again_after_a_401
+carrier-xdrive asks-per-waited-out-refusal 2 ferrox-app-xdrive::tests::a_configured_answer_is_asked_again
+carrier-xdrive store-instances-per-two-identical-configs 1 ferrox-app-xdrive::tests::a_store_is_shared_by_the_settings_that_name_it
+carrier-xdrive held-ticks-per-growing-segment 8 ferrox-app-xdrive::tests::coalescing_holds_a_growing_buffer_for_a_bounded_run_of_ticks
+carrier-xdrive segment-buffer-reallocations-per-upload-cycle 0 ferrox-app-xdrive::tests::a_finished_upload_hands_its_buffer_back_empty_and_whole
+carrier-xdrive socket-reads-per-pipelined-answer 0 ferrox-app-xdrive::tests::a_lane_keeps_what_arrives_past_the_answer_it_read
+carrier-xdrive lane-buffer-reallocations-per-answer 0 ferrox-app-xdrive::tests::a_lane_keeps_what_arrives_past_the_answer_it_read
+carrier-xdrive head-header-allocations-per-reply 0 ferrox-app-xdrive::tests::a_reply_head_costs_no_buffer_for_its_headers
+
+carrier-httpheader ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-httpheader framing-bytes-added 0 ferrox-app-httpheader::tests::header_carries_an_echo_over_loopback
+carrier-httpheader head-tail-read-syscalls 0 ferrox-app-httpheader::tests::the_bytes_behind_the_head_reach_the_relay_without_a_syscall
+carrier-httpheader head-tail-allocations 0 ferrox-app-httpheader::tests::the_record_head_hands_over_the_buffer_it_filled
+carrier-httpheader prefix-bytes-held-after-walk 0 ferrox-app-httpheader::tests::the_bytes_behind_the_head_reach_the_relay_without_a_syscall
+carrier-httpheader write-calls-per-dial 1 ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of
+carrier-httpheader request-staging-copies-per-dial 0 ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of
+carrier-httpheader request-buffer-allocations-per-dial 0 ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of
+carrier-httpheader record-lane-segment-allocations-per-dial 0 ferrox-core-tls::rustls_backend::tests::the_camouflage_gather_coalesces_without_a_heap_buffer
+carrier-httpheader user-space-copies-per-byte-relayed 1 ferrox-app-proxy::tests::carried_streams_round_trip_behind_the_http_camouflage
+carrier-httpheader pinned-threads-per-silent-vmess-request 0 ferrox-app-vmess::tests::a_silent_peer_cannot_pin_an_httpheader_vmess_request
+
+carrier-grpc ops-retired-instructions 73251 scripts/count-ops.sh
+carrier-grpc wide-hunk-probe-ops 332283 scripts/count-ops.sh
+carrier-grpc varint-write-probe-ops 102414 scripts/count-ops.sh
+carrier-grpc multi-payload-probe-ops 147461 scripts/count-ops.sh
+carrier-grpc hunk-payload-bytes 16375 ferrox-app-grpc::tests::a_hunk_fits_the_frame_that_carries_it
+carrier-grpc user-space-copies-per-byte-written 0 ferrox-app-grpc::tests::the_uplink_hands_the_payload_to_the_writer_by_pointer
+carrier-grpc writes-per-relay-read 1 ferrox-app-grpc::tests::a_relay_read_gathers_its_frames_into_one_write
+carrier-grpc segments-per-socket-write 10 ferrox-app-grpc::tests::a_relay_read_gathers_its_frames_into_one_write
+carrier-grpc payload-runs-per-socket-write 5 ferrox-app-grpc::tests::a_relay_read_gathers_its_frames_into_one_write
+carrier-grpc single-messages-per-relay-read 5 ferrox-app-grpc::tests::a_relay_read_gathers_its_frames_into_one_write
+carrier-grpc multi-messages-per-relay-read 1 ferrox-app-grpc::tests::a_multi_relay_read_at_the_peer_window_is_one_message
+carrier-grpc relay-reads-per-promoted-64KiB-window 2 ferrox-app-proxy::tests::a_limited_relay_buffer_reads_a_64kib_source_in_two
+carrier-grpc source-read-syscalls-per-promoted-64KiB-window 2 ferrox-app-proxy::tests::a_limited_relay_buffer_reads_a_64kib_source_in_two
+carrier-grpc payload-staging-copies-per-byte-read 0 ferrox-app-grpc::tests::a_body_never_lands_in_a_second_buffer
+carrier-grpc relay-window-copies-per-byte 0 ferrox-app-grpc::tests::a_relay_window_hands_the_payload_it_read_by_pointer
+carrier-grpc message-bytes-moved-per-padded-frame 0 ferrox-app-grpc::tests::a_padded_frame_opens_a_message_without_moving
+carrier-grpc credit-bytes 2097152 ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write
+carrier-grpc window-update-writes-per-credit 1 ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write
+carrier-grpc window-update-frames-per-credit 2 ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write
+carrier-grpc padded-frame-credit-octets 0 ferrox-app-grpc::tests::a_padded_frame_credits_its_whole_wire_payload
+carrier-grpc connection-window-credit-at-preface 4128769 ferrox-app-grpc::tests::the_preface_grants_the_peer_a_whole_window
+carrier-grpc pinned-threads-per-silent-preface 0 ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_preface
+carrier-grpc pinned-threads-per-silent-request-head 0 ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_request_head
+carrier-grpc pinned-threads-per-silent-vless-request 0 ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_vless_request
+carrier-grpc pinned-threads-per-silent-tls-request 0 ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_tls_vless_request
+carrier-grpc pinned-threads-per-silent-trojan-request 0 ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_trojan_request
+carrier-grpc pinned-threads-per-silent-vmess-request 0 ferrox-app-vmess::tests::a_silent_peer_cannot_pin_a_grpc_vmess_request
+carrier-grpc pinned-threads-per-silent-shadowsocks-request 0 ferrox-app-shadowsocks::tests::a_silent_peer_cannot_pin_a_grpc_shadowsocks_request
+carrier-grpc pinned-threads-per-silent-2022-request 0 ferrox-app-shadowsocks2022::tests::a_silent_peer_cannot_pin_a_grpc_shadowsocks2022_request
+carrier-grpc threads-per-muxed-connection 0 ferrox-app-proxy::tests::muxed_grpc_connections_share_the_lane_pool
+carrier-grpc message-buffer-reallocations-per-same-sized-frame 0 ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated
+carrier-grpc reclaim-moves-per-drained-buffer 0 ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated
+carrier-grpc batched-elements-served-per-message 8 ferrox-app-grpc::tests::a_batched_downlink_arrives_element_by_element
+carrier-grpc grpc-methods-served-per-listener 2 ferrox-app-grpc::tests::one_listener_serves_both_methods
+carrier-grpc concurrent-streams-per-connection 2 ferrox-app-grpc::tests::one_connection_serves_two_streams_at_once
+carrier-grpc header-field-copies-per-head 0 ferrox-app-h2::tests::a_plain_field_borrows_the_block
+carrier-grpc table-entry-copies-per-indexed-field 0 ferrox-app-h2::tests::an_indexed_field_borrows_the_table
+carrier-grpc decoder-buffer-writes-per-borrowed-field 0 ferrox-app-h2::tests::a_borrowed_block_leaves_the_scratch_alone
+carrier-grpc header-field-allocations-per-inserted-field 2 ferrox-app-h2::tests::an_indexed_field_borrows_the_table
+carrier-grpc header-block-allocations-per-frame 1 ferrox-app-h2::tests::a_header_block_is_opened_once
+
+carrier-xhttp ops-retired-instructions 33046 scripts/count-ops.sh
+carrier-xhttp framing-size-lines-without-an-allocation 0 ferrox-app-xhttp::tests::size_lines_match_format_without_allocating
+carrier-xhttp framing-read-syscalls-per-chunk 1 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
+carrier-xhttp framing-buffer-reallocations-per-steady-fill 0 ferrox-app-xhttp::tests::a_second_fill_keeps_the_framing_buffers_allocation
+carrier-xhttp read-syscalls-per-chunk 2 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
+carrier-xhttp read-syscalls-for-16-peer-chunks 3 ferrox-app-xhttp::tests::a_peer_chunk_smaller_than_the_window_amortises_its_framing
+carrier-xhttp read-syscalls-for-16-maximum-size-lines 17 ferrox-app-xhttp::tests::a_maximum_size_line_keeps_the_closing_crlf_in_the_framing_read
+carrier-xhttp write-slices-per-window 1 ferrox-app-xhttp::tests::one_window_is_one_chunked_frame
+carrier-xhttp user-space-copies-per-byte-written 1 ferrox-app-xhttp::tests::exchange_carries_an_echo_over_loopback
+carrier-xhttp read-window-copies 0 ferrox-app-xhttp::tests::a_body_window_is_the_readers_own_buffer
+carrier-xhttp h2-frame-window-copies 0 ferrox-app-xhttp_h2::tests::a_frame_window_is_the_readers_own_allocation
+carrier-xhttp h3-data-window-copies 0 ferrox-app-xhttp_h3::tests::a_data_frame_window_is_the_readers_own_buffer
+carrier-xhttp session-upload-window-copies 0 ferrox-app-xhttp::tests::a_windowed_upload_reads_without_a_copy
+carrier-xhttp packet-window-copies 0 ferrox-app-xhttp::tests::a_packet_window_is_the_sessions_own_buffer
+carrier-xhttp chunk-bodies-per-window 8 ferrox-app-xhttp::tests::a_window_gathers_every_chunk_one_read_brought
+carrier-xhttp requests-served-per-connection 2 ferrox-app-xhttp::tests::one_connection_carries_the_packet_up_uplink
+carrier-xhttp requests-served-before-a-close 1 ferrox-app-xhttp::tests::a_request_that_says_close_takes_the_connection_with_it
+carrier-xhttp writes-per-credit 1 ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write
+carrier-xhttp data-window-writes 1 ferrox-app-xhttp_h2::tests::a_data_window_leaves_as_one_write
+carrier-xhttp packet-up-windows-per-post 2 ferrox-app-xhttp::tests::a_packet_up_upload_batches_what_queues_behind_an_answer
+carrier-xhttp packet-up-bytes-reordered 0 ferrox-app-xhttp::tests::a_packet_up_upload_posts_every_byte_in_order
+carrier-xhttp window-update-frames-per-credit 2 ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write
+carrier-xhttp h2-body-cap-bytes 4210688 ferrox-app-xhttp_h2::tests::an_unread_body_holds_its_window_and_the_queue_is_capped
+carrier-xhttp head-buffer-reallocations-per-request-head 0 ferrox-app-xhttp_h2::tests::the_synthesized_head_is_sized_for_its_bytes
+carrier-xhttp head-tail-read-syscalls 0 ferrox-app-xhttp::tests::a_chunk_that_rode_in_with_the_head_costs_no_syscall
+carrier-xhttp head-tail-allocations 0 ferrox-app-xhttp::tests::the_record_head_hands_over_the_buffer_it_filled
+carrier-xhttp path-segment-allocations 0 ferrox-app-xhttp::tests::the_path_placements_are_read_without_a_list
+carrier-xhttp connection-header-allocations 0 ferrox-app-xhttp::tests::a_connection_header_is_named_without_a_lowercase_copy
+carrier-xhttp data-part-decode-allocations 3 ferrox-app-xhttp::tests::the_data_parts_decode_off_one_walk_of_the_head
+carrier-xhttp carry-tail-allocations 0 ferrox-app-xhttp::tests::the_tail_a_body_read_leaves_stays_in_the_head_buffer
+carrier-xhttp received-data-frames-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
+carrier-xhttp received-header-blocks-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
+carrier-xhttp partly-read-frame-tail-copies 0 ferrox-app-xhttp_h2::tests::a_partly_read_frame_is_not_moved
+carrier-xhttp zero-filled-bytes-per-received-frame 4096 ferrox-app-xhttp_h2::tests::a_received_frames_body_is_zeroed_once
+carrier-xhttp response-head-field-allocations 0 ferrox-app-xhttp_h2::tests::a_response_head_is_split_without_allocating
+carrier-xhttp answer-head-allocations 1 ferrox-app-xhttp::tests::a_padded_answer_is_written_from_one_buffer
+carrier-xhttp tokenish-pad-buffer-allocations 1 ferrox-app-xhttp::tests::a_tokenish_pad_is_one_buffer_drawn_without_zeroing
+carrier-xhttp zero-filled-bytes-per-tokenish-pad 0 ferrox-app-xhttp::tests::a_tokenish_pad_is_one_buffer_drawn_without_zeroing
+carrier-xhttp zero-filled-bytes-per-request-body 32 ferrox-app-xhttp::tests::a_body_read_zeroes_its_room_once
+carrier-xhttp dial-head-allocations-per-thread 1 ferrox-app-xhttp::tests::the_dial_head_is_staged_once_per_thread
+carrier-xhttp request-head-allocations 5 ferrox-app-xhttp_h2::tests::a_request_block_is_encoded_without_its_temporary_lists
+carrier-xhttp idle-closed-connections-leased 0 ferrox-app-xmux::tests::an_idle_connection_the_peer_closed_is_not_leased_again
+
+carrier-veepn ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-veepn credential-window-allocations-per-pair 0 ferrox-core-veepn::tests::the_credential_lands_in_the_callers_window_and_not_in_one_of_its_own
+carrier-veepn launch-body-window-allocations-per-ask 0 ferrox-core-veepn::tests::a_launch_body_is_the_document_the_api_reads
+carrier-veepn connect-request-allocations-per-open 0 ferrox-core-tls::rustls_backend::tests::the_connect_request_gathers_without_a_heap_buffer
+carrier-veepn write-calls-per-h1-open 1 ferrox-core-tls::rustls_backend::tests::the_connect_request_gathers_without_a_heap_buffer
+carrier-veepn region-list-copies-per-flow 0 ferrox-app-veepn::tests::a_cached_list_is_shared_not_copied_per_flow
+carrier-veepn dial-clones-per-flow 0 ferrox-app-veepn::tests::a_flow_dials_the_cached_entry_and_not_a_copy_of_it
+carrier-veepn region-name-copies-per-flow 0 ferrox-app-veepn::tests::the_named_region_is_shared_not_copied_per_flow
+carrier-veepn pair-copies-per-listed-address 0 ferrox-app-veepn::tests::a_list_answer_keeps_the_entries_this_lane_can_dial
+carrier-veepn origin-list-copies-per-ask 0 ferrox-app-veepn::tests::the_rotation_starts_where_the_last_one_left_off
+carrier-veepn edge-peer-read-allocations-per-entry 0 ferrox-core-foxy::tests::a_literal_edge_address_is_read_without_a_buffer_of_its_own
+carrier-veepn declined-edge-visits-per-two-flows 1 ferrox-app-veepn::tests::a_declined_edge_is_skipped_while_its_silence_lasts
+carrier-veepn silent-region-edges-probed-per-flow 1 ferrox-app-veepn::tests::a_silent_region_probes_one_edge_instead_of_its_whole_list
+carrier-veepn refused-target-edge-dials-per-flow 1 ferrox-app-veepn::tests::a_refused_target_stops_the_walk_and_keeps_the_region
+carrier-veepn refused-target-plane-asks-per-flow 0 ferrox-app-veepn::tests::a_refused_target_stops_the_walk_and_keeps_the_region
+carrier-veepn refusal-field-allocations-per-refusal 0 ferrox-core-foxy::tests::head_field_reads_the_names_the_edge_sent
+carrier-veepn unreachable-plane-asks-per-two-flows 1 ferrox-app-veepn::tests::a_plane_that_answers_nothing_carries_the_list_it_gave
+carrier-veepn unreachable-plane-edge-dials-per-flow 1 ferrox-app-veepn::tests::a_plane_that_answers_nothing_carries_the_list_it_gave
+carrier-veepn unreachable-plane-region-asks-per-two-flows 1 ferrox-app-veepn::tests::the_region_the_plane_named_survives_its_own_outage
+carrier-veepn unanswered-plane-pause-seconds-per-ask 0 ferrox-core-veepn::tests::a_plane_that_answered_nothing_is_rotated_away_from_not_waited_on
+carrier-veepn answered-plane-pause-seconds-per-ask 35 ferrox-core-veepn::tests::a_plane_that_answered_nothing_is_rotated_away_from_not_waited_on
+carrier-foxy ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-foxy payload-staging-copies-per-byte-written 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
+carrier-foxy payload-staging-copies-per-byte-read 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
+carrier-foxy read-buffer-bytes-per-staged-remainder 0 ferrox-app-foxy::loopback::half_a_frame_reaches_the_caller_with_the_rest_left_on_the_wire
+carrier-foxy connect-request-allocations-per-open 0 ferrox-core-tls::rustls_backend::tests::the_connect_request_gathers_without_a_heap_buffer
+carrier-foxy write-calls-per-h1-open 1 ferrox-core-tls::rustls_backend::tests::the_connect_request_gathers_without_a_heap_buffer
+carrier-foxy qpack-connect-allocations-per-open 0 ferrox-core-foxy::hpack::tests::a_connect_block_is_written_without_touching_the_heap
+carrier-foxy qpack-status-patterns-understood 3 ferrox-core-foxy::hpack::tests::the_status_reader_understands_every_pattern_the_edge_may_send
+carrier-foxy head-read-calls-per-open 1 ferrox-app-foxy::tests::the_head_walk_reads_the_answer_in_one_call
+carrier-foxy head-tail-bytes-held-after-they-reach-the-caller 0 ferrox-app-foxy::tests::the_pipelined_tail_is_released_by_the_read_that_spends_it
+carrier-foxy hop-connect-allocations-per-open 0 ferrox-app-foxy::loopback::a_hop_connect_allocates_nothing
+carrier-foxy hop-head-tunnel-bytes-held-after-the-open 0 ferrox-app-foxy::loopback::a_hop_head_leaves_the_tunnel_s_first_bytes_on_the_socket
+carrier-foxy h3-window-peek-bytes-per-delivered-frame 16 ferrox-app-foxy::loopback::the_h3_downlink_hands_the_caller_the_frame_without_staging_it
+carrier-foxy h3-frame-window-bytes 16 ferrox-app-foxy::loopback::the_h3_downlink_hands_the_caller_the_frame_without_staging_it
+carrier-foxy h3-window-bytes-per-frame-ahead-of-the-answer 16 ferrox-app-foxy::loopback::a_frame_ahead_of_the_answer_is_consumed_rather_than_waited_on
+carrier-foxy h3-bytes-lost-at-a-frame-boundary 0 ferrox-app-foxy::loopback::a_quic_capsule_split_over_frames_arrives_as_one_datagram
+carrier-foxy h3-bytes-lost-behind-a-parked-frame 0 ferrox-app-foxy::loopback::a_quic_trailer_that_parks_mid_block_keeps_the_frames_behind_it
+carrier-foxy h3-empty-frames-called-the-end 0 ferrox-app-foxy::loopback::an_empty_data_frame_is_not_the_end_of_the_tunnel
+carrier-foxy h3-datagram-write-staging-bytes 19 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram
+carrier-foxy h3-datagram-read-staging-copies-per-byte 0 ferrox-app-foxy::loopback::a_quic_datagram_in_one_frame_never_enters_the_capsule_buffer
+carrier-foxy h3-connect-ip-read-staging-copies-per-packet 0 ferrox-app-foxy::loopback::a_connect_ip_packet_in_one_frame_is_read_into_the_caller
+carrier-foxy h3-bytes-lost-in-a-block-arriving-in-pieces 0 ferrox-app-foxy::loopback::a_quic_block_that_arrives_in_pieces_keeps_the_pieces_it_already_holds
+carrier-foxy h2-bytes-lost-at-a-read-quantum 0 ferrox-app-foxy::loopback::a_frame_that_straddles_a_read_quantum_arrives_whole
+carrier-foxy uplink-bytes-blocked-by-a-parked-leg 0 ferrox-app-foxy::loopback::a_parked_downlink_leg_does_not_hold_the_uplink_behind_its_wait
+carrier-foxy edge-socket-dups-after-the-first-h1-park 0 ferrox-app-foxy::loopback::a_parked_http11_lane_hands_out_one_socket
+carrier-foxy edge-socket-dups-after-the-first-h2-park 0 ferrox-app-foxy::loopback::a_parked_http2_session_hands_out_one_socket
+carrier-foxy h2-open-scratch-reallocations-after-first-flow 0 ferrox-app-foxy::loopback::a_warm_h2_open_reuses_the_session_scratch
+carrier-foxy udp-session-handshakes-after-the-first-flow 0 ferrox-app-foxy::loopback::a_second_udp_flow_rides_the_first_session
+carrier-foxy foreign-capsules-handed-to-the-wrong-lane 0 ferrox-app-foxy::loopback::a_second_udp_flow_rides_the_first_session
+carrier-foxy session-killed-by-a-foreign-reset 0 ferrox-app-foxy::loopback::a_reset_of_one_stream_leaves_the_session_to_the_others
+carrier-foxy udp-streams-held-after-their-lane-drops 0 ferrox-app-foxy::loopback::a_dropped_udp_lane_returns_its_stream
+carrier-foxy status-head-bytes-held-after-the-open 0 ferrox-app-foxy::loopback::a_status_for_a_stream_opening_elsewhere_is_kept
+carrier-foxy foreign-status-heads-dropped 0 ferrox-app-foxy::loopback::a_status_for_a_stream_opening_elsewhere_is_kept
+carrier-foxy h2-upload-bytes-blocked-by-an-unread-grant 0 ferrox-app-foxy::loopback::an_upload_is_paced_by_the_grants_the_edge_sends_rather_than_by_the_bytes_it_reads
+carrier-foxy window-update-frames-per-floor-crossing 2 ferrox-app-foxy::loopback::credit_crossing_the_floor_costs_one_pair_not_one_per_frame
+carrier-foxy window-update-frames-below-the-floor 0 ferrox-app-foxy::loopback::credit_held_under_the_floor_never_reaches_the_wire
+carrier-foxy stalled-flow-window-update-frames 0 ferrox-app-foxy::loopback::a_flow_that_does_not_read_returns_no_stream_credit
+carrier-foxy padded-frame-credit-octets 0 ferrox-app-foxy::loopback::a_padded_frame_credits_its_whole_wire_payload
+carrier-foxy padded-frame-pad-octets-delivered 0 ferrox-app-foxy::loopback::a_padded_frame_hands_back_only_its_payload
+carrier-foxy padded-frame-staged-bytes-per-payload-byte 1 ferrox-app-foxy::loopback::a_padded_frame_hands_back_only_its_payload
+carrier-foxy padded-frame-pad-octets-delivered-in-pieces 0 ferrox-app-foxy::loopback::a_padded_frame_read_in_pieces_hands_back_only_its_payload
+carrier-foxy padding-only-frame-window-octets-lost 0 ferrox-app-foxy::loopback::a_frame_of_only_padding_hands_the_caller_nothing_and_still_credits_its_wire
+carrier-foxy staged-frame-bytes-dropped 0 ferrox-app-foxy::loopback::a_frame_wider_than_the_edge_s_own_send_limit_is_read_whole
+carrier-foxy oversized-frame-buffer-bytes 0 ferrox-app-foxy::loopback::a_frame_wider_than_the_lane_ever_asked_for_is_refused_not_allocated
+
+carrier-foxy foreign-stream-ends-that-end-this-lane 0 ferrox-app-foxy::loopback::a_foreign_stream_s_end_does_not_end_our_lane
+carrier-foxy midflow-settings-frames-wider-than-the-ask 0 ferrox-app-foxy::loopback::a_settings_that_arrives_mid_flow_bounds_the_frames_we_send
+carrier-foxy midflow-settings-read-without-an-answer 0 ferrox-app-foxy::loopback::a_settings_that_arrives_mid_flow_bounds_the_frames_we_send
+carrier-foxy ip-capsule-buffer-bytes-over-the-ceiling 0 ferrox-app-foxy::loopback::a_capsule_stream_that_never_parses_stops_at_the_lane_s_ceiling
+carrier-foxy push-refusals-on-the-tunnel-s-own-stream 0 ferrox-app-foxy::loopback::a_push_promise_is_refused_on_the_stream_it_promises
+carrier-foxy push-refusals-without-refused-stream 0 ferrox-app-foxy::loopback::a_push_promise_is_refused_on_the_stream_it_promises
+carrier-foxy push-refusals-after-the-status 0 ferrox-app-foxy::loopback::a_push_promise_after_the_status_is_refused_too
+
+carrier-foxy dead-carrier-dials-per-connect-ip-packet 0 ferrox-app-proxy::tests::the_connect_ip_lane_leaves_a_dead_carrier_dead
+carrier-foxy carriers-dialled 3 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_answers_best
+carrier-foxy udp-carriers-dialled 3 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_answers_best
+carrier-foxy auto-carrier-opened-on H2 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_answers_best
+carrier-foxy datagram-frames-per-capsule 1 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram
+carrier-foxy capsules-reassembled-across-frames 1 ferrox-app-foxy::loopback::a_capsule_split_over_frames_reassembles_as_one_datagram
+carrier-foxy datagrams-out-of-one-frame 2 ferrox-app-foxy::loopback::a_frame_of_two_datagrams_arrives_as_two_datagrams
+carrier-foxy quic-datagrams-out-of-one-frame 2 ferrox-app-foxy::loopback::a_quic_frame_of_two_datagrams_arrives_as_two_datagrams
+carrier-foxy h2-bytes-lost-at-a-short-datagram-read 0 ferrox-app-foxy::loopback::a_datagram_wider_than_the_caller_s_buffer_keeps_its_tail
+carrier-foxy h3-bytes-lost-at-a-short-datagram-read 0 ferrox-app-foxy::loopback::a_quic_datagram_wider_than_the_caller_s_buffer_keeps_its_tail
+carrier-foxy h1-bytes-lost-at-a-short-datagram-read 0 ferrox-app-foxy::loopback::a_h1_datagram_wider_than_the_caller_s_buffer_keeps_its_tail
+carrier-foxy stream-write-staging-copies-per-byte 0 ferrox-app-foxy::loopback::the_quic_carrier_sends_the_block_reads_the_status_and_carries_the_bytes
+carrier-foxy datagram-write-staging-copies-per-byte 0 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_and_echoes_a_datagram
+carrier-foxy ip-read-staging-copies-per-byte 0 ferrox-app-foxy::loopback::the_connect_ip_carrier_opens_one_tunnel_and_carries_a_datagram
+carrier-foxy platform-store-reads-per-flow 0 ferrox-app-quic::tests::the_platform_anchors_are_read_once
+carrier-foxy server-roles 0 ferrox-app-proxy::tests::quic_serve_closes_without_handshake
+carrier-foxy dialled-without-ca-cert-file 0 ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file
+carrier-foxy address-assign-capsule-bytes-per-grant 9 ferrox-core-foxy::connectip::tests::the_assign_a_proxy_writes_is_the_assign_the_lane_reads
+carrier-foxy route-advert-capsule-bytes-per-route 12 ferrox-core-foxy::connectip::tests::the_route_advert_a_proxy_writes_is_the_route_advert_the_lane_reads
+carrier-foxy word-sum-blocks-compared 42 ferrox-core-foxy::connectip::tests::the_vector_block_sum_is_the_walk_sum
+carrier-foxy word-sum-magnitudes-agreed 135 ferrox-core-foxy::connectip::tests::the_parallel_accumulators_hold_the_single_accumulator_word_sum
+carrier-foxy word-sum-probe-octets 1342 ferrox-core-foxy::connectip::tests::the_word_sum_costs_the_words_it_reads
+carrier-foxy edges-preferred-by-verified-exit 1 ferrox-app-proxy::foxy_exit_tests::the_preferred_edge_is_the_first_one_whose_exit_agrees_not_the_first_one_opened
+carrier-foxy tcp-connections-asked-of-an-untrusted-edge 1 ferrox-app-foxy::loopback::an_untrusted_edge_is_named_and_asked_once
+carrier-foxy catalogue-edges-kept-across-a-failed-fetch 4 ferrox-app-foxy_catalog::tests::a_fetch_that_failed_keeps_the_edges_already_known
+carrier-foxy catalogue-edges-rewritten-from-the-cache-file 5 ferrox-app-foxy_catalog::tests::the_cache_file_one_process_writes_is_the_one_the_next_reads
+carrier-foxy dials-of-a-silent-tcp-carrier 1 ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung
+carrier-foxy dials-across-three-flows-of-a-rested-carrier 2 ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung
+carrier-foxy relay-legs-held-after-their-lane-ended 0 ferrox-app-foxy::loopback::a_lane_that_ends_releases_the_leg_parked_on_its_client
+carrier-foxy relay-legs-held-after-their-client-ended 0 ferrox-app-foxy::loopback::a_client_that_ends_releases_the_leg_parked_on_its_lane
+carrier-foxy pool-workers-held-after-a-finished-burst 0 ferrox-app-proxy::tests::a_finished_burst_hands_its_workers_back_to_the_process
+carrier-foxy pool-directions-lost-on-a-gone-worker 0 ferrox-app-proxy::tests::a_claim_that_reaches_a_gone_worker_keeps_its_direction
+carrier-foxy rate-limits-that-stopped-a-renewal 0 ferrox-app-foxy_account::tests::a_refused_credential_is_the_only_answer_a_second_ask_cannot_change
+carrier-foxy named-waits-dropped-from-a-renewal-pause 0 ferrox-app-foxy_account::tests::a_rate_limit_carries_the_wait_its_head_names
+carrier-foxy renewal-pauses-past-their-own-ceiling 0 ferrox-app-foxy_account::tests::the_next_ask_waits_the_gap_the_plane_names_or_a_curve_that_caps
+carrier-foxy edge-peer-read-allocations-per-open 0 ferrox-core-foxy::tests::a_literal_edge_address_is_read_without_a_buffer_of_its_own
+carrier-foxy edge-authority-allocations-per-lane-open 0 ferrox-core-foxy::tests::an_edge_authority_brackets_an_address_and_borrows_a_plain_default_port_name
+carrier-foxy huffman-literal-allocations-per-decode 1 ferrox-core-foxy::hpack::tests::a_coded_literal_is_decoded_into_one_allocation
+carrier-foxy ip-packet-allocations-per-datagram 0 ferrox-app-foxy::loopback::the_packet_scratch_is_the_lanes_own_buffer_and_it_stays_there
+carrier-foxy ip-read-packet-allocations-per-datagram 0 ferrox-app-foxy::loopback::the_read_packet_is_the_callers_own_buffer_and_it_stays_there
+carrier-foxy pass-token-copies-per-dial 0 ferrox-core-foxy::tests::a_cloned_pass_shares_its_token_rather_than_copying_it
+
+carrier-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-quic zero-filled-bytes-per-relayed-frame 3 ferrox-app-quic::tests::a_relayed_datagram_frames_its_target_ahead_of_its_payload
+carrier-quic handshakes-per-server 1 ferrox-app-proxy::tests::quic_pool_shares_one_connection_between_two_streams
+carrier-quic streams-left-open-per-flow 0 ferrox-app-proxy::tests::quic_pool_shares_one_connection_between_two_streams
+carrier-quic server-roles 1 ferrox-app-proxy::tests::quic_serves_vless_echo_over_loopback
+carrier-quic dialled-without-ca-cert-file 0 ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file
+carrier-quic lanes-held-after-the-last-lease 1 ferrox-app-foxy::loopback::a_lane_outlives_its_leases_and_the_next_flow_rides_it
+carrier-quic pump-threads-owned-by-an-idle-lane 0 ferrox-app-proxy::tests::quic_dials_loopback_echo
+carrier-quic pump-threads-started-by-an-app-driven-lease 0 ferrox-app-foxy::loopback::a_lane_outlives_its_leases_and_the_next_flow_rides_it
+carrier-quic flows-per-lane-before-it-is-handed-back 64 ferrox-app-foxy::loopback::a_lane_that_lent_its_whole_grant_of_flows_is_handed_back
+carrier-quic receive-buffer-floor-bytes-armed-per-lane 262144 ferrox-app-quic::tests::a_quic_socket_arms_both_of_its_buffers
+carrier-quic send-buffer-floor-bytes-armed-per-lane 262144 ferrox-app-quic::tests::a_quic_socket_arms_both_of_its_buffers
+carrier-quic quic-bytes-parked-per-unread-stream 4194304 ferrox-app-proxy::tests::an_edge_cannot_park_more_than_the_window_unread
+carrier-quic quic-bytes-parked-per-unread-connection 16777216 ferrox-app-proxy::tests::an_edge_cannot_park_more_than_the_window_unread
+carrier-quic stream-window-ceiling-bytes 8000000 ferrox-app-quic::tests::the_window_ceiling_leaves_the_autotuner_room
+carrier-quic connection-window-ceiling-bytes 32000000 ferrox-app-quic::tests::the_window_ceiling_leaves_the_autotuner_room
+carrier-quic send-datagram-bytes 1350 ferrox-app-quic::tests::the_lane_sends_the_datagram_its_buffer_holds
+carrier-quic route-key-copies-per-packet 0 ferrox-app-quic::tests::a_route_key_is_a_window_into_the_packet
+carrier-quic route-key-allocations 0 ferrox-app-quic::tests::the_route_key_replaces_the_allocating_header_parse
+carrier-quic quic-config-builds-per-warm-dial 0 ferrox-app-quic::tests::one_trust_bundle_shares_its_built_config
+carrier-quic quic-config-lookup-allocations 0 ferrox-app-quic::tests::a_warm_config_lookup_allocates_nothing
+carrier-quic quic-resumed-dials-before-each-cold-one 1 ferrox-app-quic::tests::a_second_dial_to_an_edge_leaves_with_early_data
+carrier-quic client-migrations 1 ferrox-app-quic::tests::a_stream_migrates_its_connection_to_a_new_local
+carrier-quic congestion-controllers 3 ferrox-core-hysteria::tests::congestion_spellings_map_to_the_paced_default
+carrier-quic bbr-profiles 3 ferrox-app-quic::tests::the_three_profiles_move_the_gains_and_nothing_else
+carrier-quic bbr-knobs-set-by-a-profile 8 ferrox-app-quic::tests::the_three_profiles_move_the_gains_and_nothing_else
+carrier-quic standard-profile-overrides 0 ferrox-app-quic::tests::the_three_profiles_move_the_gains_and_nothing_else
+
+reality-tls ops-retired-instructions 202 scripts/count-ops.sh
+reality-tls tls-providers 1 ferrox-core::active_backends
+reality-tls client-outbound-rows-dialled 6 ferrox-app-proxy::tests::vless_outbound_with_reality_dials_raw_and_every_carrier
+reality-tls client-carriers-roundtrip-verified 1 ferrox-app-proxy::tests::reality_ws_dial_reaches_echo_through_the_relay
+reality-tls x25519-shares-recognised 3 ferrox-core-reality::tests::the_x25519_share_is_found_in_every_group_that_carries_one
+reality-tls short-id-bytes 8 ferrox-core-reality::tests::a_short_id_is_zero_padded_to_eight_bytes
+reality-tls cover-origin-dials-per-authenticated-hello 0 ferrox-core-reality::tests::an_authenticated_hello_costs_the_cover_origin_nothing
+reality-tls cover-origin-bytes-per-spliced-hello 1 ferrox-core-reality::tests::an_unauthenticated_hello_is_spliced_into_the_cover_origin_byte_for_byte
+reality-tls cover-origin-dials-per-unparseable-hello 1 ferrox-core-reality::tests::a_hello_that_cannot_be_parsed_still_reaches_the_cover_origin
+reality-tls cover-origin-dials-per-silent-peer 0 ferrox-core-reality::tests::a_peer_that_sends_nothing_costs_the_cover_origin_nothing
+reality-tls peer-reply-bytes-per-spliced-request 1 ferrox-app-proxy::tests::the_cover_origin_splice_carries_the_reply_back_to_the_peer
+reality-tls proxy-protocol-header-bytes 28 ferrox-core-reality::tests::the_binary_proxy_header_is_a_fixed_rectangular_twenty_eight_bytes
+reality-tls hello-buffers-per-single-record-read 1 ferrox-core-reality::tests::reading_a_single_record_hello_allocates_one_buffer
+reality-tls tls13-session-tickets-per-authenticated-handshake 0 ferrox-core-reality::tests::an_authenticated_session_sends_no_tickets_after_the_handshake
+reality-tls certificateverify-signature-scheme ED25519 ferrox-core-reality::tests::the_reality_certificate_verify_answers_ed25519_the_peer_never_offered
+reality-tls disarmed-limiter-records-per-read 2 ferrox-core-reality::tests::a_disarmed_limiter_stops_bounding_reads
+reality-tls addrs-resolved-per-xver0-handshake 0 ferrox-app-proxy::tests::reality_edges_skip_lookups_without_xver
+reality-tls client-hello-passes-per-handshake 2 ferrox-core-reality::tests::client_hellos_differ_only_in_the_session_id
+reality-tls sealed-session-id-bytes 32 ferrox-core-reality::tests::client_seal_matches_the_test_oracle_byte_for_byte
+reality-tls unauthenticated-servers-accepted 0 ferrox-core-reality::tests::a_client_with_a_wrong_key_is_refused_before_any_proxy_byte
+reality-tls server-shared-session-poll-millis 1 ferrox-app-proxy::tests::a_server_relay_bounds_the_shared_session_to_one_tick
+reality-tls late-hello-grains-survived 12 ferrox-app-proxy::tests::a_plain_tls_lane_retries_a_hello_that_arrives_past_the_grain
+reality-tls unsafe-fingerprint-header-bytes-added 0 ferrox-core-vless::tests::an_unsafe_fingerprint_adds_no_header_byte
+reality-tls plaintext-to-public-header-bytes-added 0 ferrox-core-vless::tests::pattng_plaintext_to_public_needs_opt_in_and_adds_no_byte
+reality-tls certificate-refusals-folded-into-other 0 ferrox-core-tls::rustls_backend::tests::mismatched_certificate_name_fails
+reality-tls trust-anchors-parsed-per-dial-after-the-first 0 ferrox-core-tls::rustls_backend::tests::the_parts_a_config_is_built_from_are_built_once
+reality-tls trust-anchor-bytes-copied-per-dial 0 ferrox-app-foxy::loopback::every_dial_of_one_trust_names_the_same_anchors
+reality-tls handshakes-skipped-by-an-earlier-dials-ticket 0 ferrox-core-tls::rustls_backend::tests::a_second_dial_with_the_same_config_still_fetches_the_chain
+reality-tls untrusted-dials-counted-as-retryable 0 ferrox-app-proxy::tests::a_refused_chain_is_a_refusal_not_a_drop
+reality-tls session-writes-per-frame 1 ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call
+reality-tls session-sends-per-64KiB-window 1 ferrox-app-proxy::tests::a_window_leaves_the_session_in_one_send
+reality-tls session-sends-per-frame-wider-than-the-batch 2 ferrox-app-proxy::tests::a_frame_wider_than_the_batch_leaves_in_batches
+reality-tls transport-reads-per-flush 0 ferrox-core-tls::rustls_backend::tests::a_flush_does_not_read_the_transport
+reality-tls transport-reads-per-write 0 ferrox-core-tls::rustls_backend::tests::a_write_does_not_read_the_transport
+reality-tls transport-reads-per-answer-write 0 ferrox-core-tls::rustls_backend::tests::a_server_answer_write_does_not_read_the_transport
+reality-tls relay-write-waits-for-a-parked-read 0 ferrox-app-proxy::tests::a_relay_write_goes_out_while_the_reader_is_parked
+reality-tls session-write-waits-for-a-parked-read 0 ferrox-app-proxy::tests::a_session_write_goes_out_while_its_read_is_parked
+reality-tls session-read-waits-for-a-parked-write 0 ferrox-app-proxy::tests::a_session_read_runs_while_its_write_is_parked
+reality-tls tls-split-wire-descriptors 1 ferrox-app-proxy::tests::a_split_buys_no_descriptor_for_its_wire
+reality-tls transport-reads-behind-ready-plaintext 0 ferrox-app-proxy::tests::a_driven_read_hands_over_ready_plaintext_without_another_transport_read
+reality-tls driven-transport-reads-per-relay-window 1 ferrox-app-proxy::tests::a_whole_relay_window_arrives_in_one_transport_read
+reality-tls driven-session-opens-per-steady-read 1 ferrox-app-proxy::tests::a_steady_read_opens_the_session_once
+reality-tls relay-reads-on-an-unarmed-handle 0 ferrox-app-proxy::tests::the_socket_half_reads_on_the_armed_handle
+reality-tls relay-writes-on-an-unarmed-handle 0 ferrox-app-proxy::tests::eight_downloads_finish_over_each_grpc_carrier
+reality-tls tls-arm-cells 4 scripts/run-benchmark-matrix.sh
+reality-tls census-waits-per-relay-read 0 ferrox-app-proxy::tests::a_release_build_registers_no_census_wait
+reality-tls user-space-copies-per-framed-write 0 ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call
+reality-tls seal-into-instructions UNBLESSED scripts/count-ops.sh
+reality-tls certificates-served-per-listener 2 ferrox-app-config::tests::a_certificate_list_serves_the_name_its_sni_asks_for
+reality-tls sni-names-answered-by-one-listener 2 ferrox-app-config::tests::a_certificate_list_serves_the_name_its_sni_asks_for
+reality-tls certificate-files-read-per-reload 2 ferrox-app-config::tests::a_ticker_reads_the_pair_once_and_rebuilds_only_on_a_change
+reality-tls identity-rebuilds-per-unchanged-reload 0 ferrox-app-config::tests::a_ticker_reads_the_pair_once_and_rebuilds_only_on_a_change
+reality-tls identity-builds-per-handshake-before-the-ticker 0 ferrox-app-config::tests::a_ticker_reads_the_pair_once_and_rebuilds_only_on_a_change
+
+kcp ops-retired-instructions UNBLESSED scripts/count-ops.sh
+kcp syscalls-per-datagram UNBLESSED scripts/count-ops.sh
+kcp seconds-per-datagram UNBLESSED CI bench.yml (no cell yet)
+kcp maximum-transmission-unit-bytes 1350 ferrox-core-kcp::tests::the_upstream_defaults_are_these
+kcp command-only-segment-bytes 16 ferrox-core-kcp::tests::the_command_only_layout_is_sixteen_bytes
+kcp oracle-runs-against-the-pinned-go 1 ferrox-core-kcp::oracle::the_scripted_core_matches_the_pinned_go
+kcp rto-cap-seconds 10 ferrox-core-kcp::tests::rto_is_capped_at_ten_seconds_and_widened
+kcp app-rows-serving-over-kcp 4 ferrox-app-proxy::tests::kcp_carries_vless_echo_over_loopback
+kcp send-payload-buffers-per-window 1 ferrox-core-kcp::window::tests::the_arena_serves_every_segment_without_growing
+kcp send-payload-reallocations-per-window 0 ferrox-core-kcp::window::tests::the_arena_serves_every_segment_without_growing
+kcp send-payload-staging-copies-per-segment 0 ferrox-core-kcp::window::tests::the_writer_gets_the_arena_range_and_not_a_copy_of_it
+kcp receive-payload-reallocations-per-window 0 ferrox-core-kcp::connection::tests::the_receive_pool_serves_every_segment_without_growing
+kcp receive-window-reallocations-per-window 0 ferrox-core-kcp::window::tests::the_receive_window_indexes_a_fixed_ring
+kcp receive-window-allocations-per-segment 0 ferrox-core-kcp::window::tests::the_receive_window_does_not_allocate_per_segment
+kcp receive-parse-allocations-per-segment 0 ferrox-core-kcp::segment::tests::a_data_segment_is_parsed_into_the_lent_buffer
+kcp ack-number-list-reallocations-per-flush 0 ferrox-core-kcp::window::tests::the_ack_list_reuses_its_scratch_across_flushes
+kcp ack-numbers-reallocations-per-cycle 0 ferrox-core-kcp::segment::tests::a_received_ack_reuses_its_number_list
+kcp segment-header-staging-copies-per-segment 0 ferrox-core-kcp::segment::tests::a_borrowed_payload_serialises_identically_to_an_owned_one
+kcp segment-list-vectors-per-datagram 1 ferrox-core-kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next
+kcp reader-wakeups-per-datagram 1 ferrox-core-kcp::connection::tests::a_datagram_wakes_the_reader_once_however_many_segments_it_carries
+kcp ack-wake-threshold-segments 16 ferrox-core-kcp::connection::tests::an_ack_batch_flushes_before_the_tick
+kcp receiving-lock-acquisitions-per-multi-segment-datagram 1 ferrox-core-kcp::connection::tests::a_multi_segment_datagram_takes_the_receiving_lock_once
+kcp mask-families-implemented 9 ferrox-core-kcp::listener::tests::every_mask_family_echoes_over_loopback
+kcp filter-verdicts-from-one-list 5 ferrox-app-config::tests::a_finalmask_filter_reads_both_lists
+kcp mask-chain-wire-overhead-bytes 32 ferrox-core-kcp::listener::tests::the_wire_under_a_masked_session_carries_the_mask
+kcp mask-read-side-payload-copies-per-datagram 0 ferrox-core-kcp::mask::tests::the_original_frame_round_trips_and_the_checks_fire
+kcp mask-encode-buffer-allocations-per-frame 0 ferrox-core-kcp::mask::tests::the_scratch_holds_its_capacity_across_frames
+kcp datagram-room-zero-filled-bytes 65536 ferrox-core-kcp::listener::tests::the_datagram_room_is_zeroed_once
+kcp listener-session-cap 256 ferrox-core-kcp::listener::tests::the_listener_caps_sessions_before_accept
+kcp oracle-mask-lines-against-the-pinned-go 86 ferrox-core-kcp::oracle::the_scripted_core_matches_the_pinned_go
+trojan header-reads-numeric-address 2 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
+trojan header-reads-domain-address 3 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
+trojan header-bytes-copied-out-of-the-buffer 0 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
+trojan key-bytes-compared-early-exit 0 ferrox-app-proxy::tests::the_key_compare_reads_every_byte
+trojan numeric-domain-header-allocations 0 ferrox-app-proxy::tests::the_trojan_numeric_domain_header_allocates_nothing
+carrier-hysteria ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-hysteria tcp-flows-per-handshake 2 ferrox-app-proxy::tests::hysteria_shares_one_connection_between_two_flows
+carrier-hysteria closed-connections-reused 0 ferrox-app-proxy::tests::hysteria_redials_when_a_pooled_connection_closes
+carrier-hysteria datagrams-per-turn-witnessed 16 ferrox-app-hysteria::tests::a_turn_takes_the_datagrams_queued_behind_its_first
+carrier-hysteria request-parse-reallocations 0 ferrox-app-hysteria::tests::a_parsed_request_leaves_its_payload_where_it_landed
+carrier-hysteria request-parse-moves 0 ferrox-app-hysteria::tests::a_parsed_request_leaves_its_payload_where_it_landed
+carrier-hysteria wrong-password-bytes-relayed 0 ferrox-app-proxy::tests::hysteria_refuses_a_wrong_password_without_relaying
+carrier-hysteria non-v2-configs-carried 1 ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks
+carrier-hysteria hysteria-v1-tcp-echo-round-trips 1 ferrox-app-proxy::tests::hysteria_v1_carries_a_tcp_echo_over_loopback
+carrier-hysteria hysteria-v1-udp-echo-round-trips 2 ferrox-app-proxy::tests::hysteria_v1_carries_a_udp_echo_over_loopback
+carrier-hysteria hysteria-v1-xplus-round-trips 1 ferrox-app-proxy::tests::hysteria_v1_carries_a_flow_through_xplus_over_loopback
+carrier-hysteria hysteria-v1-fragments-witnessed 200 ferrox-core-hysteria_v1::tests::every_length_survives_fragment_then_defrag_intact
+carrier-hysteria hysteria-v1-xplus-masked-bytes 10 ferrox-core-hysteria_v1::tests::the_xplus_mask_matches_an_independent_sha256_computation
+carrier-hysteria datagram-lane-client-round-trips 1 ferrox-app-proxy::tests::hysteria_carries_a_udp_association_over_the_carrier
+carrier-hysteria udp-datagram-decode-copies 0 ferrox-core-hysteria::tests::a_decoded_datagram_leaves_its_payload_where_it_landed
+carrier-hysteria udp-fragments-witnessed 200 ferrox-core-hysteria::tests::every_length_survives_fragment_then_defrag_intact
+carrier-hysteria udp-fragment-list-allocations-per-datagram 0 ferrox-core-hysteria::tests::a_fragment_run_takes_no_heap
+carrier-hysteria udp-datagram-reassembly-allocations-per-whole-packet 0 ferrox-core-hysteria::tests::an_unfragmented_datagram_is_handed_over_without_a_buffer
+carrier-hysteria obfuscated-datagram-heap-copies 0 ferrox-core-hysteria::tests::a_sealed_datagram_never_touches_the_heap
+carrier-hysteria pinned-hysteria-client-verdicts 1 scripts/run-upstream-suite.sh
+carrier-hysteria masquerade-answers-browser-on-same-port 1 ferrox-app-proxy::tests::hysteria_serves_a_canned_masquerade_response
+carrier-hysteria masquerade-answer-allocations-per-response 0 ferrox-core-hysteria::tests::an_h3_answer_writes_its_block_straight_into_the_callers_buffer
+carrier-hysteria auth-request-allocations-per-block 0 ferrox-core-hysteria::tests::an_auth_request_carries_post_auth_and_the_brutal_hint
+carrier-hysteria auth-padding-witnessed 512 ferrox-app-hysteria::tests::an_auth_padding_is_alphanumeric_inside_the_reference_range
+carrier-hysteria masquerade-file-bytes-served 1 ferrox-app-proxy::tests::hysteria_serves_a_file_from_the_masquerade_directory
+carrier-hysteria masquerade-file-type-allocations 0 ferrox-core-hysteria::tests::a_static_files_type_is_decided_without_an_allocation
+carrier-hysteria masquerade-chunked-dechunk-allocations 1 ferrox-core-hysteria::tests::a_chunked_body_deframes_into_one_buffer
+carrier-hysteria masquerade-path-decode-allocations 0 ferrox-app-hysteria::tests::a_path_with_no_escape_is_lent_back_undecoded
+carrier-hysteria masquerade-static-answer-allocations 4 ferrox-app-hysteria::tests::a_static_file_answer_opens_only_the_path_and_the_file
+carrier-hysteria masquerade-proxied-round-trips 1 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_origin
+carrier-hysteria masquerade-escapes-served 0 ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_path_that_escalates_the_directory
+carrier-hysteria hop-port-set-expanded 4 ferrox-core-hysteria::tests::the_plan_expands_overlapping_ranges_into_one_sorted_set
+carrier-hysteria hop-port-expansion-allocations 1 ferrox-core-hysteria::tests::every_plan_expands_to_the_bytes_the_contains_scan_wrote
+carrier-hysteria hop-config-forms-parsed 2 ferrox-app-config::tests::a_hysteria_carrier_reads_a_port_hopping_plan
+carrier-hysteria hop-plan-pool-keys 2 ferrox-app-hysteria::tests::a_hop_plan_is_its_own_pool_key
+carrier-hysteria hopped-datagrams-delivered 200 ferrox-app-quic::tests::a_hopped_dial_spreads_its_datagrams_over_more_than_one_server_port
+carrier-hysteria hopped-reply-source-normalized 1 ferrox-app-quic::tests::a_reply_from_a_hopped_port_reads_back_as_the_nominal_server
+carrier-hysteria hop-recv-allocations-per-datagram 0 ferrox-app-quic::tests::a_reply_from_a_lingering_socket_is_read_without_an_allocation
+carrier-hysteria gecko-frame-bytes-encoded 10 ferrox-core-hysteria::tests::a_gecko_frame_is_the_exact_bytes_the_reference_emits
+carrier-hysteria gecko-frame-decode-copies 0 ferrox-core-hysteria::tests::a_gecko_frame_decodes_its_payload_without_a_copy
+carrier-hysteria gecko-packet-reassembled-bytes 1234 ferrox-core-hysteria::tests::a_fragmented_long_header_packet_reassembles_bit_identical
+carrier-hysteria gecko-window-forms-parsed 3 ferrox-app-config::tests::a_hysteria_carrier_reads_a_gecko_window
+carrier-hysteria gecko-loopback-reassembled-bytes 900 ferrox-app-quic::tests::a_gecko_dial_reassembles_its_split_long_header
+carrier-hysteria masquerade-https-origin-served-bytes 6 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_https_origin
+carrier-hysteria masquerade-https-untrusted-refusals 1 ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_https_origin_whose_chain_is_untrusted
+carrier-hysteria masquerade-unix-origin-served-bytes 6 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_a_unix_origin
+carrier-hysteria stun-binding-exchange-allocations 0 ferrox-core-stun::tests::a_binding_exchange_takes_no_heap
+carrier-hysteria realm-punch-allocations 0 ferrox-core-realm::tests::an_encoded_and_decoded_packet_takes_no_heap
+carrier-hysteria realm-configs-parsed 3 ferrox-app-config::tests::a_hysteria_carrier_reads_a_realm_rendezvous
+carrier-hysteria realm-candidate-sorts 1 ferrox-core-realm::tests::a_candidate_walk_sorts_once_and_an_expansion_sorts_twice
+carrier-hysteria realm-expansion-sorts 2 ferrox-core-realm::tests::a_candidate_walk_sorts_once_and_an_expansion_sorts_twice
+carrier-hysteria upnp-mapped-externals 1 ferrox-app-hysteria-realm::tests::a_gateway_maps_the_port_and_names_its_external_address
+
+# --- TLS ClientHello `cipher_suites` field (PattNG ext.) --------------------
+tls-cipher-suites ops-retired-instructions UNBLESSED scripts/count-ops.sh
+tls-cipher-suites syscalls-per-handshake UNBLESSED scripts/count-ops.sh
+tls-cipher-suites handshake-copies-per-byte UNBLESSED no copy checker yet
+tls-cipher-suites seconds-per-handshake UNBLESSED CI bench.yml (no cell yet)
+tls-cipher-suites oracle-cases-replayed-byte-identical 10 ferrox-core-tls::cipher_suites::tests::oracle_replay_matches_go
+tls-cipher-suites cipher-suite-ids-reachable-by-rustls 9 ferrox-core-tls::rustls_backend::tests::the_reachable_set_is_the_tls13_trio_and_ring_s_six_tls12_aead_suites
+tls-cipher-suites cipher-suite-ids-reachable-by-boring 11 ferrox-core-tls::rustls_backend::tests::the_legacy_lane_covers_the_cbc_and_static_rsa_ids_ring_has_not
+tls-cipher-suites cipher-suite-ids-reachable-by-neither 5 ferrox-core-tls::rustls_backend::tests::the_legacy_lane_covers_the_cbc_and_static_rsa_ids_ring_has_not
+tls-cipher-suites dialer-hello-cipher-field-equals-reference 1 ferrox-core-tls::rustls_backend::tests::a_crafted_list_reorders_the_dialer_hello_to_the_reference
+tls-cipher-suites tls12-list-ids-equal-reference-in-order 1 ferrox-core-tls::rustls_backend::tests::a_tls12_list_keeps_the_reference_ids_and_order_on_the_wire
+tls-cipher-suites tls12-suite-negotiated-by-the-dialer 1 ferrox-core-tls::rustls_backend::tests::a_tls12_dial_negotiates_the_configured_suite
+tls-cipher-suites mixed-list-dialer-field-equals-reference 1 ferrox-core-tls::rustls_backend::tests::a_mixed_list_keeps_the_reference_order_on_the_wire
+tls-cipher-suites mixed-list-negotiated-by-the-dialer 1 ferrox-core-tls::rustls_backend::tests::a_mixed_list_negotiates_a_tls12_suite
+tls-cipher-suites ech-list-ids-equal-reference-without-scsv 1 ferrox-core-tls::rustls_backend::tests::an_ech_list_keeps_the_configured_ids_without_an_scsv
+tls-cipher-suites ech-offer-accepted-on-the-stock-shaped-hello 1 ferrox-core-tls::rustls_backend::tests::an_ech_offer_rides_the_stock_shaped_hello
+tls-cipher-suites tls12-suite-negotiated-by-the-listener 1 ferrox-core-tls::rustls_backend::tests::a_tls_floor_and_suite_reach_the_negotiation
+tls-cipher-suites shaped-listener-negotiates-the-five-unreachable-ids 5 ferrox-core-tls::rustls_backend::tests::a_shaped_listener_serves_the_five_ids_neither_backend_has
+tls-cipher-suites mixed-max-hellos-routed-by-the-peek 2 ferrox-core-tls::rustls_backend::tests::a_mixed_max_listener_peeks_the_hello_before_choosing_an_engine
+tls-cipher-suites legacy-dial-tls12-ids-equal-reference-in-order 1 ferrox-core-tls::rustls_backend::tests::a_legacy_dial_offers_the_reference_cipher_ids_in_order
+tls-cipher-suites legacy-cbc-suite-negotiated-by-the-dialer 1 ferrox-core-tls::rustls_backend::tests::a_legacy_dial_negotiates_a_cbc_suite
+tls-cipher-suites legacy-static-rsa-suite-negotiated-by-the-listener 1 ferrox-core-tls::rustls_backend::tests::a_legacy_listener_negotiates_static_rsa
+tls-cipher-suites legacy-tls12-session-resumed 1 ferrox-core-tls::rustls_backend::tests::a_legacy_dial_resumes_a_tls12_session
+tls-cipher-suites config-key-heap-buffers-per-dial 0 ferrox-core-tls::rustls_backend::tests::a_repeat_dial_keys_the_config_without_copying_the_suite_order
+
+# --- OCSP stapling + anti-replay/time-window caches (matrix row 49) -----------
+ocsp-stapling-anti-replay-time-window-caches ops-retired-instructions UNBLESSED scripts/count-ops.sh
+ocsp-stapling-anti-replay-time-window-caches syscalls-per-relayed-megabyte UNBLESSED scripts/count-ops.sh
+ocsp-stapling-anti-replay-time-window-caches relay-staging-copies-per-byte UNBLESSED no copy checker yet
+ocsp-stapling-anti-replay-time-window-caches seconds-per-relayed-megabyte UNBLESSED .github/workflows/bench.yml
+ocsp-stapling-anti-replay-time-window-caches ocsp-fetch-unit-tests 11 ferrox-core-tls::ocsp::tests
+ocsp-stapling-anti-replay-time-window-caches ocsp-handshake-witness-tests 5 ferrox-core-tls::rustls_backend::tests::a_stapled_identity_reaches_the_client_and_is_checked
+ocsp-stapling-anti-replay-time-window-caches vmess-history-tests 4 ferrox-app-vmess::tests::the_history_refuses_a_session_within_its_lifetime
+ocsp-stapling-anti-replay-time-window-caches ocsp-config-tests 1 ferrox-app-config::tests::an_ocsp_stapling_entry_records_the_ticker_and_renews_with_it
+
+# --- Multipath QUIC (matrix row 78) -----------------------------------------
+multipath-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
+multipath-quic syscalls-per-relayed-megabyte UNBLESSED scripts/count-ops.sh
+multipath-quic relay-staging-copies-per-byte UNBLESSED not measured
+multipath-quic seconds-per-relayed-megabyte UNBLESSED .github/workflows/bench.yml
+
+# --- uTLS-shaped ClientHello (matrix row 38) --------------------------------
+security-utls ops-retired-instructions UNBLESSED scripts/count-ops.sh
+security-utls syscalls-per-shaped-dial UNBLESSED scripts/count-ops.sh
+security-utls seconds-per-shaped-dial UNBLESSED CI benchmark-matrix.yml (no handshake clock)
+security-utls oracle-cases-replayed 50 ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls
+security-utls distinct-presets-behind-those-names 31 ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls
+security-utls shaped-dials-that-complete-a-tls13-handshake 1 ferrox-core-tls::rustls_backend::tests::a_shaped_chrome_handshake_reaches_a_stock_server
+security-utls shaped-dials-that-answer-a-tls13-client-auth-request 1 ferrox-core-tls::rustls_backend::tests::a_shaped_chrome_handshake_answers_a_client_certificate_request
+security-utls shaped-dials-that-complete-a-tls12-handshake 3 ferrox-core-tls::rustls_backend::tests::a_shaped_dial_finishes_every_tls12_record_shape
+security-utls relayed-records-that-allocate-once-warm 0 ferrox-core-tls::rustls_backend::tests::a_shaped_record_relays_without_allocating_once_the_handshake_is_done
+security-utls shaped-records-resumed-after-a-poll-split 1 ferrox-core-tls::shaped::client::tests::a_record_split_by_a_timeout_is_resumed_not_lost
+security-utls pulled-records-resumed-after-a-poll-split 1 ferrox-core-tls::shaped::client::tests::a_landed_record_split_by_a_timeout_is_resumed_not_lost
+security-utls shaped-handshake-records-resumed-after-a-poll-split 1 ferrox-core-tls::shaped::client::tests::a_handshake_record_split_by_a_timeout_is_resumed_not_lost
+security-utls carrier-records-that-allocate-once-warm 0 ferrox-core-tls::rustls_backend::tests::a_carrier_record_lands_in_the_callers_window_without_a_stage
+security-utls carrier-records-staged-into-a-fitting-window 0 ferrox-core-tls::rustls_backend::tests::a_carrier_record_lands_in_the_callers_window_without_a_stage
+security-utls tls12-gcm-records-that-shift-their-plaintext 0 ferrox-core-tls::shaped::record::tests::a_tls12_gcm_record_opens_behind_its_explicit_nonce
+security-utls tls12-cbc-records-that-shift-their-plaintext 0 ferrox-core-tls::shaped::record::tests::a_tls12_cbc_record_pads_to_the_rfc_length_and_open_back
+security-utls tls12-3des-records-that-shift-their-plaintext 0 ferrox-core-tls::shaped::record::tests::a_tls12_3des_record_pads_to_its_own_block_and_open_back
+security-utls heap-buffers-for-a-sealed-rc4-record 0 ferrox-core-tls::shaped::record::tests::a_tls12_rc4_record_carries_its_mac_and_no_iv
+security-utls tls12-sessions-replayed-byte-identical 16 ferrox-core-tls::shaped::oracle::tls12_sessions_match_go
+security-utls rsa-key-transport-vectors-replayed-byte-identical 20 ferrox-core-tls::shaped::oracle::rsa_key_transport_matches_go
+security-utls table-spelling-resolutions-that-allocate 0 ferrox-core-tls::shaped::tests::a_table_spelling_resolves_without_a_heap_buffer
+security-utls heap-buffers-for-a-chrome-hello 2 ferrox-core-tls::shaped::hello::tests::a_shaped_hello_writes_into_one_buffer
+security-utls heap-buffers-for-an-ech-cover 1 ferrox-core-tls::shaped::hello::tests::an_ech_cover_is_written_into_one_buffer
+security-utls heap-buffers-for-an-x25519-share 2 ferrox-core-tls::shaped::keys::tests::an_x25519_share_is_drawn_without_a_heap_buffer
+security-utls heap-buffers-for-a-shuffled-hello-order 0 ferrox-core-tls::shaped::hello::tests::the_shuffle_draws_its_picks_without_a_heap_buffer
+security-utls alpn-picks-that-allocate 0 ferrox-core-tls::shaped::hello::tests::an_alpn_pick_is_checked_without_a_copy
+security-utls forced-alpn-lists-that-allocate 0 ferrox-core-tls::shaped::hello::tests::an_alpn_pick_is_checked_without_a_copy
+security-utls heap-buffers-for-an-rsa-exponentiation 8 ferrox-core-tls::shaped::oracle::rsa_key_transport_matches_go
+security-utls heap-buffers-for-a-post-handshake-flight 0 ferrox-core-tls::shaped::client::tests::a_post_handshake_flight_is_read_where_it_lies
+security-utls certificate-entries-copied-out-of-the-record 0 ferrox-core-tls::shaped::client::tests::a_certificate_chain_is_read_where_the_record_lies
+security-utls pulled-record-reads-outside-the-inbuf 0 ferrox-core-tls::shaped::client::tests::a_record_read_fills_the_inbuf_it_decrypts_from
+security-utls inbuf-reallocations-per-record-cycle 0 ferrox-core-tls::shaped::client::tests::a_record_read_fills_the_inbuf_it_decrypts_from
+security-utls heap-buffers-for-a-warm-relay-write 0 ferrox-core-tls::shaped::client::tests::a_warm_write_seals_into_the_buffer_it_already_owns
+security-utls pulled-record-plaintext-copies-out-of-a-fitting-window 0 ferrox-core-tls::shaped::client::tests::a_tls13_record_is_read_where_it_lands
+security-utls pulled-record-reads-per-window 1 ferrox-core-tls::shaped::client::tests::a_pulled_record_lands_in_one_vectored_read
+security-ech heap-buffers-for-an-hpke-context 0 ferrox-core-tls::hpke::tests::a_context_costs_no_allocations
+security-ech heap-buffers-for-a-shaped-sealer 0 ferrox-core-tls::hpke::tests::a_shaped_sealer_costs_no_allocations
+security-ech heap-buffers-for-an-ech-config 1 ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer
+security-ech heap-buffers-for-a-real-ech-offer 8 ferrox-core-tls::shaped::hello::tests::an_enable_ech_offer_parses_in_place
+security-ech seal-plaintext-buffer-moves 0 ferrox-core-tls::hpke::tests::an_owned_seal_appends_where_the_plaintext_lay
+
+# --- TLS options (row 48) ---------------------------------------------------
+security-tls-options ops-retired-instructions UNBLESSED scripts/count-ops.sh
+security-tls-options syscalls-per-tls-handshake UNBLESSED scripts/count-ops.sh
+security-tls-options user-space-copies-per-tls-handshake UNBLESSED no copy checker yet
+security-tls-options seconds-per-tls-handshake UNBLESSED CI bench.yml (no cell yet)
+security-tls-options client-version-ceilings-narrowing-the-shaped-hello 1 ferrox-core-tls::shaped::hello::tests::a_client_version_ceiling_narrows_the_shaped_hello
+security-tls-options client-version-ceilings-refused-by-the-stock-lane 1 ferrox-core-tls::rustls_backend::tests::a_client_version_ceiling_refuses_a_newer_listener
+security-tls-options server-curve-lists-ordered-by-the-stock-lane 1 ferrox-core-tls::rustls_backend::tests::a_configured_server_curve_orders_the_listener_provider
+security-tls-options server-curve-lists-picked-by-the-shaped-lane 1 ferrox-core-tls::shaped::server::tests::a_configured_server_curve_is_the_one_the_listener_picks
+
+# --- ECH -------------------------------------------------------------------
+security-ech aes256-gcm-seal-retired-instructions 14957 scripts/count-ops.sh
+security-ech aes256-gcm-open-retired-instructions 15329 scripts/count-ops.sh
+security-ech syscalls-per-ech-handshake UNBLESSED scripts/count-ops.sh
+security-ech user-space-copies-per-ech-handshake UNBLESSED no copy checker yet
+security-ech seconds-per-ech-handshake UNBLESSED CI bench.yml (no cell yet)
+security-ech ech-offers-accepted-by-the-stock-lane 1 ferrox-app-proxy::tests::vless_over_ech_tls_carries_an_echo
+security-ech rejected-ech-offers-retried-once 1 ferrox-app-proxy::tests::a_rejected_ech_offer_retries_once_with_the_servers_list
+security-ech ech-retries-that-ask-at-most-twice 1 ferrox-app-proxy::tests::a_retry_is_the_dials_last_ask
+security-ech ech-offers-built-by-the-shaped-lane 1 ferrox-core-tls::shaped::hello::tests::a_real_ech_offer_hides_the_inner_name_under_the_public_one
+security-ech quic-ech-offers-accepted 1 ferrox-app-quic::tests::an_ech_serving_lane_accepts_an_offer
+security-ech quic-dials-that-offer-the-configured-list 1 ferrox-app-quic::tests::a_client_dial_offers_the_configured_ech_list
+security-ech quic-lanes-that-fall-back-without-an-offer 1 ferrox-app-quic::tests::an_ech_serving_lane_answers_a_client_without_an_offer
+security-ech heap-buffers-for-an-ech-cover 1 ferrox-core-tls::shaped::hello::tests::an_ech_cover_is_written_into_one_buffer
+
+# --- engine sniffing --------------------------------------------------------
+engine-sniffing-http-tls-quic-fakedns ops-retired-instructions 1228 scripts/count-ops.sh
+engine-sniffing-http-tls-quic-fakedns http-host-and-tls-sni-recognized 2 ferrox-app-sniff::tests::reads_http_host_and_tls_sni
+engine-sniffing-http-tls-quic-fakedns quic-initial-sni-recognized 1 ferrox-app-sniff::tests::reads_a_quic_initial_sni
+engine-sniffing-http-tls-quic-fakedns bittorrent-and-utp-recognized 2 ferrox-app-sniff::tests::reads_bittorrent_and_utp
+engine-sniffing-http-tls-quic-fakedns excluded-targets-kept 2 ferrox-app-sniff::tests::exclusions_keep_the_original_destination
+engine-sniffing-http-tls-quic-fakedns loopback-sniffed-host-overrides 1 ferrox-app-proxy::tests::a_loopback_sniffing_overrides_the_re_inject_destination
+engine-sniffing-http-tls-quic-fakedns routed-protocol-selectors 1 ferrox-app-router::tests::a_protocol_rule_reads_the_sniffed_protocol
+
+# --- loopback re-inject outbound --------------------------------------------
+loopback ops-retired-instructions UNBLESSED scripts/count-ops.sh
+loopback tcp-echo-bytes-preserved 65536 ferrox-app-proxy::tests::a_re_injected_tcp_stream_carries_an_echo
+loopback udp-datagram-bytes-preserved 4 ferrox-app-proxy::tests::a_re_injected_udp_association_carries_a_datagram
+loopback sniffed-http-host-dials-the-sniffed-name 1 ferrox-app-proxy::tests::a_loopback_sniffing_overrides_the_re_inject_destination
+loopback route-targets-resolved-at-startup 1 ferrox-app-proxy::tests::a_loopback_outbound_is_a_route_target
+loopback named-inbound-rules-consulted 1 ferrox-app-proxy::tests::a_loopback_consults_the_named_inbounds_rules
+loopback protobuf-outbound-decoded 1 ferrox-app-xray_pb::tests::the_loopback_outbound_decodes_to_the_json_this_tree_serves
+
+# --- unix domain sockets ------------------------------------------------------
+unix ops-retired-instructions UNBLESSED scripts/count-ops.sh
+unix syscalls-per-round-trip UNBLESSED no syscall checker yet
+unix user-space-copies-per-round-trip UNBLESSED no copy checker yet
+unix seconds-per-round-trip UNBLESSED CI bench.yml (no cell yet)
+unix unix-stream-bytes-preserved 65536 ferrox-app-conn::tests::a_unix_connection_carries_the_same_bytes_the_tcp_round_trip_does
+unix unix-head-not-vector-multiple 1501 ferrox-app-conn::tests::a_unix_round_trip_survives_lengths_a_vector_would_split
+unix unix-timeout-bound-read-back 50 ferrox-app-conn::tests::a_unix_read_timeout_arms_the_way_the_tcp_one_does
+unix unix-path-past-the-field-refused 200 ferrox-app-conn::tests::a_unix_path_past_the_socket_field_is_refused
+unix unix-abstract-name-served 27 ferrox-app-conn::tests::a_unix_abstract_name_is_bound_and_dialed
+unix unix-abstract-padded-field 108 ferrox-app-conn::tests::a_doubled_unix_at_names_the_padded_abstract_name
+unix unix-permission-mode 504 ferrox-app-conn::tests::a_unix_listener_takes_the_permission_it_names
+unix unix-non-octal-comma-literal 7 ferrox-app-conn::tests::a_unix_comma_path_that_is_not_a_mode_stays_literal
+unix unix-regular-file-refused 16 ferrox-app-conn::tests::a_unix_listener_never_removes_a_regular_file
+unix unix-mode-path-at-field-limit 107 ferrox-app-conn::tests::a_unix_mode_on_a_path_at_the_address_field_limit
+unix unix-mode-staging-litter 0 ferrox-app-conn::tests::a_unix_mode_staging_leaves_only_the_socket
+
+# --- tun device inbound -----------------------------------------------------
+front-tun-smoltcp ops-retired-instructions 32598 scripts/count-ops.sh
+front-tun-smoltcp syscalls-per-tun-packet UNBLESSED no syscall checker yet
+front-tun-smoltcp user-space-copies-per-tun-packet UNBLESSED no copy checker yet
+front-tun-smoltcp time-tcp-down-1 ferrox=13.767Gbit/s,hev=16.039Gbit/s,ratio=0.86 tun-bench.yml
+front-tun-smoltcp time-tcp-down-10 ferrox=20.363Gbit/s,hev=43.298Gbit/s,ratio=0.47 tun-bench.yml
+front-tun-smoltcp time-tcp-up-1 ferrox=17.848Gbit/s,hev=23.474Gbit/s,ratio=0.76 tun-bench.yml
+front-tun-smoltcp time-tcp-up-10 ferrox=21.132Gbit/s,hev=40.103Gbit/s,ratio=0.53 tun-bench.yml
+front-tun-smoltcp time-rr ferrox=8591tps,hev=17785tps,ratio=0.48 tun-bench.yml
+front-tun-smoltcp time-rr-8x1k ferrox=61292tps,hev=93763tps,ratio=0.65 tun-bench.yml
+front-tun-smoltcp time-udp-100k ferrox=99268pps,hev=99301pps,ratio=1.00 tun-bench.yml
+front-tun-smoltcp cpu-cores-at-tcp-down-10 ferrox=2.98cores,hev=2.06cores tun-bench.yml
+front-tun-smoltcp rss-mb-at-ten-flows ferrox=75.2MB,hev=2.5MB tun-bench.yml
+front-tun-smoltcp writes-after-a-refused-packet 2 ferrox-app-tun-stack::tests::a_refused_packet_is_dropped_and_the_next_still_goes_out
+front-tun ops-retired-instructions UNBLESSED scripts/count-ops.sh
+front-tun syscalls-per-tun-packet UNBLESSED no syscall checker yet
+front-tun dial-set-flows-matching-the-pinned-stack 3 ferrox-app-tun::tests::the_dial_set_matches_the_pinned_stream
+front-tun reverse-role-response-round-trips 1 ferrox-app-tun::tests::the_response_bytes_come_back_as_ip_packets
+front-tun parse-copies-per-packet 0 ferrox-app-tun::tests::the_payload_is_borrowed_from_the_read_buffer
+front-tun flows-handed-back-at-the-idle-budget 2 ferrox-app-tun::tests::a_quiet_tun_flow_hands_its_threads_back
+front-tun flows-finished-with-fin-on-proxy-close 1 ferrox-app-tun::tests::a_closed_proxy_leg_sends_fin_after_its_bytes
+front-tun refused-proxy-legs-reset 1 ferrox-app-tun::tests::a_refused_proxy_leg_resets_the_device_flow
+front-tun writes-after-a-refused-packet 2 ferrox-app-tun::tests::a_refused_packet_does_not_end_the_flow
+front-tun datagram-association-round-trips 1 ferrox-app-tun::tests::a_datagram_flow_frames_the_association_and_returns_the_echo
+front-tun datagram-parse-copies-per-packet 0 ferrox-app-tun::tests::the_datagram_is_borrowed_from_the_read_buffer
+front-tun datagram-reply-packets-checksummed 1 ferrox-app-tun::tests::the_reply_packet_verifies_at_the_reference_reader
+front-tun datagram-dial-set-flows-matching-the-pinned-stack 5 ferrox-app-tun::tests::the_datagram_dial_set_matches_the_pinned_stream
+front-tun icmp-echo-replies-verified 1 ferrox-app-tun::tests::an_icmp_echo_request_is_answered_as_a_reply
+front-tun icmp-non-echo-messages-refused 3 ferrox-app-tun::tests::a_non_echo_icmp_message_is_refused
+front-tun ipv6-tcp-packets-parsed 1 ferrox-app-tun::tests::an_ipv6_tcp_packet_parses_and_renders_with_its_checksum
+front-tun ipv6-extension-headers-walked 1 ferrox-app-tun::tests::an_ipv6_extension_header_is_walked_to_the_transport
+front-tun icmpv6-echo-replies-verified 1 ferrox-app-tun::tests::a_v6_echo_request_flips_to_a_v6_reply
+front-tun icmp-error-quoted-flows-named 1 ferrox-app-tun::tests::an_icmp_error_quotes_the_flow_it_ends
+front-tun virtio-gso-headers-written 1 ferrox-app-tun::tests::a_virtio_gso_header_names_the_tcp_segment
+front-tun gso-frames-per-large-response-read 1 ferrox-app-tun::tests::a_large_response_read_leaves_as_one_gso_frame
+front-tun emit-packet-reallocations-per-render 0 ferrox-app-tun::tests::an_emitted_packet_reuses_its_render_buffer
+front-tun response-payload-copies-per-read 0 ferrox-app-tun::tests::a_response_is_rendered_where_the_relay_read_landed
+front-tun flows-served-off-the-queue-that-opened-them 1 ferrox-app-tun::tests::a_flow_opened_on_one_queue_is_served_from_another
+front-tun direct-lane-flows-without-a-pair 1 ferrox-app-tun::tests::a_direct_lane_carries_the_flow_without_the_pair
+front-tun direct-datagram-lanes-without-the-association 1 ferrox-app-tun::tests::a_direct_datagram_lane_frames_the_relay_without_the_association
+front-tun time-tcp-up-1 ferrox=26.737Gbit/s,hev=23.474Gbit/s,ratio=1.14 tun-bench.yml
+front-tun time-tcp-up-10 ferrox=43.763Gbit/s,hev=40.103Gbit/s,ratio=1.09 tun-bench.yml
+front-tun time-tcp-down-1 ferrox=26.873Gbit/s,hev=16.039Gbit/s,ratio=1.68 tun-bench.yml
+front-tun time-tcp-down-10 ferrox=48.259Gbit/s,hev=43.298Gbit/s,ratio=1.11 tun-bench.yml
+front-tun time-rr ferrox=25801tps,hev=17785tps,ratio=1.45 tun-bench.yml
+front-tun time-rr-8x1k ferrox=95637tps,hev=93763tps,ratio=1.02 tun-bench.yml
+front-tun time-udp-100k ferrox=99296pps,hev=99301pps,ratio=1.00 tun-bench.yml
+front-tun cpu-cores-at-tcp-down-10 ferrox=1.79cores,hev=2.06cores tun-bench.yml
+front-tun rss-mb-at-tcp-down-10 ferrox=15.2MB,hev=2.5MB tun-bench.yml
+front-tun rss-above-start-mb-at-tcp-down-10 ferrox=1.0MB,hev=0.7MB tun-bench.yml
+
+# --- finalmask post-TLS TCP mask chain --------------------------------------
+finalmask sudoku-ops-retired-instructions UNBLESSED scripts/count-ops.sh
+finalmask sudoku-entropy-getrandoms 512 ferrox-core-finalmask-sudoku::tests::the_entropy_supply_serves_a_pure_encode
+finalmask sudoku-encoder-capacity-growth 0 ferrox-core-finalmask-sudoku::tests::the_encoder_buffer_holds_its_capacity
+finalmask sudoku-pure-octets-per-plaintext-octet 4 ferrox-core-finalmask-sudoku::tests::the_wire_ratio_is_the_reference_shape
+finalmask sudoku-packed-octets-per-three-octets 4 ferrox-core-finalmask-sudoku::tests::the_wire_ratio_is_the_reference_shape
+finalmask ops-retired-instructions 346140 scripts/count-ops.sh
+finalmask pieces-restaged-per-hello 0 ferrox-core-finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies
+finalmask filter-verdicts-from-one-list 5 ferrox-app-config::tests::a_finalmask_filter_reads_both_lists
+finalmask merged-pieces-restaged-per-hello 0 ferrox-core-finalmask::tests::a_merged_run_gathers_the_callers_body_without_restaging_it
+finalmask getrandoms-for-two-random-widths 1 ferrox-core-finalmask::tests::a_random_merged_hello_draws_only_the_random_widths_from_the_supply
+finalmask records-past-max-split 0 ferrox-core-finalmask::tests::a_max_split_ends_the_run_on_the_whole_hello
+finalmask socket-writes-for-a-merged-hello 1 ferrox-core-finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths
+finalmask hello-records-from-the-config 9 ferrox-app-proxy::tests::a_configured_fragment_chain_cuts_the_hello_on_the_wire
+finalmask header-custom-handshake-write-calls 1 ferrox-core-finalmask::header_custom::tests::a_client_writes_its_sequence_then_checks_the_answer
+finalmask header-custom-error-bytes-on-mismatch 1 ferrox-core-finalmask::header_custom::tests::a_mismatch_writes_the_configured_error_and_stops
+finalmask header-custom-captured-vars-per-handshake 1 ferrox-core-finalmask::header_custom::tests::a_captured_value_survives_into_the_next_connection
+finalmask header-custom-ops-retired-instructions UNBLESSED scripts/count-ops.sh
+finalmask xmc-ops-retired-instructions UNBLESSED scripts/count-ops.sh
+finalmask xmc-syscalls-per-handshake UNBLESSED scripts/count-ops.sh
+finalmask xmc-copies-per-handshake UNBLESSED scripts/count-ops.sh
+finalmask xmc-time UNBLESSED bench.yml
+finalmask xmc-paired-session-directions 2 ferrox-app-proxy::tests::a_configured_xmc_stage_carries_both_directions
+finalmask xmc-unknown-profile-disconnects 1 ferrox-core-finalmask-xmc::tests::an_unknown_profile_is_disconnected
+finalmask xmc-keepalives-echoed-by-client 1 ferrox-core-finalmask-xmc::tests::a_client_echoes_keepalives_and_skips_other_payloads
+finalmask xmc-payload-copies-in-the-parse 0 ferrox-core-finalmask-xmc::packet_stream::tests::a_custom_payload_is_a_slice_of_its_frame
+finalmask xmc-writer-capacity-growth 0 ferrox-core-finalmask-xmc::packet_stream::tests::the_frame_buffer_holds_its_capacity
+finalmask header-custom-handshake-time UNBLESSED not measured
+finalmask fragment-time UNBLESSED CI bench.yml (no cell yet)
+finalmask unarmable-masks-dialled-unmasked 0 ferrox-app-proxy::tests::a_tcp_mask_this_tree_cannot_arm_is_refused
+finalmask splices-past-a-masked-writer 0 ferrox-app-proxy::tests::a_masked_destination_is_not_fed_by_splice
+finalmask pinned-fragment-interop-rows 2 scripts/run-upstream-suite.sh
+
+# --- HTTP proxy, both roles --------------------------------------------------
+http-proxy ops-retired-instructions UNBLESSED scripts/count-ops.sh
+http-proxy syscalls-per-forwarded-request UNBLESSED scripts/count-ops.sh
+http-proxy seconds-per-forwarded-request UNBLESSED CI bench.yml (no cell yet)
+http-proxy connect-grant-allocations 0 ferrox-app-proxy::tests::a_connect_grant_costs_no_heap_buffer
+http-proxy connect-request-allocations 0 ferrox-app-proxy::tests::the_connect_request_builds_in_one_buffer
+http-proxy forwarded-head-allocations 0 ferrox-app-proxy::tests::an_origin_form_head_reaches_the_uplink_where_it_landed
+http-proxy forwarded-head-copies 0 ferrox-app-proxy::tests::a_forwarded_head_is_the_head_that_was_read
+http-proxy pb-client-endpoints-decoded 1 ferrox-app-xray_pb::tests::a_socks_http_fallback_scenario_decodes_both_sides
+http-proxy hop-relay-splice-pipes 2 ferrox-app-proxy::tests::a_plain_http_hop_relays_without_a_user_space_copy
+
+# --- Routing rules and geosite/geoip -----------------------------------------
+engine-router ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-router syscalls-per-flow UNBLESSED scripts/count-ops.sh
+engine-router flow-decision-allocations 0 ferrox-app-router::tests::a_flow_without_a_domain_matcher_allocates_nothing
+engine-router host-lowercase-buffers-lowercase 0 ferrox-app-router::tests::a_lowercase_host_matches_without_a_buffer
+engine-router host-lowercase-buffers-mixed-case 1 ferrox-app-router::tests::a_mixed_case_host_takes_one_lowercase_buffer
+engine-router host-lowercase-buffers-mixed-case-two-rules 1 ferrox-app-router::tests::a_mixed_case_host_is_lowercased_once_for_the_table
+engine-router host-lowercase-buffers-before-a-domain-rule 0 ferrox-app-router::tests::a_mixed_case_host_matched_before_a_domain_rule_is_not_lowered
+engine-router geosite-shared-entry-copies 0 ferrox-app-router::tests::a_code_named_by_two_rules_shares_its_entries
+engine-router geosite-unwanted-code-allocations 0 ferrox-app-router::tests::an_unwanted_geosite_code_is_not_decoded
+engine-router geoip-unwanted-code-allocations 0 ferrox-app-router::tests::an_unwanted_geoip_code_is_not_decoded
+engine-router geosite-unrequested-attribute-allocations 0 ferrox-app-router::tests::attributes_are_not_decoded_unless_requested
+engine-router domain-table-reads-ip-if-non-match-candidate 1 ferrox-app-router::tests::a_candidate_is_not_re_evaluated_under_ip_if_non_match
+engine-router literal-route-allocations 0 ferrox-app-proxy::tests::a_route_decision_on_a_literal_address_allocates_nothing
+engine-router dns-lookups-per-rule-matched-name 0 ferrox-app-router::tests::ip_if_non_match_resolves_only_after_no_rule_matched
+engine-router dns-lookups-per-unmatched-name 1 ferrox-app-router::tests::ip_if_non_match_resolves_only_after_no_rule_matched
+engine-router dns-lookups-ip-if-non-match-no-ip-rule 0 ferrox-app-router::tests::ip_if_non_match_does_not_resolve_without_an_ip_rule
+engine-router dns-lookups-ip-on-demand-source-failed 0 ferrox-app-router::tests::ip_on_demand_does_not_resolve_when_a_later_selector_fails
+engine-router gunzip-write-chunk-bytes 65536 ferrox-app-geodata::tests::a_gzipped_asset_is_written_while_it_is_decompressed
+
+# --- SOCKS5, both roles ------------------------------------------------------
+socks ops-retired-instructions 895 scripts/count-ops.sh
+socks socks-raw-down-8-client-mib-per-second 2658 CI benchmark-matrix.yml run 43292720499
+socks socks-raw-down-8-server-mib-per-second 2808 CI benchmark-matrix.yml run 43292720499
+socks oracle-lines-matching-the-pinned-go 10 ferrox-core-socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
+socks methods-offered-in-the-greeting 1 ferrox-core-socks::tests::the_greeting_is_the_bytes_the_pinned_writer_writes
+socks request-bytes-per-tcp-dial 10 ferrox-core-socks::tests::the_request_is_the_bytes_the_pinned_writer_writes
+socks credential-bytes-per-authenticated-dial 5 ferrox-core-socks::tests::the_user_pass_block_is_rfc_1929
+socks datagram-frame-bytes-overhead 10 ferrox-core-socks::tests::the_datagram_frame_is_rfc_1928
+socks servers-answering-another-method-refused 1 ferrox-app-socks::tests::a_credentialed_session_refuses_a_server_that_answers_no_auth
+socks device-flows-leaving-through-the-client-lane 1 ferrox-app-tun::tests::a_device_flow_leaves_through_the_socks_client_lane
+socks tcp-tunnels-through-the-front 1 ferrox-app-proxy::tests::a_socks_client_dials_the_front_and_carries_an_echo
+socks datagrams-through-the-front 1 ferrox-app-proxy::tests::a_socks_client_carries_a_datagram_through_the_front
+socks datagram-payload-copies-per-forwarded-datagram 0 ferrox-app-proxy::tests::a_forwarded_datagram_is_the_frame_the_client_framed
+socks datagram-frame-allocations-per-frame 0 ferrox-app-proxy::tests::a_forwarded_datagram_is_the_frame_the_client_framed
+socks front-name-zero-filled-bytes 12 ferrox-app-proxy::tests::a_socks_front_zeroes_the_name_once
+socks datagram-rebuild-copies-per-reframed-datagram 1 ferrox-app-proxy::tests::a_datagram_naming_a_host_is_reframed_around_its_payload
+socks client-datagram-payload-copies 0 ferrox-app-proxy::tests::a_client_datagram_hands_its_payload_over_by_pointer
+socks device-datagram-payload-copies 0 ferrox-app-tun::tests::a_device_datagram_hands_the_payload_over_by_pointer
+socks device-datagram-head-reallocations-after-the-first 0 ferrox-app-tun::tests::a_device_datagram_hands_the_payload_over_by_pointer
+socks device-datagram-head-bytes 22 ferrox-app-tun::tests::a_device_datagram_hands_the_payload_over_by_pointer
+socks datagram-frames-the-client-framed 1 ferrox-app-proxy::tests::a_forwarded_datagram_is_the_frame_the_client_framed
+socks datagram-ipv6-literal-destinations-answered 1 ferrox-app-proxy::tests::a_destination_naming_an_ipv6_literal_is_the_address_it_named
+socks credentialed-tunnels-through-the-front 1 ferrox-app-proxy::tests::a_socks_client_offers_the_credential_the_front_asks_for
+socks credentials-the-front-refuses 1 ferrox-app-proxy::tests::a_front_refuses_a_credential_it_does_not_know
+socks config-lanes-named 1 ferrox-app-proxy::tests::a_socks_outbound_names_its_server_and_credential
+socks pb-scenario-sides-decoded 2 ferrox-app-xray_pb::tests::a_socks_scenario_decodes_both_sides
+socks socks4-handshake-allocations 0 ferrox-app-proxy::tests::a_socks4_handshake_costs_no_heap_buffer
+socks socks4a-handshake-allocations 1 ferrox-app-proxy::tests::a_socks4a_handshake_costs_one_heap_buffer
+socks credentialed-literal-handshake-allocations 0 ferrox-app-proxy::tests::a_credentialed_literal_handshake_costs_no_heap_buffer
+socks socks4-reply-bytes 8 ferrox-core-socks::tests::the_socks4_reply_is_the_bytes_the_pinned_server_writes
+socks socks4-client-request-buffers 0 ferrox-app-socks::tests::a_socks4_connect_takes_no_heap_buffer
+socks socks4-request-zero-filled-bytes 0 ferrox-core-socks::tests::the_socks4_request_is_one_unzeroed_buffer
+socks socks4a-client-request-buffers 0 ferrox-app-socks::tests::a_socks4a_connect_takes_no_heap_buffer
+socks socks5-connect-write-calls 2 ferrox-app-socks::tests::a_no_auth_connect_writes_the_greeting_then_the_request
+socks socks5-connect-read-calls 3 ferrox-app-socks::tests::a_no_auth_connect_writes_the_greeting_then_the_request
+socks socks5-connect-allocations 0 ferrox-app-socks::tests::a_no_auth_connect_writes_the_greeting_then_the_request
+socks socks5-credentialed-connect-write-calls 3 ferrox-app-socks::tests::a_credentialed_connect_writes_the_greeting_credential_and_request
+socks socks5-credentialed-connect-read-calls 4 ferrox-app-socks::tests::a_credentialed_connect_writes_the_greeting_credential_and_request
+socks socks5-credentialed-connect-allocations 0 ferrox-app-socks::tests::a_credentialed_connect_writes_the_greeting_credential_and_request
+socks socks5-long-connect-allocations 0 ferrox-app-socks::tests::a_long_destination_and_a_long_bound_name_take_no_heap_buffer
+socks socks5-long-connect-read-calls 4 ferrox-app-socks::tests::a_long_destination_and_a_long_bound_name_take_no_heap_buffer
+socks socks5-association-bound-name-allocations 0 ferrox-app-socks::tests::an_association_bound_name_is_read_without_a_heap_buffer
+socks socks4-requests-a-credential-front-refuses 1 ferrox-app-proxy::tests::a_front_that_asks_for_a_credential_refuses_a_socks4_request
+socks socks4-xray-scenario-tests-passing 1 scripts/run-upstream-suite.sh
+socks http-fallback-requests-served 1 ferrox-app-proxy::tests::a_socks_front_serves_an_http_outbound_that_offers_its_account
+socks http-fallback-scenario-tests-passing 1 scripts/run-upstream-suite.sh
+
+# --- dokodemo-door transparent inbound -----------------------------------------
+front-dokodemo ops-retired-instructions UNBLESSED scripts/count-ops.sh
+front-dokodemo syscalls-per-datagram UNBLESSED scripts/count-ops.sh
+front-dokodemo user-space-copies-per-datagram UNBLESSED no copy checker yet
+front-dokodemo seconds-per-datagram UNBLESSED CI bench.yml (no cell yet)
+front-dokodemo datagrams-carrying-to-the-target 1 ferrox-app-proxy::tests::a_dokodemo_door_carries_a_datagram_to_its_target
+front-dokodemo datagram-frame-allocations-per-frame 0 ferrox-app-proxy::tests::a_forwarded_datagram_is_the_frame_the_client_framed
+front-dokodemo associations-answering-with-the-relay 1 ferrox-app-proxy::tests::the_udp_association_carries_a_datagram_to_the_target
+front-dokodemo transparent-modes-decoded 4 ferrox-app-proxy::tests::dokodemo_transparency_reads_follow_and_tproxy
+front-dokodemo loopback-destinations-classified 4 ferrox-app-proxy::tests::dokodemo_loopback_is_the_listener_or_its_loopback_port
+front-dokodemo redirect-fallbacks-classified 4 ferrox-app-proxy::tests::dokodemo_redirect_uses_the_kernel_or_the_rewrite
+front-dokodemo protobuf-port-map-fields-decoded 1 ferrox-app-xray_pb::tests::a_dokodemo_port_map_decodes
+front-dokodemo protobuf-follow-redirect-fields-decoded 1 ferrox-app-xray_pb::tests::a_dokodemo_follow_redirect_decodes
+front-dokodemo protobuf-user-level-fields-decoded 1 ferrox-app-xray_pb::tests::a_dokodemo_user_level_decodes
+front-dokodemo xray-scenario-tests-passing 2 scripts/run-upstream-suite.sh
+carrier-foxy h3-read-calls-per-16k-download 5 ferrox-app-foxy::loopback::an_h3_read_crosses_the_frames_under_it
+carrier-foxy h3-bytes-lost-when-the-peer-finishes 0 ferrox-app-foxy::loopback::an_h3_stream_the_peer_finished_ends_the_tunnel
+carrier-foxy carrier-cache-lookup-allocations 0 ferrox-core-foxy::tests::a_carrier_cache_lookup_allocates_nothing
+
+# --- blackhole sink, both roles -----------------------------------------------
+blackhole ops-retired-instructions UNBLESSED scripts/count-ops.sh
+blackhole syscalls-per-answered-flow UNBLESSED scripts/count-ops.sh
+blackhole answer-bytes-the-reference-writes 101 ferrox-core-blackhole::tests::the_answer_is_the_bytes_the_pinned_go_writes
+blackhole inbound-http-answer-bytes 101 ferrox-app-proxy::tests::a_blackhole_inbound_serves_all_three_answers
+blackhole answer-writes-per-flow 1 ferrox-core-blackhole::tests::the_answer_is_one_write
+blackhole answer-copies-per-byte-written 0 ferrox-core-blackhole::tests::the_answer_reaches_the_writer_uncopied
+blackhole answer-allocations-per-flow 0 ferrox-core-blackhole::tests::the_answer_reaches_the_writer_uncopied
+blackhole answer-buffer-moves-per-clone 0 ferrox-core-blackhole::tests::the_answer_reaches_the_writer_uncopied
+blackhole custom-answer-bytes-written-verbatim 3 ferrox-core-blackhole::tests::the_answer_is_the_bytes_the_pinned_go_writes
+blackhole peer-reads-per-window 1 ferrox-app-blackhole::tests::the_peers_bytes_are_read_in_windows
+blackhole peer-reads-for-the-end 1 ferrox-app-blackhole::tests::the_peers_bytes_are_read_in_windows
+blackhole drain-allocations-per-flow 0 ferrox-app-blackhole::tests::the_peers_bytes_are_read_in_windows
+blackhole upstream-connections-per-flow 0 ferrox-app-proxy::tests::a_blackhole_front_answers_the_client_and_dials_nothing
+blackhole scenario-map-tests-passing 1 scripts/run-xray-scenario-map.sh
+blackhole seconds-per-answered-flow UNBLESSED CI bench.yml (no cell yet)
+carrier-foxy h2-connections-per-two-flows 1 ferrox-app-foxy::loopback::two_live_flows_ride_one_session
+carrier-foxy dial-order-allocations-per-flow 0 ferrox-core-foxy::tests::a_dial_order_walks_without_touching_the_heap
+carrier-foxy ladder-walk-allocations-per-flow 0 ferrox-app-proxy::tests::a_flow_walks_the_ladder_without_touching_the_heap
+carrier-foxy edge-name-copies-per-flow 0 ferrox-core-foxy::tests::an_edge_name_is_shared_rather_than_copied
+carrier-foxy edge-strike-lookup-allocations 0 ferrox-core-foxy::tests::an_edge_strike_lookup_allocates_nothing
+carrier-foxy carrier-alpn-allocations-per-dial 0 ferrox-app-foxy::tests::a_carriers_alpn_list_is_shared_rather_than_built_per_dial
+
+# --- the DNS outbound -------------------------------------------------------
+dns-outbound ops-retired-instructions 52343912 scripts/count-ops.sh
+dns-outbound syscalls-per-forwarded-question UNBLESSED scripts/count-ops.sh
+dns-outbound user-space-copies-per-forwarded-question UNBLESSED no copy checker yet
+dns-outbound seconds-per-forwarded-question UNBLESSED CI bench.yml (no cell yet)
+dns-outbound answer-cases-replayed 21 ferrox-core-dns::tests::the_answer_is_the_bytes_the_pinned_go_writes
+dns-outbound parse-refusals-replayed 8 ferrox-core-dns::tests::the_parse_refuses_what_the_reference_refuses
+dns-outbound pointer-hop-cap 10 ferrox-core-dns::tests::the_pointer_loop_refuses_at_the_cap
+dns-outbound maximum-name-bytes 254 ferrox-core-dns::tests::the_name_bound_matches_the_reference
+dns-outbound allocations-per-forwarded-question 0 ferrox-core-dns::tests::a_forwarded_question_is_decided_without_an_allocation
+dns-outbound allocations-per-hijacked-question 1 ferrox-core-dns::tests::a_hijacked_question_opens_only_its_answer
+dns-outbound name-folds-per-rule-list 1 ferrox-core-dns::tests::a_mixed_case_name_is_folded_once_for_the_rule_list
+dns-outbound name-folds-per-lowercase-rule-list 0 ferrox-core-dns::tests::a_lowercase_name_matches_the_rule_list_without_a_fold
+dns-outbound allocations-per-literal-lookup 2 ferrox-app-proxy::dns_lane_tests::a_literal_lookup_answers_without_a_socket_addr_buffer
+dns-outbound allocations-per-cached-lookup 2 ferrox-app-proxy::dns_lane_tests::a_cached_lookup_answers_without_a_copy_of_the_cache
+dns-outbound allocations-per-eight-stream-messages 1 ferrox-app-proxy::dns_lane_tests::the_stream_lane_reads_every_message_into_one_buffer
+dns-outbound stream-answer-bytes-per-query 38 ferrox-app-proxy::dns_lane_tests::the_dns_stream_lane_relays_a_direct_query_byte_for_byte
+dns-outbound datagram-query-bytes-per-datagram 43 ferrox-app-proxy::dns_lane_tests::the_dns_datagram_lane_relays_a_direct_datagram_byte_for_byte
+dns-outbound datagram-answer-bytes-per-datagram 58 ferrox-app-proxy::dns_lane_tests::the_dns_datagram_lane_relays_a_direct_datagram_byte_for_byte
+engine-dns ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-dns syscalls-per-udp-exchange UNBLESSED scripts/count-ops.sh
+engine-dns allocations-per-cached-lookup 4 ferrox-app-dnsapp::resolver_tests::a_cache_hit_copies_only_the_answer_vector
+engine-dns fake-hit-allocations 0 ferrox-app-dnsapp::resolver_tests::a_fake_hit_allocates_nothing
+engine-dns fake-name-allocations 1 ferrox-app-dnsapp::resolver_tests::a_fake_name_is_held_once
+engine-dns seconds-per-lookup UNBLESSED CI bench.yml (no cell yet)
+
+# --- the reverse tunnel -----------------------------------------------------
+reverse ops-retired-instructions 80066 scripts/count-ops.sh
+reverse tcp-echo-bytes-preserved 5 ferrox-app-proxy::reverse_tests::a_portal_flow_reaches_the_bridge_and_comes_back
+
+# --- health observatory and healthcheck inbound -----------------------------
+engine-observatory ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-observatory burst-ring-samples 10 ferrox-app-observatory::tests::a_burst_ring_holds_the_sampling_window_and_puts_without_allocating
+engine-observatory sample-allocations-per-put 0 ferrox-app-observatory::tests::a_burst_ring_holds_the_sampling_window_and_puts_without_allocating
+engine-observatory failed-legacy-delay-ms 99999999 ferrox-app-observatory::tests::a_failed_legacy_probe_keeps_the_reference_delay
+engine-observatory default-burst-samples 10 ferrox-app-observatory::tests::burst_settings_default_to_ten_samples_and_head
+front-healthcheck ops-retired-instructions UNBLESSED scripts/count-ops.sh
+front-healthcheck syscalls-per-answer UNBLESSED scripts/count-ops.sh
+front-healthcheck answer-copies-per-byte-written UNBLESSED no copy checker yet
+front-healthcheck seconds-per-answer UNBLESSED CI bench.yml (no cell yet)
+front-healthcheck answer-allocations 0 ferrox-app-proxy::hc_tests::an_hc_answer_is_prebuilt_without_allocating
+front-healthcheck answer-bytes 85 ferrox-app-proxy::hc_tests::an_hc_answer_is_prebuilt_without_allocating
+
+# --- TLS client from config -------------------------------------------------
+tls-client ops-retired-instructions UNBLESSED scripts/count-ops.sh
+tls-client syscalls-per-relayed-megabyte UNBLESSED scripts/count-ops.sh
+tls-client relay-staging-copies-per-byte UNBLESSED not measured
+tls-client seconds-per-relayed-megabyte UNBLESSED .github/workflows/bench.yml
+tls-client socks-tls-carriers-parsed 7 ferrox-app-proxy::tests::socks_tls_outbound_parses_diallable_carriers
+tls-client http-tls-carriers-parsed 7 ferrox-app-proxy::tests::http_tls_outbound_parses_diallable_carriers
+tls-client socks-tls-raw-echo-round-trips 1 ferrox-app-proxy::tests::socks_tls_over_raw_reaches_echo
+tls-client socks-tls-ws-echo-round-trips 1 ferrox-app-proxy::tests::socks_tls_over_ws_reaches_echo
+tls-client socks-tls-kcp-echo-round-trips 1 ferrox-app-proxy::tests::socks_tls_over_kcp_reaches_echo
+tls-client http-tls-raw-echo-round-trips 1 ferrox-app-proxy::tests::http_tls_over_raw_reaches_echo
+tls-client http-tls-ws-echo-round-trips 1 ferrox-app-proxy::tests::http_tls_over_ws_reaches_echo
+tls-client http-tls-kcp-echo-round-trips 1 ferrox-app-proxy::tests::http_tls_over_kcp_reaches_echo
+
+# --- Commander gRPC management API ----------------------------------------
+engine-api ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-api syscalls-per-api-call UNBLESSED scripts/count-ops.sh
+engine-api seconds-per-api-call UNBLESSED CI bench.yml (no cell yet)
+
+# --- wireguard tunnel, both roles ---------------------------------------------
+wireguard ops-retired-instructions UNBLESSED scripts/count-ops.sh
+wireguard syscalls-per-transport-record UNBLESSED scripts/count-ops.sh
+wireguard wireguard-raw-down-8-client-ubuntu-arm-mib-per-second 220 CI benchmark-matrix.yml run 43127254767
+wireguard seconds-per-relayed-megabyte 0.0045 CI benchmark-matrix.yml run 43127254767 (220 MiB/s down-8)
+wireguard route-scan-instructions 68609 scripts/count-ops.sh
+wireguard route-table-instructions 585 scripts/count-ops.sh
+wireguard transport-header-bytes 16 ferrox-core-wireguard::tests::the_reference_message_sizes
+wireguard initiation-bytes 148 ferrox-core-wireguard::tests::the_reference_message_sizes
+wireguard response-bytes 92 ferrox-core-wireguard::tests::the_reference_message_sizes
+wireguard default-mtu 1420 ferrox-app-wireguard::tests::the_defaults_are_the_reference_ones
+wireguard inner-mtu-bytes 65535 ferrox-app-wg-stack::tests::a_client_cannot_narrow_the_server_mtu
+wireguard tunnel-fragment-bytes 1344 ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles
+wireguard wireguard-fragment-bytes 1420 ferrox-app-wg-stack::tests::the_fragment_limit_follows_the_carrier
+wireguard reassembly-set-cap 1024 ferrox-app-wg-stack::tests::a_flood_of_first_fragments_is_bounded_by_count
+wireguard reassembly-peer-set-cap 64 ferrox-app-wg-stack::tests::one_peers_fragments_do_not_evict_anothers
+wireguard reassembly-peer-byte-cap 524288 ferrox-app-wg-stack::tests::a_peer_cannot_take_the_whole_reassembly_byte_budget
+wireguard reassembly-range-cap 256 ferrox-app-wg-stack::tests::range_metadata_is_bounded
+wireguard range-merge-allocations 0 ferrox-app-wg-stack::tests::merging_fragment_ranges_reuses_the_list
+wireguard timeout-walks-per-unexpired-fragment 0 ferrox-app-wg-stack::tests::an_unexpired_fragment_does_not_walk_the_sets
+wireguard reassembly-byte-cap 8388608 ferrox-app-wg-stack::tests::a_growing_set_cannot_exceed_the_reassembly_byte_cap
+wireguard large-segment-fragments 4 ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles
+wireguard ipv4-fragment-round-trips 1 ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles
+wireguard download-bytes-reassembled 16384 ferrox-app-wg-stack::tests::a_server_download_leaves_as_fragments_the_client_reassembles
+wireguard ipv6-fragment-round-trips 1 ferrox-app-wg-stack::tests::an_ipv6_packet_fragments_and_reassembles_without_its_fragment_header
+wireguard syn-conservative-mss-bytes 1380 ferrox-app-wg-stack::tests::the_client_keeps_the_tunnel_mss_without_large_segments
+wireguard syn-advertised-mss-bytes 65495 ferrox-app-wg-stack::tests::the_client_advertises_the_inner_mss
+wireguard syn-ack-advertised-mss-bytes 1380 ferrox-app-wg-stack::tests::the_server_keeps_the_syn_mss_and_lowers_its_answer
+wireguard tcp-bytes-echoed 9 ferrox-app-wg::tests::a_tcp_flow_crosses_the_tunnel_to_a_freedom_dial
+wireguard client-datagram-bytes-echoed 6 ferrox-app-wg-stack::tests::a_client_datagram_lane_frames_and_unframes
+wireguard server-datagram-bytes-echoed 2 ferrox-app-wg-stack::tests::a_server_datagram_lane_echoes_through_freedom
+wireguard echo-answers-on-the-client 2 ferrox-app-wg-stack::tests::an_echo_to_the_devices_own_address_is_answered_on_the_tunnel
+wireguard echo-answers-on-the-server 1 ferrox-app-wg-stack::tests::a_server_answers_an_echo_to_its_own_address
+wireguard prefixed-record-allocations 0 ferrox-core-wireguard::tests::a_prefixed_record_reuses_the_stack_headroom
+wireguard prefixed-record-zeroed-bytes 0 ferrox-core-wireguard::tests::a_prefixed_record_reuses_the_stack_headroom
+wireguard received-record-copies 0 ferrox-core-wireguard::tests::an_owned_transport_record_keeps_the_received_allocation
+wireguard kernel-rule-priority 32765 ferrox-app-wg-kernel::tests::the_rule_marks_the_table
+wireguard kernel-iif-priority 32764 ferrox-app-wg-kernel::tests::the_iif_rule_keeps_the_reverse_path_inside_the_tunnel
+carrier-masque ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-masque tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_crosses_the_tunnel_to_a_freedom_dial
+carrier-masque ipv6-tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_crosses_the_tunnel_over_ipv6
+carrier-masque udp-echo-round-trips 1 ferrox-app-masque::tests::a_datagram_flow_crosses_the_tunnel_to_a_freedom_dial
+carrier-masque wrong-password-status 401 ferrox-app-masque::tests::a_wrong_password_is_refused_with_401
+carrier-masque path-forms-witnessed 5 ferrox-app-masque::tests::a_request_path_reads_the_way_xray_parses_it
+carrier-masque reference-edge-spellings 2 ferrox-app-masque::tests::the_reference_settings_spellings_read_the_same_edge
+carrier-masque reference-user-spellings 4 ferrox-app-masque::tests::the_reference_user_spellings_serve_the_same_table
+carrier-masque pool-contained-addresses-witnessed 2 ferrox-app-masque::tests::a_pool_holds_every_address_its_prefix_covers
+carrier-masque pool-outside-addresses-witnessed 1 ferrox-app-masque::tests::a_pool_holds_every_address_its_prefix_covers
+carrier-masque subnet-grants-witnessed 2 ferrox-app-masque::tests::a_subnet_grant_names_its_first_host
+carrier-masque datagram-prefix-round-trips 1 ferrox-app-masque::tests::the_datagram_prefix_round_trips
+carrier-masque assignment-outcomes-witnessed 5 ferrox-app-masque::tests::an_address_capsule_withdraws_what_it_no_longer_grants
+carrier-masque icmp-too-big-shapes 2 ferrox-core-foxy::connectip::tests::a_packet_too_big_swaps_the_addresses_and_verifies_at_both_versions
+carrier-masque icmp-too-big-edges 5 ferrox-core-foxy::connectip::tests::a_packet_too_big_copies_options_and_refuses_a_narrow_mtu
+carrier-masque icmp-mtu-narrows 2 ferrox-app-wg-stack::tests::a_packet_too_big_narrows_the_device_mtu
+carrier-masque icmp-too-big-responses 1 ferrox-app-masque::tests::a_packet_wider_than_one_datagram_is_answered_with_icmp
+carrier-masque datagram-send-queue-depth 32 ferrox-app-masque::tests::a_full_datagram_queue_refuses_the_next_packet
+carrier-masque dials-per-ten-second-flap 4 ferrox-app-masque::tests::a_flapping_edge_is_dialled_on_the_backoff_not_per_packet
+carrier-masque echo-replies 2 ferrox-core-connectip::tests::an_echo_request_is_answered_at_both_families
+carrier-masque echo-refusals 3 ferrox-core-connectip::tests::a_message_that_is_not_an_echo_request_leaves_the_buffer_alone
+carrier-masque echo-answers-on-the-client 2 ferrox-app-wg-stack::tests::an_echo_to_the_devices_own_address_is_answered_on_the_tunnel
+carrier-masque echo-answers-on-the-server 1 ferrox-app-wg-stack::tests::a_server_answers_an_echo_to_its_own_address
+carrier-masque h2-datagram-round-trips 1 ferrox-app-masque-h2::tests::an_h2_tunnel_assigns_and_carries_a_datagram
+carrier-masque h2-dialer-round-trips 1 ferrox-app-masque::tests::a_datagram_flow_crosses_the_h2_tunnel_to_a_freedom_dial
+carrier-masque h2-tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_crosses_the_h2_tunnel_to_a_freedom_dial
+carrier-masque h1-tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_crosses_the_h1_tunnel_to_a_freedom_dial
+carrier-masque h2c-tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_crosses_the_h2c_tunnel_to_a_freedom_dial
+carrier-masque carrier-alpn-choices-witnessed 8 ferrox-app-masque::tests::the_carrier_follows_the_alpn_list
+carrier-masque h3-datagram-send-allocations 0 ferrox-app-masque::tests::a_queued_datagram_is_the_buffer_the_caller_built
+carrier-masque h3-forward-buffer-reallocations 0 ferrox-app-masque::tests::a_forwarded_datagram_is_the_buffer_that_arrived
+carrier-masque h3-deliver-buffer-reallocations 0 ferrox-app-masque::tests::a_delivered_datagram_is_the_buffer_that_arrived
+carrier-masque h3-forward-stack-prefix-bytes-moved 0 ferrox-app-masque::tests::a_forwarded_datagram_is_the_buffer_that_arrived
+carrier-masque h3-deliver-stack-prefix-bytes-moved 0 ferrox-app-masque::tests::a_delivered_datagram_is_the_buffer_that_arrived
+carrier-masque h2-frame-body-allocations 0 ferrox-app-masque-h2::tests::a_frame_body_is_read_where_it_landed
+carrier-masque h2-capsule-staging-allocations 0 ferrox-app-masque-h2::tests::a_whole_capsule_is_read_where_it_landed
+carrier-masque h2-datagram-packet-queue-copies 0 ferrox-app-masque-h2::tests::a_datagram_capsule_goes_straight_to_its_lane
+carrier-masque h2-queued-capsule-cap 64 ferrox-app-masque-h2::tests::a_stalled_send_window_bounds_the_queued_capsules
+carrier-masque h2-capsules-in-a-four-packet-burst 4 ferrox-app-masque-h2::tests::a_burst_leaves_as_one_data_frame
+carrier-masque h2-downlink-frame-body-cap 16384 ferrox-app-masque-h2::tests::a_burst_keeps_every_body_inside_the_frame_limit
+carrier-masque h2-writes-per-immediate-data-frame 1 ferrox-app-masque-h2::tests::a_data_frame_leaves_the_wire_in_one_write
+carrier-masque h2-writes-per-queued-data-frame 1 ferrox-app-masque-h2::tests::a_partially_credited_capsule_leaves_one_write_per_frame
+carrier-masque early-datagram-cap 64 ferrox-app-masque::tests::poll_refuses_a_pre_stack_datagram_flood
+carrier-masque early-datagram-byte-cap 1048576 ferrox-app-masque::tests::early_h3_datagrams_are_bounded_by_count_and_bytes
+carrier-masque quic-v2-bait-bytes 1200 ferrox-app-masque::tests::the_bait_is_a_v2_versioned_long_header_of_the_minimum_size
+carrier-masque quic-v2-generic-default off ferrox-app-masque::tests::the_quic_v2_setting_is_opt_in_for_generic_masque
+carrier-masque quic-v2-bait-answer consumed ferrox-app-masque::tests::the_bait_triggers_a_version_negotiation_from_a_v1_only_server
+carrier-psiphon ops-per-ssh-handshake UNBLESSED scripts/count-ops.sh
+carrier-psiphon syscalls-per-relayed-megabyte UNBLESSED scripts/count-ops.sh
+carrier-psiphon relay-staging-copies-per-byte UNBLESSED not measured
+carrier-psiphon download-staging-copies-per-byte 0 ferrox-app-psiphon-ssh::tests::a_channel_chunk_is_the_packet_allocation
+carrier-psiphon ss-vectored-write-extra-buffers 0 ferrox-app-psiphon-shadowsocks::tests::a_vectored_write_allocates_only_the_wire_buffer
+carrier-psiphon flow-clone-allocations 0 ferrox-app-psiphon::tests::a_flow_clone_shares_the_credential_words
+carrier-psiphon affinity-lookup-allocations 0 ferrox-app-psiphon::tests::an_affinity_lookup_does_not_format_each_entry
+carrier-psiphon move-to-front-allocations 0 ferrox-app-psiphon::tests::a_live_server_moves_to_the_front
+carrier-psiphon capability-name-allocations 0 ferrox-app-psiphon::tests::capability_names_borrow_when_no_mask_is_needed
+carrier-psiphon preresolved-pick-allocations 0 ferrox-app-psiphon-dns::tests::a_preresolved_pick_takes_no_heap
+carrier-psiphon ss-direct-write-probe-ops UNBLESSED scripts/count-ops.sh
+carrier-psiphon ss-flatten-write-probe-ops 47810192 scripts/count-ops.sh
+carrier-psiphon quic-varint-probe-ops 131079 scripts/count-ops.sh
+carrier-psiphon seconds-per-live-transfer UNBLESSED .github/workflows/psiphon-live.yml
+carrier-psiphon rc4-passes-per-byte 1 ferrox-app-psiphon-ssh::tests::rc4_apply_matches_the_stream_across_every_length
+carrier-foxy connect-udp-h1-round-trips 1 ferrox-app-masque::tests::an_h1_connect_udp_tunnel_carries_a_datagram_to_its_target
+carrier-foxy connect-udp-h2-round-trips 1 ferrox-app-masque-h2::tests::an_h2_connect_udp_tunnel_carries_a_datagram_to_its_target
+carrier-foxy connect-udp-h2c-round-trips 1 ferrox-app-masque-h2::tests::an_h2c_connect_udp_tunnel_carries_a_datagram_to_its_target
+carrier-foxy connect-udp-h3-round-trips 1 ferrox-app-masque::tests::an_h3_connect_udp_tunnel_carries_a_datagram_to_its_target
+carrier-foxy connect-udp-h2-streams-per-connection 1 ferrox-app-masque-h2::tests::a_second_h2_connect_udp_stream_is_refused_rather_than_left_waiting
+carrier-foxy connect-udp-wrong-bearer-status 401 ferrox-app-masque::tests::an_h1_connect_udp_tunnel_refuses_a_wrong_bearer_with_a_proxy_challenge
+carrier-foxy connect-udp-path-forms-witnessed 8 ferrox-app-masque::tests::a_udp_template_path_names_its_target_and_decodes_only_the_host
+carrier-foxy connect-udp-auth-schemes-witnessed 5 ferrox-app-masque::tests::a_udp_pass_is_a_bearer_secret_or_a_basic_credential
+warp ops-retired-instructions UNBLESSED scripts/count-ops.sh
+warp registration-api-calls 3 ferrox-app-warp::tests::a_registration_is_register_enroll_enable
+warp registration-api-calls-wg 2 ferrox-app-warp::tests::a_wireguard_slot_registers_without_enrolling_masque
+warp gool-second-run-enrollments 0 ferrox-app-warp::tests::a_second_gool_registration_finds_the_file_the_first_one_wrote
+warp gool-identities-read-without-an-outer-file 1 ferrox-app-warp::tests::a_gool_identity_file_stands_without_an_outer_identity_file
+warp register-kinds 6 ferrox-app-warp::tests::six_register_kinds_parse
+warp identity-files-all 5 ferrox-app-warp::tests::every_slot_derives_beside_its_own_first_hop
+warp tunnel-halves-built 2 ferrox-app-warp::tests::a_registered_identity_builds_both_tunnels
+warp identity-file-mode 600 ferrox-app-warp::tests::an_identity_survives_a_save_and_load
+warp api-address-dial-port 8443 ferrox-app-warp::tests::an_api_address_moves_the_dial_not_the_name
+warp refused-statuses 3 ferrox-app-warp::tests::a_refused_read_back_is_told_apart_from_an_outage
+warp reprovision-off-spellings 3 ferrox-app-warp::tests::three_spellings_turn_reprovisioning_off
+warp race-first-winner wireguard ferrox-app-warp::tests::the_first_answering_half_wins_the_race
+warp race-surviving-lane masque ferrox-app-warp::tests::a_failed_probe_does_not_end_the_race
+warp race-fallback-lane wireguard ferrox-app-warp::tests::two_failed_probes_fall_back_to_wireguard
+warp scan-mode-spellings 14 warp_scan::tests::every_reference_alias_names_its_mode
+warp wg-sweep-seeds 5 warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones
+warp wg-sweep-ports 54 warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones
+warp masque-sweep-seeds 10 warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones
+warp masque-sweep-ports 7 warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones
+warp last-edge-cap 8 warp_scan::tests::the_last_edge_keeps_one_entry_per_carrier_and_is_bounded
+warp ironclad-status 204 warp::tests::an_http_status_line_is_read_not_guessed
+warp mim-inner-datagram-v4 1252 ferrox-app-warp::tests::the_mim_inner_budget_subtracts_the_headers_and_the_masque_overhead
+warp mim-inner-mtu-v4 1182 ferrox-app-warp::tests::the_mim_inner_budget_subtracts_the_headers_and_the_masque_overhead
+warp noize-wireguard-profiles 6 noize::tests::six_wireguard_profiles_keep_six_shapes
+warp noize-masque-profiles 4 noize::tests::four_masque_profiles_keep_four_shapes
+warp noize-retry-candidates 4 noize::tests::a_scan_retries_the_fallback_profiles_once_each
+warp quic-v2-bait-bytes 1200 ferrox-app-masque::tests::the_bait_is_a_v2_versioned_long_header_of_the_minimum_size
+warp quic-v2-bait-answer consumed ferrox-app-masque::tests::the_bait_triggers_a_version_negotiation_from_a_v1_only_server
+
+# --- tagged outbound --------------------------------------------------------
+engine-tagged ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-tagged syscalls-per-tagged-datagram UNBLESSED scripts/count-ops.sh
+engine-tagged copies-per-tagged-datagram UNBLESSED scripts/count-ops.sh
+engine-tagged seconds-per-tagged-dial UNBLESSED CI conformance.yml (feature_test.go)
+engine-tagged tcp-dialer-proxy-hops 1 ferrox-app-proxy::tests::a_dialer_proxy_hop_carries_the_outbound_dial
+engine-tagged tagged-udp-hops 1 ferrox-app-proxy::tests::a_tagged_udp_dial_reaches_the_named_hop
+engine-tagged kcp-tagged-carrier-echoes 1 ferrox-app-proxy::tests::a_kcp_dial_rides_the_tagged_hop_to_its_server
+engine-tagged kcp-dial-with-stops-on-close 1 ferrox-core-kcp::listener::tests::a_dial_with_rides_the_callers_socket_and_stops_on_close
+engine-tagged pb-dialer-proxy-fields-decoded 1 ferrox-app-xray_pb::tests::a_sender_socket_dialer_proxy_names_the_tagged_outbound
+
+# --- detour graph and ordered chains ---------------------------------------
+engine-chaining ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-chaining syscalls-per-detour-dial UNBLESSED scripts/count-ops.sh
+engine-chaining copies-per-detour-dial UNBLESSED scripts/count-ops.sh
+engine-chaining seconds-per-chain-dial UNBLESSED CI (no chain cell yet)
+engine-chaining detour-tcp-hops 1 ferrox-app-proxy::tests::a_detour_hop_carries_the_outbound_dial
+engine-chaining ordered-tcp-hops 2 ferrox-app-proxy::tests::an_ordered_chain_carries_tcp_through_each_hop
+engine-chaining ordered-udp-hops 1 ferrox-app-proxy::tests::an_ordered_chain_carries_udp_through_its_hop
+
+# --- kTLS ------------------------------------------------------------------
+security-ktls ops-retired-instructions UNBLESSED scripts/count-ops.sh
+security-ktls syscalls-per-offloaded-record UNBLESSED scripts/count-ops.sh
+security-ktls user-space-copies-per-offloaded-record UNBLESSED no copy checker yet
+security-ktls seconds-per-offloaded-record UNBLESSED CI bench.yml (no cell yet)
+security-ktls both-directions-carried-by-the-kernel 1 ferrox-core-tls::rustls_backend::tests::a_ktls_loopback_carries_both_directions
+
+# --- evasion: UDP noise and fake-SNI ---------------------------------------
+obfs-evasion fake-hello-octets 517 ferrox-core-evasion::tests::a_fake_hello_is_the_fixed_packet_and_carries_its_name
+obfs-evasion fake-sni-max-bytes 219 ferrox-core-evasion::tests::a_fake_name_outside_the_bound_is_refused
+obfs-evasion decoy-segment-checksums 2 ferrox-core-evasion::tests::a_decoy_packet_has_both_checksums_right
+obfs-evasion noise-packets-per-count 3 ferrox-app-proxy::tests::a_noise_count_sends_that_many_packets
+obfs-evasion noise-entry-kinds-parsed 5 ferrox-app-proxy::tests::a_freedom_noise_keeps_its_packet_and_family
+obfs-evasion noise-overlay-precedence 1 ferrox-app-proxy::tests::a_finalmask_noise_wins_over_the_legacy_list
+obfs-evasion record-header-version-bytes 2 ferrox-app-conn::tests::a_record_shape_rewrites_one_header
+obfs-evasion sni-label-cuts 4 ferrox-core-evasion::tests::every_label_of_a_name_takes_a_cut_inside_it
+obfs-evasion mixed-case-name-octets 15 ferrox-core-evasion::tests::a_mixed_case_name_is_the_same_name_to_the_server
+obfs-evasion sni-record-count 5 ferrox-core-finalmask::tests::an_sni_record_is_cut_inside_the_name_and_arrives_whole
+obfs-evasion empty-record-octets 5 ferrox-app-conn::tests::an_empty_shape_precedes_one_record
+obfs-evasion noise-ops-retired-instructions UNBLESSED scripts/count-ops.sh
+obfs-evasion decoy-ops-retired-instructions UNBLESSED scripts/count-ops.sh
+obfs-evasion noise-syscalls-per-flow UNBLESSED scripts/count-ops.sh
+obfs-evasion decoy-syscalls-per-hello UNBLESSED scripts/count-ops.sh
+obfs-evasion noise-copies-per-packet UNBLESSED scripts/count-ops.sh
+obfs-evasion evasion-time UNBLESSED bench.yml

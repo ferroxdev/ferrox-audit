@@ -1,0 +1,270 @@
+# Per-method retired-instruction counts, for ops.yml to report.
+#
+# `scripts/count-ops.sh check` gates the blessed rows in
+# `scripts/expected-ops.txt`. This file is the open list: ops.yml measures every
+# row here on every run and publishes the numbers, which is what turns a row in
+# `scripts/method-counts.txt` from UNBLESSED into a number somebody can read and
+# decide to bless.
+#
+# A row is measured in the test binary that holds its filter, and `count-ops.sh`
+# confirms that before valgrind runs: profiling a binary where the filter matches
+# no test runs zero tests, and then every symbol reads frame-less. The label says
+# which of two different things happened.
+#
+#   Ir=inlined-not-a-frame  the test ran and the profile holds no frame for the
+#                           symbol, so the method dissolved into its caller.
+#   Ir=no-such-test         neither test binary has a test by the filter's name:
+#                           the row drifted and needs re-pointing, not blessing.
+#
+# Until that check existed the harness profiled only the ferrox-app test binary,
+# while 14 of these 31 rows name a test that lives in ferrox-core. Those blanks
+# were never a verdict about inlining, so the `lto = "thin"` sentence published
+# here for them was wrong and is gone; it stays a candidate explanation only for
+# a row the fixed harness reports as `inlined-not-a-frame`.
+#
+# The first run through the fixed harness is read, not guessed: those 14 filters
+# resolve, run their test, and still report `inlined-not-a-frame`. The test ran
+# because the syscall table now shows the thread it spawns (`clone3`,
+# `set_robust_list`, `futex`) where the app-binary run showed process startup and
+# nothing else. So those leaves do dissolve into their callers in ferrox-core's
+# own release test binary, and each such row must be re-pointed at the smallest
+# caller that keeps a frame — or given the probe below — before it can carry a
+# number.
+#
+# Renaming such a row to its test body is NOT the fix. A test frame charges the
+# harness, the fixture bytes and any socket it opens, which is not a claim about
+# the method; it converts an honest blank into a number that answers a different
+# question. A dead row needs a probe whose cost is the method and nothing else —
+# a repeated call over a fixed buffer — before it earns a number.
+#
+# One row has that now. `shadowsocks` points at
+# `shadowsocks::tests::the_stream_cipher_costs_the_prga_loop_and_nothing_else`:
+# 64 KiB of `Rc4::crypt` over one stack buffer, with one fold as the witness and
+# no socket, allocation or fixture in the frame. Its number is the frame, so the
+# fold and the frame entry ride inside it — which is why a probe row is read as
+# the difference between two runs of the same row and never as the cost of the
+# method alone. The in-memory half of this list is exact for the same reason:
+# `masque::datagram_encode`, `ws::write_frame` and the masking probe held
+# byte-identical across three runs, including one built with different debug
+# info, while the two rows driven over a loopback socket moved between runs at
+# the same flags.
+#
+# Five rows carry a number: `proxy::decode_trojan_request`, `foxy::read_frame`,
+# `masque::datagram_encode`, `ws::write_frame`, and
+# `ws::tests::mask_chunks_match_the_byte_loop`, whose body is the masking loop
+# with no I/O, so the frame and the method are the same thing.
+# The Trojan row's domain header carries `127.0.0.1`, so its frame is the parse
+# and not the resolver, and the number it publishes reproduces.
+#
+# `doc  test filter  symbol`
+record-layer  record::tests::the_ladder_reports_the_blocks_the_caller_asked_for  ferrox_core::record::fill_exact
+record-layer  record::tests::the_head_is_the_references_own_first_block_and_the_rest_is_unshifted  ferrox_core::record::fill_exact_with_head
+record-layer  record::tests::the_ladder_reports_the_blocks_the_caller_asked_for  ferrox_core::aead::chacha20_poly1305_decrypt_in_place
+record-layer  poly1305::tests::byte_at_a_time_matches_one_shot  ferrox_core::poly1305::Poly1305::update
+shadowsocks  shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks::Cipher::seal_into
+shadowsocks  shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks::Cipher::open_in_place
+shadowsocks  shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes  ferrox_core::shadowsocks::Cipher::open_in_place
+shadowsocks  shadowsocks::tests::the_stream_cipher_costs_the_prga_loop_and_nothing_else  ferrox_core::shadowsocks::tests::the_stream_cipher_costs_the_prga_loop_and_nothing_else
+shadowsocks-2022  shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks2022::Cipher::seal_into
+shadowsocks-2022  shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks2022::Cipher::open_in_place
+shadowsocks-2022  shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes  ferrox_core::shadowsocks2022::Cipher::open_in_place
+shadowsocks-2022  shadowsocks2022::tests::udp_multi_user_packs_one_eih_and_opens_with_the_pinned_psk  ferrox_app::shadowsocks2022::Datagrams::seal_list
+shadowsocks-2022  shadowsocks2022::tests::udp_multi_user_packs_one_eih_and_opens_with_the_pinned_psk  ferrox_app::shadowsocks2022::Datagrams::open_multi
+shadowsocks-2022  shadowsocks2022::tests::udp_server_replies_are_server_typed_and_stay_with_their_session  ferrox_app::shadowsocks2022::Datagrams::seal_server
+shadowsocks-2022  shadowsocks2022::tests::udp_server_replies_are_server_typed_and_stay_with_their_session  ferrox_app::shadowsocks2022::Datagrams::open_server
+shadowsocks-2022  shadowsocks2022::tests::the_session_subkey_probe_costs_the_derive_and_nothing_else  ferrox_core::shadowsocks2022::session_subkey
+vmess  vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time  vmess::stage_frame
+vmess  vmess::tests::frames_reuse_the_callers_buffers  vmess::read_frame
+vmess  vmess::tests::an_aes_batch_is_the_frames_written_one_at_a_time  vmess::stage_frame
+vmess  vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time  ferrox_core::chacha::avx512::xor_blocks_from
+vmess  vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time  ferrox_core::chacha::avx2::xor_blocks_from
+vmess  vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write  ferrox_app::vmess::Wire<ferrox_app::vmess::tests::Sealed>::step
+vmess  vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write  ferrox_app::vmess::Wire<ferrox_app::vmess::tests::Sealed>::batch
+trojan  proxy::tests::the_trojan_header_costs_two_reads_not_seven  proxy::decode_trojan_request
+vless  vless::tests::first_method_header_is_stable  ferrox_core::vless::VlessLink::encode_into
+vless  vless::tests::the_request_parse_probe_costs_the_read_and_nothing_else  ferrox_core::vless::decode_request
+vless  vless::tests::the_flow_decision_probe_costs_the_walk_and_nothing_else  ferrox_core::vless::flow_of
+vless  vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy  ferrox_core::vless_encryption::tests::sealed_write_probe
+xtls-vision  vision::tests::the_framing_switch_ends_the_staging  vision::Link::read_direct
+xtls-vision  vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else  vision::Link
+xtls-vision  vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else  ferrox_app::vision::tests::Fake::pump
+xtls-vision  vless::tests::the_command_validator_probe_costs_the_match_and_nothing_else  ferrox_core::vless::VisionCommand::from_byte
+# The scan and the six-byte window it replaced, both under a probe over the same
+# 512-byte hello: one ops job reports both frames, and only their difference is a
+# claim about the scan.
+xtls-vision  vision::tests::the_word_version_scan_costs_the_scan_and_nothing_else  vision::supports_tls13
+xtls-vision  vision::tests::the_word_version_scan_costs_the_scan_and_nothing_else  vision::tests::the_word_version_scan_costs_the_scan_and_nothing_else
+xtls-vision  vision::tests::the_serial_version_scan_costs_the_same_answer  vision::tests::the_serial_version_scan_costs_the_same_answer
+carrier-foxy  foxy::loopback::the_http2_carrier_writes_one_literal_header_block_and_relays  foxy::read_frame
+carrier-foxy  foxy::loopback::the_h3_downlink_hands_the_caller_the_frame_without_staging_it  foxy::H3::read
+carrier-foxy  foxy::loopback::the_masque_carrier_opens_connect_udp_and_echoes_a_datagram  masque::datagram_encode
+carrier-foxy  foxy::hpack::tests::the_huffman_probe_costs_the_decode_and_nothing_else  ferrox_core::foxy::hpack::huffman_decode
+carrier-foxy  foxy::hpack::tests::the_huffman_probe_costs_the_decode_and_nothing_else  ferrox_core::foxy::hpack::tests::the_huffman_probe_costs_the_decode_and_nothing_else
+carrier-foxy  foxy::tests::the_head_walk_costs_the_scan_and_nothing_else  ferrox_core::foxy::head_end
+carrier-foxy  foxy::tests::the_head_walk_costs_the_scan_and_nothing_else  ferrox_core::foxy::tests::the_head_walk_costs_the_scan_and_nothing_else
+carrier-foxy  foxy::tests::the_serial_terminator_walk_costs_the_same_answer  ferrox_core::foxy::tests::the_serial_terminator_walk_costs_the_same_answer
+# The growing scan and the whole-prefix rewalk it replaced, both over the same
+# head in eleven pieces: one ops job reports both frames, and only their
+# difference is a claim about the resume.
+carrier-foxy  foxy::tests::a_growing_head_is_walked_once  ferrox_core::foxy::head_end
+carrier-foxy  foxy::tests::a_growing_head_is_walked_once  ferrox_core::foxy::tests::a_growing_head_is_walked_once
+carrier-foxy  foxy::tests::a_growing_head_rewalked_costs_the_old_pass  ferrox_core::foxy::tests::a_growing_head_rewalked_costs_the_old_pass
+carrier-foxy  foxy::tests::a_growing_head_rewalked_costs_the_old_pass  ferrox_core::foxy::head_end
+carrier-foxy  foxy::connectip::tests::the_word_sum_costs_the_words_it_reads  ferrox_core::foxy::connectip::word_sum
+carrier-foxy  foxy::connectip::tests::the_word_sum_costs_the_words_it_reads  ferrox_core::foxy::connectip::tests::the_word_sum_costs_the_words_it_reads
+carrier-foxy  foxy::connectip::tests::the_serial_word_sum_costs_the_same_answer  ferrox_core::foxy::connectip::tests::the_serial_word_sum_costs_the_same_answer
+carrier-grpc  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
+carrier-grpc  grpc::tests::the_varint_length_over_every_boundary  grpc::tests::the_varint_length_over_every_boundary
+carrier-grpc  grpc::tests::the_varint_shift_loop_over_every_boundary  grpc::tests::the_varint_shift_loop_over_every_boundary
+carrier-grpc  grpc::tests::the_direct_write_costs_the_second_byte_and_nothing_else  grpc::tests::direct_write_probe
+carrier-grpc  grpc::tests::the_walk_write_costs_the_same_answer  grpc::tests::walk_write_probe
+carrier-grpc  grpc::tests::the_multi_payload_fixed_point_costs_less_than_the_walk  grpc::tests::multi_payload_probe
+carrier-grpc  grpc::tests::the_multi_payload_fixed_point_costs_less_than_the_walk  grpc::tests::multi_payload_walk_probe
+engine-api  accesslog::tests::the_ascii_scan_over_a_bulk_field  accesslog::tests::the_ascii_scan_over_a_bulk_field
+engine-api  accesslog::tests::the_swar_scan_over_a_bulk_field  accesslog::tests::the_swar_scan_over_a_bulk_field
+engine-api  accesslog::tests::the_codepoint_walk_over_a_bulk_field  accesslog::tests::the_codepoint_walk_over_a_bulk_field
+carrier-veepn  veepn::tests::the_domain_walk_costs_the_labels_and_nothing_else  ferrox_core::veepn::api_domain
+carrier-veepn  veepn::tests::the_domain_walk_costs_the_labels_and_nothing_else  ferrox_core::veepn::tests::the_domain_walk_costs_the_labels_and_nothing_else
+carrier-veepn  veepn::tests::the_pair_coder_costs_the_coder_and_nothing_else  ferrox_core::veepn::credential_into
+carrier-veepn  veepn::tests::the_pair_coder_costs_the_coder_and_nothing_else  ferrox_core::veepn::tests::the_pair_coder_costs_the_coder_and_nothing_else
+carrier-veepn  veepn::tests::the_pair_coder_costs_the_coder_and_nothing_else  ferrox_core::b64::encode_parts_into
+carrier-websocket  b64::tests::the_alphabet_coder_costs_the_groups_and_nothing_else  ferrox_core::b64::encode
+carrier-websocket  b64::tests::the_alphabet_coder_costs_the_groups_and_nothing_else  ferrox_core::b64::tests::the_alphabet_coder_costs_the_groups_and_nothing_else
+carrier-websocket  b64::tests::the_alphabet_decoder_costs_the_groups_and_nothing_else  ferrox_core::b64::decode
+carrier-websocket  b64::tests::the_alphabet_decoder_costs_the_groups_and_nothing_else  ferrox_core::b64::tests::the_alphabet_decoder_costs_the_groups_and_nothing_else
+carrier-websocket  ws::tests::a_read_covers_a_window_not_one_frame_header  ws::WsReader::pull
+carrier-websocket  ws::tests::frames_round_trip_masked_and_plain  ws::write_frame
+carrier-websocket  ws::tests::mask_chunks_match_the_byte_loop  ws::apply_mask
+carrier-websocket  ws::tests::mask_chunks_match_the_byte_loop  ws::tests::mask_chunks_match_the_byte_loop
+carrier-websocket  ws::tests::the_masked_frame_costs_the_walk_over_its_payload_and_nothing_else  ws::tests::the_masked_frame_costs_the_walk_over_its_payload_and_nothing_else
+carrier-websocket  ws::tests::the_head_yields_the_path_the_key_and_the_early_data  ws::tests::the_head_yields_the_path_the_key_and_the_early_data
+carrier-websocket  transport::tests::the_early_data_line_costs_the_encode_and_nothing_else  ferrox_core::transport::tests::the_early_data_line_costs_the_encode_and_nothing_else
+carrier-xhttp  xhttp_h2::tests::a_credit_grants_both_windows_in_one_write  xhttp_h2::replenish
+carrier-xhttp  xhttp_h2::tests::a_data_window_leaves_as_one_write  xhttp_h2::H2Conn::send_data
+carrier-xhttp  xhttp::tests::a_body_window_is_the_readers_own_buffer  xhttp::Reader<core::io::cursor::Cursor<alloc::vec::Vec<u8>>>
+carrier-xhttp  xhttp::tests::the_chunk_line_costs_one_walk  xhttp::tests::xhttp_line_probe
+mux-cool  mux::tests::the_frame_probe_costs_the_metadata_and_payload_write_and_nothing_else  ferrox_core::mux::Outgoing::encode_into
+mux-cool  proxy::tests::a_read_into_the_tail_appends_exactly_what_the_stream_held  ferrox_app::proxy::read_into_tail
+mux-cool  mux::tests::the_decode_probe_costs_the_frame_walk_and_nothing_else  ferrox_core::mux::decode
+mux-cool  mux::tests::the_header_probe_costs_the_metadata_write_and_nothing_else  ferrox_core::mux::Outgoing::encode_header_into
+kcp  kcp::oracle::the_scripted_core_matches_the_pinned_go  ferrox_core::kcp::Segment::serialize
+kcp  kcp::connection::tests::every_read_size_delivers_the_same_stream  ferrox_core::kcp::worker::ReceivingWorker::read
+kcp  kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next  ferrox_core::kcp::Connection::input
+kcp  kcp::segment::tests::a_received_ack_reuses_its_number_list  ferrox_core::kcp::segment::AckSegment::parse
+carrier-quic  foxy::loopback::the_quic_carrier_rides_a_socks5_upstream_and_carries_the_bytes  quic::flush_egress
+carrier-quic  foxy::loopback::the_quic_carrier_rides_a_socks5_upstream_and_carries_the_bytes  quic::pump_once
+carrier-quic  foxy::loopback::the_quic_carrier_rides_a_socks5_upstream_and_carries_the_bytes  quic::hand_off
+carrier-quic  foxy::loopback::a_lane_outlives_its_leases_and_the_next_flow_rides_it  quic::pump
+carrier-quic  foxy::loopback::a_lane_outlives_its_leases_and_the_next_flow_rides_it  quic::pooled_stream_within
+carrier-quic  quic::tests::a_quic_socket_arms_its_receive_buffer  quic::bind_datagram
+carrier-quic  foxy::loopback::the_h3_downlink_hands_the_caller_the_frame_without_staging_it  quic::flush_burst
+carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::serve_loop
+carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::drive_once
+carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::serve_stream
+carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::read_request
+carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::auth_exchange
+carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::open_pooled
+# The type a static masquerade file answers with, asked of the whole table 64 times, and
+# the lowercase match it replaced asked the same 64 times: one ops job reports both
+# frames, and only their difference is a claim about the key.
+carrier-hysteria  hysteria::tests::the_word_extension_key_costs_the_word_and_nothing_else  ferrox_core::hysteria::tests::the_word_extension_key_costs_the_word_and_nothing_else
+carrier-hysteria  hysteria::tests::the_lowercase_extension_key_costs_the_same_answer  ferrox_core::hysteria::tests::the_lowercase_extension_key_costs_the_same_answer
+carrier-hysteria  hysteria::tests::the_block_answer_costs_the_bytes_it_copies  ferrox_core::hysteria::tests::the_block_answer_costs_the_bytes_it_copies
+carrier-hysteria  hysteria::tests::the_direct_answer_costs_the_same_bytes_once  ferrox_core::hysteria::tests::the_direct_answer_costs_the_same_bytes_once
+# The hop pick and reply membership, 512 picks and memberships over a thousand-port plan, and
+# the two filters with the linear scan that walked the same 512: one ops job reports both
+# frames, and only their difference is a claim about the searches.
+carrier-hysteria  hysteria::tests::the_binary_pick_and_membership_costs_the_search_and_nothing_else  ferrox_core::hysteria::tests::the_binary_pick_and_membership_costs_the_search_and_nothing_else
+carrier-hysteria  hysteria::tests::the_linear_scan_costs_the_same_answer  ferrox_core::hysteria::tests::the_linear_scan_costs_the_same_answer
+# The STUN binding exchange, 4096 times over the peer's answer, and the punch packet build and read
+# of 4096 packets: one ops job reports both frames, and their buffers are the caller's own.
+carrier-hysteria  stun::tests::a_binding_exchange_takes_no_heap  ferrox_core::stun::tests::a_binding_exchange_takes_no_heap
+carrier-hysteria  realm::tests::an_encoded_and_decoded_packet_takes_no_heap  ferrox_core::realm::tests::an_encoded_and_decoded_packet_takes_no_heap
+# The UDP fragment's check once per fragment, and the same 512 fragment runs without it: one ops
+# job reports both frames, and only their difference is a claim about the validation.
+carrier-hysteria  hysteria::tests::the_checked_fragment_costs_the_validate_and_nothing_else  ferrox_core::hysteria::tests::the_checked_fragment_costs_the_validate_and_nothing_else
+carrier-hysteria  hysteria::tests::the_unchecked_fragment_costs_the_bytes_and_nothing_else  ferrox_core::hysteria::tests::the_unchecked_fragment_costs_the_bytes_and_nothing_else
+finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Chain::write
+finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Fragment::write_hello
+finalmask  finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies  ferrox_core::finalmask::write_record
+finalmask  finalmask::tests::the_last_configured_width_governs_every_later_segment  ferrox_core::finalmask::Fragment::write_pieces
+finalmask  finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather  ferrox_core::finalmask::tests::merged_hello_probe
+# The pure sudoku slot walk over the same 64 KiB in each direction: one ops job
+# reports both frames, and a slot walk that divides or counts references shows up
+# in the encoder/decoder probes rather than in the test that drives them.
+finalmask  finalmask::sudoku::tests::the_sudoku_wire_costs_the_bytes_and_nothing_else  ferrox_core::finalmask::sudoku::tests::encode_probe
+finalmask  finalmask::sudoku::tests::the_sudoku_wire_costs_the_bytes_and_nothing_else  ferrox_core::finalmask::sudoku::tests::decode_probe
+# The block-batched CFB8 decrypt and the byte walk it replaced, both under one 64 KiB probe: one
+# ops job reports both frames, and only their difference is a claim about the batch.
+finalmask  finalmask::xmc::cfb8::tests::the_block_decrypt_costs_the_blocks_and_nothing_else  ferrox_core::finalmask::xmc::cfb8::tests::block_decrypt_probe
+finalmask  finalmask::xmc::cfb8::tests::the_block_decrypt_costs_the_blocks_and_nothing_else  ferrox_core::finalmask::xmc::cfb8::tests::serial_decrypt_probe
+reverse  proxy::reverse_tests::a_sixteen_kib_downlink_is_echoed_whole  reverse::Session::read_loop
+http-proxy  proxy::tests::the_connect_request_builds_in_one_buffer  proxy::http_connect_request
+http-proxy  proxy::tests::http_request_parses_connect_and_both_get_forms  proxy::http_proxy_request
+# The head walk and the octet walk it replaced, both under a probe over the same
+# forwarded head: one ops job reports both frames, and only their difference is a
+# claim about the scan.
+http-proxy  proxy::tests::the_head_walk_costs_the_head_and_nothing_else  proxy::drop_header
+http-proxy  proxy::tests::the_head_walk_costs_the_head_and_nothing_else  proxy::connection_named
+http-proxy  proxy::tests::the_head_walk_costs_the_head_and_nothing_else  proxy::tests::the_head_walk_costs_the_head_and_nothing_else
+http-proxy  proxy::tests::the_byte_walk_header_costs_the_same_answer  proxy::tests::the_byte_walk_header_costs_the_same_answer
+front-tun  tun::tests::an_emitted_packet_reuses_its_render_buffer  ferrox_app::tun::render_tcp_packet
+front-tun  tun::tests::a_gso_frame_carries_the_folded_pseudo_sum  ferrox_app::tun::render_tcp_headers_ip
+front-tun-smoltcp  tun_system::tests::a_rewrite_keeps_the_checksum_of_every_payload_length  ferrox_app::tun_system::Nat::rewrite
+socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_core::socks::greeting
+socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_core::socks::user_pass
+socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_core::socks::request
+socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_core::socks::datagram
+socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_core::socks::Target::encode_into
+socks  socks::tests::the_socks4_request_is_the_bytes_the_pinned_writer_writes  ferrox_core::socks::request4
+socks  socks::tests::the_socks4_reply_is_the_bytes_the_pinned_server_writes  ferrox_core::socks::grant4
+socks  proxy::tests::socks_udp_datagrams_split_and_reject  ferrox_app::proxy::parse_socks_udp
+socks  proxy::tests::socks_udp_datagrams_split_and_reject  ferrox_app::proxy::parse_socks_addr_rest
+dns-outbound  dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else  ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+# The queue hit and the slot hit, on the same full pool and after the same fill:
+# one ops job reports both frames, and only their difference is a claim about
+# the walk the slot list removed.
+engine-dns  dnsapp::resolver_tests::the_queue_hit_costs_the_held_names  ferrox_app::dnsapp::resolver_tests::the_queue_hit_costs_the_held_names
+engine-dns  dnsapp::resolver_tests::the_slot_hit_costs_two_index_writes  ferrox_app::dnsapp::resolver_tests::the_slot_hit_costs_two_index_writes
+security-ech  tls::shaped::hello::tests::an_aes_256_only_config_seals_the_inner_hello  ferrox_core::tls::hpke::Context::seal_owned
+security-ech  tls::shaped::hello::tests::an_aes_256_only_config_seals_the_inner_hello  ferrox_core::tls::hpke::Context::open
+engine-observatory  observatory::tests::a_probe_through_freedom_reads_the_headers_and_gives_the_delay  ferrox_app::observatory::probe
+# The same eight-kilobyte answer head through the front-to-back rescan and
+# through the resumed walk: one ops job reports both frames, and only their
+# difference is a claim about the rescan.
+engine-observatory  observatory::tests::the_front_scan_costs_every_window_it_has_already_walked  ferrox_app::observatory::tests::the_front_scan_costs_every_window_it_has_already_walked
+engine-observatory  observatory::tests::the_seam_scan_costs_the_octets_it_has_not_walked  ferrox_app::observatory::tests::the_seam_scan_costs_the_octets_it_has_not_walked
+front-healthcheck  proxy::hc_tests::an_hc_get_answers_the_configured_body_after_the_exact_path  ferrox_app::proxy::HcHandler::answer
+# The head that arrives in sixteen windows, walked once and walked again per
+# round: one ops job reports both frames, and only their difference is a claim
+# about the rescan.
+front-healthcheck  proxy::hc_tests::the_front_scan_costs_every_window_it_has_already_walked  ferrox_app::proxy::hc_tests::the_front_scan_costs_every_window_it_has_already_walked
+front-healthcheck  proxy::hc_tests::the_seam_scan_costs_the_bytes_it_has_not_walked  ferrox_app::proxy::hc_tests::the_seam_scan_costs_the_bytes_it_has_not_walked
+# The same eight-octet QUIC varint decoded 4096 times by the one-load read and
+# by the byte walk it replaced: one ops job reports both frames, and only their
+# difference is a claim about the decode.
+carrier-psiphon  psiphon_quic::tests::the_word_varint_read_costs_the_load_and_nothing_else  ferrox_app::psiphon_quic::tests::word_varint_probe
+carrier-psiphon  psiphon_quic::tests::the_byte_varint_walk_costs_the_same_answer  ferrox_app::psiphon_quic::tests::byte_varint_probe
+# The same four SSH packet slices sealed 4096 times directly and after
+# flattening: one ops job reports both probe frames. Their difference includes
+# the flatten copy and the effect of passing four slices versus one to the same
+# writer; it is not a measurement of the previous writer.
+carrier-psiphon  psiphon_shadowsocks::tests::the_direct_write_costs_the_seal_and_nothing_else  ferrox_app::psiphon_shadowsocks::tests::direct_write_probe
+carrier-psiphon  psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy  ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe
+# The sniff probe's frame is not an exact gate: on the same source it has read
+# 1228 and 1231, so it is reported here and not in expected-ops.
+engine-sniffing-http-tls-quic-fakedns  sniff::tests::a_warm_probe_costs_the_documented_instructions  ferrox_app::sniff::Sniffing::inspect
+carrier-quic  proxy::tests::quic_serves_vless_echo_over_loopback  quic::serve_loop
+wireguard  wireguard::device::tests::a_replayed_transport_counter_is_refused  wireguard::device::Tunnel::send
+wireguard  wg::tests::a_prefix_table_picks_the_peer_the_scan_picks  ferrox_app::wg::tests::route_scan_once
+wireguard  wg::tests::a_prefix_table_picks_the_peer_the_scan_picks  ferrox_app::wg::tests::route_table_once
+carrier-quic  quic::tests::a_two_entry_identity_builds_every_context  quic::tls_config
+
+# The TUIC parser's own frame: one full PACKET header and payload over a fixed
+# buffer, with no socket, resolver or session state in the frame.
+tuic  tuic::tests::a_full_packet_fits_one_command  ferrox_core::tuic::parse_packet
+
+# The TLS split's own frame: one dial's two halves over a socket, priced before
+# the relay reads a byte. The test's syscall table counts the descriptors the
+# split duplicates.
+reality-tls  proxy::tests::socks_tls_over_raw_reaches_echo  proxy::session_halves

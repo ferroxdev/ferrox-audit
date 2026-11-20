@@ -1,0 +1,124 @@
+# Measured legs below the 0.90 bound that are filed already. A new leg, or one
+# worse than its last filed ratio by more than 0.10, still fails the matrix.
+# base|leg|ratio|issue|basis, where basis is raw (default) or ceiling.
+# Full-tier runs 43669590474 (83d7235f), 43674011752/43675054535 (cbb2f8a1) and 43688223029
+# (b0c4d66b), linux-x86_64, three repeats, the hysteria cells alone: down-8's server leg is at
+# parity, so the old 0.04 entry is gone. The relay peaks at 15 threads against 11 on down-8 and 15
+# against 13 on duplex-8. Duplex-8's server CPU leg reads 1.11x and 1.13x on the cbb2f8a1 runs
+# against 0.58x on 83d7235f, the two cells landing on different hosts, so it is filed here rather
+# than as a reproducible cost gap.
+# Full-tier run 43968769974 (59e18793) cleared up-1 (client 1.24x, server 1.03x), so its line is gone.
+masque-down-8|server|0.15|861
+# The WARP server leg's xray client is bimodal on arm: 69/74/74/75/192 MiB/s in run 43155796255 and
+# 74/189/190/192/194 in run 43127254767, against a ferrox server that held 208-213. The writer's own
+# evidence is the 1.03x median when the client does not collapse; the cell median is the client's.
+wireguard-raw-down-8|server|0.18|861|ceiling
+masque-down-8|server-threads|1.40|861
+shadowsocks-raw-duplex-8|client|0.84|696
+# Serving the xray client's shared gRPC connection reveals the cost the single-stream row never produced: one control thread per connection and the xray client's small stream window, both #696.
+shadowsocks-grpc-down-8|server-cpu|1.50|696
+shadowsocks-grpc-down-8|server-threads|1.08|696
+shadowsocks2022-raw-up-1|server|0.72|696
+vless-hysteria-down-8|server-threads|1.50|696
+vless-hysteria-duplex-8|server-cpu|1.11|696
+vless-hysteria-duplex-8|server-threads|1.15|696
+vless-grpc-down-8|server-threads|1.14|696
+vless-kcp-down-8|server-threads|2.10|696
+vless-raw-down-16|server-threads|1.44|696
+vless-raw-up-1|client|0.78|486
+vless-raw-up-1|server|0.78|486|ceiling
+vless-grpc-multi-down-8|server-threads|1.07|696
+vless-tls-grpc-multi-down-8|server-threads|1.13|696
+vless-reality-grpc-down-8|server-cpu|1.11|696
+vless-reality-grpc-down-8|server-threads|1.29|696
+vless-reality-xhttp-down-8|server-threads|2.08|696
+# host-model dependent: 0.95x on EPYC 9V45 (42091428145), 1.38x on 9V74 (42093273330); the wider pairing is filed.
+vless-tls-grpc-down-8|server-cpu|1.38|696
+vless-tls-grpc-down-8|server-threads|1.21|696
+vless-tls-grpc-up-1|rust|0.54|704
+vless-reality-xhttp-down-8|rust|0.64|704
+vless-vision-reality-raw-down-8|server-threads|1.54|696
+vless-tls-raw-up-1|client|0.67|683
+vless-tls-raw-up-1|rust|0.64|683
+vless-vision-tls-raw-up-1|client|0.63|683
+vless-vision-tls-raw-up-1|server|0.79|486
+vless-vision-tls-raw-up-1|server-cpu|1.12|486
+vless-ws-down-8|server-threads|1.36|696
+vless-ws-down-16|server|0.24|1210
+vless-ws-down-16|server-threads|1.23|1210
+vless-xhttp-duplex-8|server-threads|1.29|696
+vless-xhttp-down-8|server-threads|1.27|696
+# A stream-up GET runs on its own thread so it never parks a setup lane; eight flows peak 18 against xray's 14.
+vless-xhttp-streamup-down-8|server-threads|1.29|696
+# Stream-one relays now that the poll is armed, but an idle xray client still leaves the server leg at 0.59x of its ceiling.
+vless-xhttp-streamone-down-8|server|0.59|486|ceiling
+vless-tls-xhttp-h2-down-8|server-threads|1.85|696
+# The muxed gRPC server starts one h2 control thread per connection and pays the xray client's small stream window, the same #696 cost its vless and vmess siblings file.
+trojan-grpc-down-8|server-cpu|1.30|696
+trojan-grpc-down-8|server-threads|1.08|696
+trojan-tls-grpc-down-8|server-cpu|1.09|696
+trojan-tls-grpc-down-8|server-threads|1.15|696
+trojan-tls-xhttp-h2-down-8|server-threads|1.70|696
+vmess-tls-xhttp-h2-down-8|server-threads|1.70|696
+# The h2 server keeps one thread per stream and the relay pool on top; its vless, trojan and vmess h2 siblings file the same #696 gap at 1.70-1.85.
+shadowsocks-tls-xhttp-h2-down-8|server-threads|1.70|696
+shadowsocks2022-tls-xhttp-h2-down-8|server-threads|1.40|696
+vmess-tls-ws-down-8|server-threads|1.54|696
+vmess-reality-raw-down-8|server|0.78|486|ceiling
+vmess-grpc-down-8|server-threads|1.08|696
+vmess-tls-grpc-down-8|server-threads|1.14|696
+# The xray client's 65_535-byte stream window makes the muxed hunk writer flush four messages at a time; the server pays the round trips.
+vmess-grpc-down-8|server-cpu|1.30|696
+vmess-reality-raw-down-8|server-threads|1.08|696
+# 1.21 predates the window that ends at the sink's last byte. The corrected window reads 19-23
+# threads against the reference's 13-15, so the medians land at 1.27, 1.36, 1.50 and 1.53 across
+# four runs; the worst pairing of the observed medians is 23/14, filed here because the peak's
+# spread is wider than the 0.10 tolerance. The gap itself is the one its grpc siblings file at
+# 1.54-1.67.
+vless-grpc-duplex-8|server-threads|1.64|1276
+vless-grpc-duplex-8|server-cpu|5.77|1276
+# Trojan over REALITY loses only to the Go xray client: it reads 0.56 on EPYC and 0.78 on Xeon,
+# so the worse pairing is filed.
+trojan-reality-raw-down-8|server|0.56|486|ceiling
+# Worst observed pairing from fork benchmark-matrix run 42631614669 (standard, ferrox+xray-core, three
+# repeats): the VMess and Trojan TLS servers pay the 500 ms setup wave the VLESS park removed, and the
+# HTTPUpgrade frame adds one more round trip, so these file 0.68, 0.47 and 0.70 of the ceiling.
+vmess-tls-raw-down-8|server|0.68|486|ceiling
+trojan-tls-httpupgrade-down-8|server|0.47|486|ceiling
+shadowsocks-httpupgrade-down-8|server|0.70|486|ceiling
+# KCP keeps the relay lane armed per packet, so the server peaks two threads above the reference in the
+# same run; all four dialects file the identical 1.20.
+vmess-kcp-down-8|server-threads|1.20|696
+trojan-kcp-down-8|server-threads|1.20|696
+shadowsocks-kcp-down-8|server-threads|1.20|696
+shadowsocks2022-kcp-down-8|server-threads|1.20|696
+# The Hysteria relay peaks 11-18 threads against the reference's 10-11 across runs; file the worst pairing.
+trojan-hysteria-down-8|server-threads|1.64|696
+
+# Full-tier run 43529363754 (linux-aarch64, 5 repeats): server legs newly below 0.90 and the REALITY upload client.
+shadowsocks-tls-httpupgrade-down-8|server|0.77|1208
+shadowsocks-tls-httpupgrade-ed-down-8|server|0.74|1208
+shadowsocks-tls-raw-down-8|server|0.72|1208
+shadowsocks-tls-ws-down-8|server|0.77|1208
+shadowsocks-ws-down-8|server|0.72|1208
+shadowsocks2022-hysteria-down-8|server|0.81|1208
+trojan-httpupgrade-down-8|server|0.54|1208
+trojan-raw-udp-8|server|0.40|1208
+trojan-tls-httpupgrade-ed-down-8|server|0.74|1208
+trojan-ws-down-8|server|0.61|1208
+vless-encryption-raw-down-8|server|0.38|1213
+vless-encryption-reality-raw-down-8|server|0.37|1213
+vless-encryption-tls-raw-down-8|server|0.37|1213
+vless-httpupgrade-down-8|server|0.37|1208
+vless-reality-raw-up-1|client|0.61|1645
+vless-tls-httpupgrade-down-8|server|0.39|1208
+vless-tls-httpupgrade-ed-down-8|server|0.40|1208
+vless-tls-ws-down-8|server|0.41|1208
+vless-ws-down-8|server|0.39|1208
+vmess-httpupgrade-down-8|server|0.64|1208
+vmess-raw-udp-8|server|0.67|1208
+vmess-tls-httpupgrade-down-8|server|0.72|1208
+vmess-tls-httpupgrade-ed-down-8|server|0.73|1208
+vmess-tls-ws-down-8|server|0.77|1208
+vmess-tls-ws-ed-down-8|server|0.76|1208
+vmess-ws-down-8|server|0.64|1208
