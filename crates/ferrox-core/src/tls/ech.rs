@@ -1,0 +1,502 @@
+use crate::b64;
+#[cfg(test)]
+use x25519_dalek::{PublicKey, StaticSecret};
+
+pub(crate) const VERSION: u16 = 0xfe0d;
+pub(crate) const KEM_X25519: u16 = 0x0020;
+pub(crate) const KDF_SHA256: u16 = 0x0001;
+pub(crate) const AEAD_AES_128_GCM: u16 = 0x0001;
+pub(crate) const AEAD_AES_256_GCM: u16 = 0x0002;
+pub(crate) const AEAD_CHACHA20_POLY1305: u16 = 0x0003;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Config<'a> {
+    pub(crate) id: u8,
+    pub(crate) kem_id: u16,
+    pub(crate) public_key: &'a [u8],
+    pub(crate) cipher_suites: &'a [u8],
+    pub(crate) maximum_name_length: u8,
+    pub(crate) public_name: &'a [u8],
+    pub(crate) extensions: &'a [u8],
+}
+
+impl<'a> Config<'a> {
+    /// The config's encoded length, header included.
+    pub(crate) fn encoded_len(&self) -> usize {
+        let contents = 1
+            + 2
+            + 2
+            + self.public_key.len()
+            + 2
+            + self.cipher_suites.len()
+            + 1
+            + 1
+            + self.public_name.len()
+            + 2
+            + self.extensions.len();
+        4 + contents
+    }
+
+    /// The config in one buffer reserved to its exact length.
+    #[cfg(test)]
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        // The length is known before the first byte, so the config lands in one buffer and no contents copy.
+        let mut out = Vec::with_capacity(self.encoded_len());
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Appends the config, header included, to `out`.
+    #[cfg(test)]
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
+        self.feed_encoded(|bytes| out.extend_from_slice(bytes));
+    }
+
+    /// Feeds the config, header included, to a sink a field at a time.
+    pub(crate) fn feed_encoded(&self, mut put: impl FnMut(&[u8])) {
+        let contents = self.encoded_len() - 4;
+        put(&VERSION.to_be_bytes());
+        put(&(contents as u16).to_be_bytes());
+        put(&[self.id]);
+        put(&self.kem_id.to_be_bytes());
+        put(&(self.public_key.len() as u16).to_be_bytes());
+        put(self.public_key);
+        put(&(self.cipher_suites.len() as u16).to_be_bytes());
+        put(self.cipher_suites);
+        put(&[self.maximum_name_length]);
+        put(&[self.public_name.len() as u8]);
+        put(self.public_name);
+        put(&(self.extensions.len() as u16).to_be_bytes());
+        put(self.extensions);
+    }
+
+    /// The four-byte cipher suite entries as `(kdf, aead)` pairs.
+    pub(crate) fn suites(&self) -> impl Iterator<Item = (u16, u16)> + '_ {
+        self.cipher_suites.as_chunks::<4>().0.iter().map(|suite| {
+            (
+                u16::from_be_bytes([suite[0], suite[1]]),
+                u16::from_be_bytes([suite[2], suite[3]]),
+            )
+        })
+    }
+
+    fn decode_at(bytes: &'a [u8], at: &mut usize, end: usize) -> Result<Config<'a>, String> {
+        let version = take_u16(bytes, at, end)?;
+        if version != VERSION {
+            return Err(format!("ech: unsupported version {version:#06x}"));
+        }
+        let length = usize::from(take_u16(bytes, at, end)?);
+        let config_end = at
+            .checked_add(length)
+            .filter(|config_end| *config_end <= end)
+            .ok_or("ech: config length past the end")?;
+        Self::decode_contents(bytes, at, config_end)
+    }
+
+    /// Parses one config body whose version and length header the caller has read.
+    fn decode_contents(
+        bytes: &'a [u8],
+        at: &mut usize,
+        config_end: usize,
+    ) -> Result<Config<'a>, String> {
+        let id = take_u8(bytes, at, config_end)?;
+        let kem_id = take_u16(bytes, at, config_end)?;
+        let public_key = take_len16(bytes, at, config_end)?;
+        let suites_len = usize::from(take_u16(bytes, at, config_end)?);
+        if suites_len % 4 != 0 {
+            return Err("ech: cipher suite list is not four-byte entries".to_owned());
+        }
+        let cipher_suites = take(bytes, at, suites_len, config_end)?;
+        let maximum_name_length = take_u8(bytes, at, config_end)?;
+        let name_len = usize::from(take_u8(bytes, at, config_end)?);
+        let public_name = take(bytes, at, name_len, config_end)?;
+        let extensions = take_len16(bytes, at, config_end)?;
+        if *at != config_end {
+            return Err("ech: trailing bytes in config".to_owned());
+        }
+        Ok(Self {
+            id,
+            kem_id,
+            public_key,
+            cipher_suites,
+            maximum_name_length,
+            public_name,
+            extensions,
+        })
+    }
+
+    pub(crate) fn has_unknown_mandatory_extension(&self) -> bool {
+        let mut at = 0;
+        while at < self.extensions.len() {
+            if self.extensions.len() - at < 4 {
+                return true;
+            }
+            let kind = u16::from_be_bytes([self.extensions[at], self.extensions[at + 1]]);
+            let len = usize::from(u16::from_be_bytes([
+                self.extensions[at + 2],
+                self.extensions[at + 3],
+            ]));
+            let next = at + 4 + len;
+            if next > self.extensions.len() || kind & 0x8000 != 0 {
+                return true;
+            }
+            at = next;
+        }
+        false
+    }
+
+    fn single(bytes: &'a [u8]) -> Result<Config<'a>, String> {
+        let mut at = 0;
+        let config = Self::decode_at(bytes, &mut at, bytes.len())?;
+        if at != bytes.len() {
+            return Err("ech: trailing bytes after config".to_owned());
+        }
+        Ok(config)
+    }
+}
+
+/// The configs a list carries, walked where they lie so a dial allocates no list.
+pub(crate) struct Configs<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    end: usize,
+    seen: usize,
+    done: bool,
+}
+
+impl<'a> Iterator for Configs<'a> {
+    type Item = Result<Config<'a>, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.done {
+                return None;
+            }
+            if self.at >= self.end {
+                self.done = true;
+                return (self.seen == 0)
+                    .then(|| Err("ech: no supported config in the list".to_owned()));
+            }
+            if self.end - self.at < 4 {
+                self.done = true;
+                return Some(Err("ech: short config header".to_owned()));
+            }
+            let version = u16::from_be_bytes([self.bytes[self.at], self.bytes[self.at + 1]]);
+            let length = usize::from(u16::from_be_bytes([
+                self.bytes[self.at + 2],
+                self.bytes[self.at + 3],
+            ]));
+            let Some(config_end) = self
+                .at
+                .checked_add(4 + length)
+                .filter(|config_end| *config_end <= self.end)
+            else {
+                self.done = true;
+                return Some(Err("ech: config length past the end".to_owned()));
+            };
+            if version != VERSION {
+                self.at = config_end;
+                continue;
+            }
+            let mut at = self.at + 4;
+            self.at = config_end;
+            self.seen += 1;
+            let config = Config::decode_contents(self.bytes, &mut at, config_end);
+            if config.is_err() {
+                self.done = true;
+            }
+            return Some(config);
+        }
+    }
+}
+
+pub(crate) fn parse_config_list(bytes: &[u8]) -> Result<Configs<'_>, String> {
+    let mut at = 0;
+    let length = usize::from(take_u16(bytes, &mut at, bytes.len())?);
+    let end = at
+        .checked_add(length)
+        .filter(|end| *end <= bytes.len())
+        .ok_or("ech: config list length past the end")?;
+    if end != bytes.len() {
+        return Err("ech: trailing bytes after the config list".to_owned());
+    }
+    Ok(Configs {
+        bytes,
+        at,
+        end,
+        seen: 0,
+        done: false,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn encode_config_list(configs: &[Config]) -> Vec<u8> {
+    let encoded: Vec<Vec<u8>> = configs.iter().map(Config::encode).collect();
+    let mut out = Vec::with_capacity(2 + encoded.iter().map(Vec::len).sum::<usize>());
+    out.extend_from_slice(&(encoded.iter().map(Vec::len).sum::<usize>() as u16).to_be_bytes());
+    for config in encoded {
+        out.extend_from_slice(&config);
+    }
+    out
+}
+
+pub(crate) fn normalize_config_list(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    if parse_config_list(&bytes)
+        .is_ok_and(|configs| configs.into_iter().all(|config| config.is_ok()))
+    {
+        return Ok(bytes);
+    }
+    if Config::single(&bytes).is_ok() {
+        let length = u16::try_from(bytes.len()).map_err(|_| "ech: config too long")?;
+        let mut out = Vec::with_capacity(2 + bytes.len());
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(&bytes);
+        return Ok(out);
+    }
+    Err("ech: neither a config list nor a config".to_owned())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ServerKey {
+    pub(crate) private_key: Vec<u8>,
+    pub(crate) config: Vec<u8>,
+}
+
+pub(crate) fn parse_server_keys(bytes: &[u8]) -> Result<Vec<ServerKey>, String> {
+    let mut keys = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let private_key = take_len16(bytes, &mut at, bytes.len())?;
+        let config = take_len16(bytes, &mut at, bytes.len())?;
+        if private_key.len() != 32 {
+            return Err("ech: server key is not a 32-byte X25519 secret".to_owned());
+        }
+        Config::single(config)?;
+        keys.push(ServerKey {
+            private_key: private_key.to_vec(),
+            config: config.to_vec(),
+        });
+    }
+    if keys.is_empty() {
+        return Err("ech: no server keys".to_owned());
+    }
+    Ok(keys)
+}
+
+#[cfg(test)]
+pub(crate) fn encode_server_keys(keys: &[ServerKey]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for key in keys {
+        out.extend_from_slice(&(key.private_key.len() as u16).to_be_bytes());
+        out.extend_from_slice(&key.private_key);
+        out.extend_from_slice(&(key.config.len() as u16).to_be_bytes());
+        out.extend_from_slice(&key.config);
+    }
+    out
+}
+
+#[cfg(test)]
+pub(crate) fn generate(public_name: &str, config_id: u8) -> Result<(Vec<u8>, Vec<u8>), String> {
+    generate_with_suites(
+        public_name,
+        config_id,
+        &[
+            (KDF_SHA256, AEAD_AES_128_GCM),
+            (KDF_SHA256, AEAD_AES_256_GCM),
+            (KDF_SHA256, AEAD_CHACHA20_POLY1305),
+        ],
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn generate_with_suites(
+    public_name: &str,
+    config_id: u8,
+    cipher_suites: &[(u16, u16)],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    if public_name.is_empty() || public_name.len() > 255 {
+        return Err("ech: public name must be 1..=255 bytes".to_owned());
+    }
+    let mut private = [0u8; 32];
+    getrandom::fill(&mut private).map_err(|_| "ech: no randomness")?;
+    let public = PublicKey::from(&StaticSecret::from(private)).to_bytes();
+    let mut suites = Vec::with_capacity(cipher_suites.len() * 4);
+    for (kdf, aead) in cipher_suites {
+        suites.extend_from_slice(&kdf.to_be_bytes());
+        suites.extend_from_slice(&aead.to_be_bytes());
+    }
+    let config = Config {
+        id: config_id,
+        kem_id: KEM_X25519,
+        public_key: &public,
+        cipher_suites: &suites,
+        maximum_name_length: 0,
+        public_name: public_name.as_bytes(),
+        extensions: &[],
+    };
+    let config_bytes = config.encode();
+    let list = encode_config_list(&[config]);
+    let keys = encode_server_keys(&[ServerKey {
+        private_key: private.to_vec(),
+        config: config_bytes,
+    }]);
+    Ok((list, keys))
+}
+
+pub(crate) fn decode_source(text: &str, label: &str) -> Result<Vec<u8>, String> {
+    let text = text.trim();
+    let body = if text.starts_with("-----BEGIN") {
+        let begin = format!("-----BEGIN {label}-----");
+        let end = format!("-----END {label}-----");
+        let after = text
+            .split_once(begin.as_str())
+            .ok_or_else(|| format!("ech: no {label} PEM block"))?
+            .1;
+        after
+            .split_once(end.as_str())
+            .ok_or_else(|| format!("ech: unterminated {label} PEM block"))?
+            .0
+    } else {
+        text
+    };
+    let clean: Vec<u8> = body
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    b64::decode(&clean).ok_or_else(|| format!("ech: {label} is not base64"))
+}
+
+fn take<'a>(bytes: &'a [u8], at: &mut usize, len: usize, end: usize) -> Result<&'a [u8], String> {
+    let next = at
+        .checked_add(len)
+        .filter(|next| *next <= end)
+        .ok_or("ech: field past the end")?;
+    let out = &bytes[*at..next];
+    *at = next;
+    Ok(out)
+}
+
+fn take_u8(bytes: &[u8], at: &mut usize, end: usize) -> Result<u8, String> {
+    let field = take(bytes, at, 1, end)?;
+    Ok(field[0])
+}
+
+fn take_u16(bytes: &[u8], at: &mut usize, end: usize) -> Result<u16, String> {
+    let field = take(bytes, at, 2, end)?;
+    Ok(u16::from_be_bytes([field[0], field[1]]))
+}
+
+fn take_len16<'a>(bytes: &'a [u8], at: &mut usize, end: usize) -> Result<&'a [u8], String> {
+    let len = usize::from(take_u16(bytes, at, end)?);
+    take(bytes, at, len, end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(bytes: &[u8]) -> Vec<Config<'_>> {
+        parse_config_list(bytes)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn a_generated_pair_round_trips() {
+        let (list, keys) = generate("cloudflare-ech.com", 7).unwrap();
+        let configs = parsed(&list);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].id, 7);
+        assert_eq!(configs[0].kem_id, KEM_X25519);
+        assert_eq!(configs[0].public_key.len(), 32);
+        assert_eq!(configs[0].public_name, b"cloudflare-ech.com");
+        assert_eq!(encode_config_list(&configs), list);
+
+        let parsed = parse_server_keys(&keys).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].private_key.len(), 32);
+        assert_eq!(parsed[0].config, configs[0].encode());
+        assert_eq!(encode_server_keys(&parsed), keys);
+    }
+
+    /// The configs are framed before the first byte is written: one buffer, no contents copy or regrowth.
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn an_encoded_config_is_one_buffer() {
+        let (list, _) = generate("example.com", 0).unwrap();
+        let config = parsed(&list).remove(0);
+        let (bytes, counts) = crate::alloc_count::measure(|| config.encode());
+        assert_eq!(counts.allocs, 1, "one reservation holds the whole config");
+        assert_eq!(bytes, config.encode(), "the bytes are unchanged");
+    }
+
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn a_bare_config_is_wrapped() {
+        let (list, _) = generate("example.com", 0).unwrap();
+        let config = parsed(&list)[0].encode();
+        assert_eq!(normalize_config_list(config.clone()).unwrap(), list);
+        assert_eq!(normalize_config_list(list.clone()).unwrap(), list);
+    }
+
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn pem_and_base64_sources_decode() {
+        let (list, keys) = generate("example.com", 0).unwrap();
+        let list_pem = format!(
+            "-----BEGIN ECH CONFIGS-----\n{}\n-----END ECH CONFIGS-----\n",
+            b64::encode(&list)
+        );
+        let keys_pem = format!(
+            "-----BEGIN ECH KEYS-----\n{}\n-----END ECH KEYS-----\n",
+            b64::encode(&keys)
+        );
+        assert_eq!(decode_source(&list_pem, "ECH CONFIGS").unwrap(), list);
+        assert_eq!(decode_source(&keys_pem, "ECH KEYS").unwrap(), keys);
+        assert_eq!(
+            decode_source(&b64::encode(&list), "ECH CONFIGS").unwrap(),
+            list
+        );
+    }
+
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn an_unsupported_version_is_skipped() {
+        let (list, _) = generate("example.com", 7).unwrap();
+        let mut body = vec![0xfe, 0x0e, 0x00, 0x04, 0, 0, 0, 0];
+        body.extend_from_slice(&list[2..]);
+        let mut bytes = (body.len() as u16).to_be_bytes().to_vec();
+        bytes.extend_from_slice(&body);
+        let configs = parsed(&bytes);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].public_name, b"example.com");
+    }
+
+    #[test]
+    fn a_long_run_of_unsupported_versions_is_walked_without_recursion() {
+        let count = 16_000u16;
+        let mut body = Vec::with_capacity(usize::from(count) * 4);
+        for _ in 0..count {
+            body.extend_from_slice(&[0xfe, 0x0e, 0x00, 0x00]);
+        }
+        let mut bytes = (body.len() as u16).to_be_bytes().to_vec();
+        bytes.extend_from_slice(&body);
+        let mut configs = parse_config_list(&bytes).unwrap();
+        match configs.next() {
+            Some(Err(err)) => assert_eq!(err, "ech: no supported config in the list"),
+            _ => panic!("a list of unknown versions has no supported config"),
+        }
+        assert!(configs.next().is_none());
+    }
+
+    #[test]
+    fn malformed_inputs_are_refused() {
+        assert!(parse_config_list(&[]).is_err());
+        assert!(parse_config_list(&[0, 3, 0xfe, 0x0d]).is_err());
+        assert!(parse_server_keys(&[]).is_err());
+        assert!(parse_server_keys(&[0, 32]).is_err());
+        assert!(decode_source("not base64!", "ECH CONFIGS").is_err());
+    }
+}
