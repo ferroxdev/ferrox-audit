@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""Pin the reference client to the server the native lane selected."""
+import argparse
+import json
+import os
+import re
+import sys
+
+
+MEEK_PROTOCOLS = {
+    "FRONTED-MEEK-OSSH": "FRONTED-MEEK",
+    "FRONTED-MEEK-CDN-OSSH": "FRONTED-MEEK",
+    "FRONTED-MEEK-HTTP-OSSH": "FRONTED-MEEK-HTTP",
+    "FRONTED-MEEK-CDN-HTTP-OSSH": "FRONTED-MEEK-HTTP",
+    "FRONTED-MEEK-QUIC-OSSH": "FRONTED-MEEK-QUIC",
+    "FRONTED-MEEK-CDN-QUIC-OSSH": "FRONTED-MEEK-QUIC",
+    "UNFRONTED-MEEK-HTTPS-OSSH": "UNFRONTED-MEEK-HTTPS",
+    "UNFRONTED-MEEK-OSSH": "UNFRONTED-MEEK",
+}
+DIRECT_PROTOCOLS = ("SSH", "OSSH")
+UNSUPPORTED_PROTOCOLS = {"QUIC-OSSH"}
+
+
+def chosen(log_path):
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return set()
+    seen = set()
+    for found, protocol in re.findall(r"tunnel up via (\S+) (\S+)", text):
+        if (
+            protocol not in DIRECT_PROTOCOLS
+            and protocol not in MEEK_PROTOCOLS
+            and protocol not in UNSUPPORTED_PROTOCOLS
+        ):
+            continue
+        host, port = found.rsplit(":", 1)
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        seen.add((host, int(port), protocol))
+    return seen
+
+
+def port(value):
+    if not isinstance(value, int) or isinstance(value, bool):
+        return 0
+    return value if 0 < value <= 65535 else 0
+
+
+def reference_port(value):
+    if value is None:
+        return True
+    return isinstance(value, int) and not isinstance(value, bool) and -(1 << 63) <= value < (1 << 63)
+
+
+def native_port(server, protocol):
+    obfuscated = port(server.get("sshObfuscatedPort"))
+    plain = port(server.get("sshPort"))
+    key = server.get("sshObfuscatedKey")
+    if obfuscated > 0 and isinstance(key, str) and key:
+        return obfuscated
+    if plain > 0:
+        return plain
+    if protocol in MEEK_PROTOCOLS:
+        return port(server.get("meekServerPort")) or (
+            80 if "-HTTP-" in protocol else 443
+        )
+    return 0
+
+
+def fronted_entry(server):
+    fronts = server.get("meekFrontingAddresses")
+    if isinstance(fronts, list) and any(
+        isinstance(front, str) and front for front in fronts
+    ):
+        return True
+    for key in ("meekFrontingDomain", "meekFrontingAddressesRegex"):
+        value = server.get(key)
+        if isinstance(value, str) and value:
+            return True
+    return False
+
+
+def entry(state, host, selected_port, protocol):
+    path = os.path.join(state, "server_entries.txt")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return None
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = bytes.fromhex(line).split(b" ", 4)[4]
+            server = json.loads(payload)
+        except (ValueError, IndexError, json.JSONDecodeError):
+            continue
+        if server.get("ipAddress") != host:
+            continue
+        capability = MEEK_PROTOCOLS.get(protocol)
+        if capability is not None:
+            if (
+                not reference_port(server.get("sshPort"))
+                or not reference_port(server.get("sshObfuscatedPort"))
+                or not reference_port(server.get("meekServerPort"))
+            ):
+                continue
+            names = server.get("capabilities")
+            if not isinstance(names, list) or capability not in names:
+                continue
+            if native_port(server, protocol) != selected_port:
+                continue
+            if capability.startswith("FRONTED-MEEK"):
+                if not fronted_entry(server):
+                    continue
+            else:
+                meek_port = port(server.get("meekServerPort"))
+                if meek_port == 0:
+                    continue
+            return line, protocol
+        if not reference_port(server.get("sshPort")):
+            continue
+        if not reference_port(server.get("sshObfuscatedPort")):
+            continue
+        obfuscated = port(server.get("sshObfuscatedPort"))
+        plain = port(server.get("sshPort"))
+        key = server.get("sshObfuscatedKey")
+        if protocol == "SSH" and plain > 0:
+            effective = (plain, "SSH")
+        elif obfuscated > 0 and isinstance(key, str) and key:
+            effective = (obfuscated, "OSSH")
+        elif plain > 0:
+            effective = (plain, "SSH")
+        else:
+            continue
+        if effective == (selected_port, protocol):
+            return line, protocol
+    return None
+
+
+def selftest():
+    import tempfile
+
+    servers = [
+        {
+            "ipAddress": "192.0.2.1",
+            "sshPort": 22,
+            "sshObfuscatedPort": "443",
+            "sshObfuscatedKey": "k",
+        },
+        {
+            "ipAddress": "192.0.2.2",
+            "sshPort": 22,
+            "sshObfuscatedPort": 443.5,
+            "sshObfuscatedKey": "k",
+        },
+        {
+            "ipAddress": "192.0.2.3",
+            "sshPort": 22,
+            "sshObfuscatedPort": 443.0,
+            "sshObfuscatedKey": "k",
+        },
+        {
+            "ipAddress": "192.0.2.4",
+            "sshPort": 70000,
+            "sshObfuscatedPort": 443,
+            "sshObfuscatedKey": "k",
+        },
+        {
+            "ipAddress": "192.0.2.5",
+            "sshPort": "22",
+            "sshObfuscatedPort": 443,
+            "sshObfuscatedKey": "k",
+        },
+        {
+            "ipAddress": "192.0.2.6",
+            "sshPort": 22,
+            "sshObfuscatedPort": 443.5,
+            "sshObfuscatedKey": "k",
+        },
+        {
+            "ipAddress": "192.0.2.7",
+            "sshPort": None,
+            "sshObfuscatedPort": 443.0,
+            "sshObfuscatedKey": "k",
+        },
+        {
+            "ipAddress": "192.0.2.8",
+            "capabilities": ["FRONTED-MEEK"],
+            "meekFrontingAddresses": ["front.example:443"],
+        },
+        {
+            "ipAddress": "192.0.2.9",
+            "capabilities": ["UNFRONTED-MEEK-HTTPS"],
+        },
+        {
+            "ipAddress": "192.0.2.10",
+            "capabilities": ["FRONTED-MEEK"],
+            "meekFrontingDomain": "front.example",
+            "meekFrontingHosts": ["cdn.example"],
+        },
+        {
+            "ipAddress": "192.0.2.11",
+            "sshPort": 22,
+            "sshObfuscatedPort": 53,
+            "sshObfuscatedKey": "k",
+            "capabilities": ["FRONTED-MEEK"],
+            "meekFrontingAddressesRegex": "front[0-9].example",
+        },
+        {
+            "ipAddress": "192.0.2.12",
+            "capabilities": ["UNFRONTED-MEEK-HTTPS"],
+            "meekServerPort": 8443,
+        },
+        {
+            "ipAddress": "192.0.2.13",
+            "capabilities": ["FRONTED-MEEK"],
+        },
+        {
+            "ipAddress": "192.0.2.14",
+            "sshPort": "22",
+            "capabilities": ["FRONTED-MEEK"],
+            "meekFrontingDomain": "front.example",
+        },
+        {
+            "ipAddress": "192.0.2.15",
+            "capabilities": ["UNFRONTED-MEEK-HTTPS"],
+            "meekServerPort": "8443",
+        },
+        {
+            "ipAddress": "192.0.2.16",
+            "sshObfuscatedPort": 443.5,
+            "capabilities": ["FRONTED-MEEK"],
+            "meekFrontingDomain": "front.example",
+        },
+        {
+            "ipAddress": "192.0.2.17",
+            "capabilities": ["FRONTED-MEEK-QUIC"],
+            "meekFrontingDomain": "front.example",
+        },
+        {
+            "ipAddress": "192.0.2.18",
+            "sshPort": 22,
+            "sshObfuscatedPort": None,
+            "sshObfuscatedKey": "k",
+        },
+        {
+            "ipAddress": "192.0.2.19",
+            "capabilities": ["FRONTED-MEEK-HTTP", "FRONTED-MEEK-QUIC"],
+            "meekFrontingDomain": "front.example",
+        },
+    ]
+    assert port(443) == 443
+    assert port(443.0) == 0
+    assert port("443") == 0
+    assert port(443.5) == 0
+    assert port(True) == 0
+    assert port(0) == 0
+    assert port(65536) == 0
+
+    with tempfile.TemporaryDirectory() as state:
+        with open(os.path.join(state, "server_entries.txt"), "w", encoding="utf-8") as handle:
+            for server in servers:
+                line = ("0 0 0 0 " + json.dumps(server)).encode().hex()
+                handle.write(line + "\n")
+        assert entry(state, "192.0.2.1", 22, "SSH") is None
+        assert entry(state, "192.0.2.1", 443, "OSSH") is None
+        assert entry(state, "192.0.2.2", 22, "SSH") is None
+        assert entry(state, "192.0.2.2", 443, "OSSH") is None
+        assert entry(state, "192.0.2.3", 443, "OSSH") is None
+        assert entry(state, "192.0.2.4", 443, "OSSH") is not None
+        assert entry(state, "192.0.2.5", 443, "OSSH") is None
+        assert entry(state, "192.0.2.6", 22, "SSH") is None
+        assert entry(state, "192.0.2.7", 443, "OSSH") is None
+        assert entry(state, "192.0.2.8", 443, "FRONTED-MEEK-OSSH") is not None
+        assert entry(state, "192.0.2.8", 443, "FRONTED-MEEK-CDN-OSSH") is not None
+        assert entry(state, "192.0.2.8", 443, "FRONTED-MEEK-HTTP-OSSH") is None
+        assert entry(state, "192.0.2.8", 443, "UNFRONTED-MEEK-HTTPS-OSSH") is None
+        assert entry(state, "192.0.2.9", 443, "UNFRONTED-MEEK-HTTPS-OSSH") is None
+        assert entry(state, "192.0.2.9", 443, "FRONTED-MEEK-OSSH") is None
+        assert entry(state, "192.0.2.10", 443, "FRONTED-MEEK-OSSH") is not None
+        assert entry(state, "192.0.2.11", 53, "FRONTED-MEEK-OSSH") is not None
+        assert entry(state, "192.0.2.11", 443, "FRONTED-MEEK-OSSH") is None
+        assert entry(state, "192.0.2.12", 8443, "UNFRONTED-MEEK-HTTPS-OSSH") is not None
+        assert entry(state, "192.0.2.17", 443, "FRONTED-MEEK-QUIC-OSSH") is not None
+        assert entry(state, "192.0.2.19", 80, "FRONTED-MEEK-CDN-HTTP-OSSH") is not None
+        assert entry(state, "192.0.2.19", 443, "FRONTED-MEEK-CDN-QUIC-OSSH") is not None
+        assert entry(state, "192.0.2.19", 443, "FRONTED-MEEK-CDN-OSSH") is None
+        assert entry(state, "192.0.2.12", 443, "UNFRONTED-MEEK-HTTPS-OSSH") is None
+        assert entry(state, "192.0.2.13", 443, "FRONTED-MEEK-OSSH") is None
+        assert entry(state, "192.0.2.14", 443, "FRONTED-MEEK-OSSH") is None
+        assert entry(state, "192.0.2.15", 8443, "UNFRONTED-MEEK-HTTPS-OSSH") is None
+        assert entry(state, "192.0.2.16", 443, "FRONTED-MEEK-OSSH") is None
+        assert entry(state, "192.0.2.18", 22, "SSH") is not None
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+        handle.write(
+            "psiphon: tunnel up via 192.0.2.1:22 SSH\n"
+            "psiphon: tunnel up via [2001:db8::1]:443 OSSH\n"
+            "psiphon: tunnel up via 192.0.2.2:22 SSH\n"
+            "psiphon: tunnel up via 192.0.2.8:443 FRONTED-MEEK-OSSH\n"
+            "psiphon: tunnel up via 192.0.2.19:80 FRONTED-MEEK-CDN-HTTP-OSSH\n"
+            "psiphon: tunnel up via 192.0.2.17:443 FRONTED-MEEK-QUIC-OSSH\n"
+            "psiphon: tunnel up via 192.0.2.18:443 QUIC-OSSH\n"
+        )
+        log = handle.name
+    try:
+        assert chosen(log) == {
+            ("192.0.2.1", 22, "SSH"),
+            ("2001:db8::1", 443, "OSSH"),
+            ("192.0.2.2", 22, "SSH"),
+            ("192.0.2.8", 443, "FRONTED-MEEK-OSSH"),
+            ("192.0.2.19", 80, "FRONTED-MEEK-CDN-HTTP-OSSH"),
+            ("192.0.2.17", 443, "FRONTED-MEEK-QUIC-OSSH"),
+            ("192.0.2.18", 443, "QUIC-OSSH"),
+        }
+    finally:
+        os.unlink(log)
+    print("psiphon-target selftest: ok")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--log", required=True)
+    parser.add_argument("--state", required=True)
+    parser.add_argument("--config", required=True)
+    args = parser.parse_args()
+    picked = chosen(args.log)
+    if not picked:
+        print("psiphon-target: the native lane named no tunnel", file=sys.stderr)
+        return 1
+    if len(picked) > 1:
+        named = ", ".join(
+            f"{host}:{port} {protocol}" for host, port, protocol in sorted(picked)
+        )
+        print(
+            f"psiphon-target: the native lane used more than one server ({named})",
+            file=sys.stderr,
+        )
+        return 1
+    picked = next(iter(picked))
+    if picked[2] in UNSUPPORTED_PROTOCOLS:
+        print(
+            f"psiphon-target: the native lane selected {picked[2]}, "
+            "which the verified cache cannot pin",
+            file=sys.stderr,
+        )
+        return 1
+    target = entry(args.state, *picked)
+    if target is None:
+        print("psiphon-target: the selected server is not in the verified cache", file=sys.stderr)
+        return 1
+    try:
+        with open(args.config, encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        print("psiphon-target: the reference config is unreadable", file=sys.stderr)
+        return 1
+    config["TargetServerEntry"], protocol = target
+    config["LimitTunnelProtocols"] = [protocol]
+    with open(args.config, "w", encoding="utf-8") as handle:
+        json.dump(config, handle)
+    print(f"psiphon-target: pinned the reference to {picked[0]}:{picked[1]} over {protocol}")
+    return 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--selftest"]:
+        selftest()
+    else:
+        sys.exit(main())
