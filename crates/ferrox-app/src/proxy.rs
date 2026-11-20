@@ -1819,4 +1819,256 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
             let left = budget.saturating_sub(started.elapsed());
             match dial_from(target, source, sockopts.as_deref(), true, left) {
                 Ok((stream, armed)) => {
-                    let deferred = a
+                    let deferred = armed && crate::fastopen::deferred(&stream);
+                    kept = Some(stream);
+                    if deferred {
+                        outcome = Fast::Deferred;
+                        break;
+                    }
+                    if !armed {
+                        outcome = Fast::Absent;
+                        break;
+                    }
+                }
+                Err(_) if round == 0 => {
+                    let plain = sockopts.map(|options| options.without_fast_open());
+                    let left = budget.saturating_sub(started.elapsed());
+                    match dial_from(target, source, plain.as_ref(), false, left) {
+                        Ok((stream, _)) => {
+                            kept = Some(stream);
+                            outcome = Fast::Absent;
+                            break;
+                        }
+                        Err(plain) => {
+                            return Err(Failure::new(Stage::SocketConnected, Kind::of(&plain)));
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let stream =
+            Connection::Tcp(kept.expect("the first round either returns or keeps a socket"));
+        no_delay(&stream);
+        return Ok((outbound_metered(stream), outcome));
+    }
+    let outcome = if fast { Fast::Absent } else { Fast::Off };
+    let stream = match (source, sockopts) {
+        (None, None) => crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
+            .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
+        (source, sockopts) => Connection::Tcp(
+            dial_from(target, source, sockopts.as_deref(), false, budgets::dial())
+                .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?
+                .0,
+        ),
+    };
+    no_delay(&stream);
+    Ok((outbound_metered(stream), outcome))
+}
+
+fn outbound_metered(stream: Connection) -> Connection {
+    let meter = OUTBOUND_TAG.with(|cell| {
+        cell.borrow()
+            .as_deref()
+            .map(|tag| crate::stats::outbound(Some(tag)))
+    });
+    match meter {
+        Some(meter) => stream.with_meter(meter),
+        None => stream,
+    }
+}
+
+pub(crate) fn dial_or_report(target: &SocketAddr) -> Option<Connection> {
+    match dial(target) {
+        Ok(stream) => {
+            DIAL_REPORT.with(|slot| slot.set(Some(true)));
+            Some(stream)
+        }
+        Err(failure) => {
+            DIAL_REPORT.with(|slot| slot.set(Some(false)));
+            note_dial_failure(target, failure);
+            None
+        }
+    }
+}
+
+fn note_dial_failure(target: &SocketAddr, failure: Failure) {
+    if failure.worth_retrying() {
+        RETRYABLE_DIALS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        FATAL_DIALS.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Ok(mut last) = LAST_DIAL.lock() {
+        *last = Some((*target, failure));
+    }
+    #[cfg(test)]
+    if let Ok(mut by_target) = LAST_DIAL_BY_TARGET.lock() {
+        by_target.push((*target, failure));
+    }
+    echo_trace(&format!("dial {target} failed: {failure}"));
+    eprintln!("dial {target} failed: {failure}");
+}
+
+/// The dial-failure report a lazy answer owes when the peer refuses it: the answer is read
+/// after the relay starts, so the dial can no longer climb and the flow closes instead.
+fn answer_refused(server: Option<SocketAddr>) -> Arc<dyn Fn() + Send + Sync> {
+    Arc::new(move || {
+        if let Some(server) = server {
+            note_dial_failure(&server, Failure::new(Stage::RequestSent, Kind::Dropped));
+        }
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn last_dial_failure() -> Option<(SocketAddr, Failure)> {
+    LAST_DIAL.lock().ok().and_then(|last| *last)
+}
+
+#[cfg(test)]
+pub(crate) fn last_dial_failure_at(target: SocketAddr) -> Option<Failure> {
+    LAST_DIAL_BY_TARGET.lock().ok().and_then(|all| {
+        all.iter()
+            .rev()
+            .find(|(at, _)| *at == target)
+            .map(|(_, failure)| *failure)
+    })
+}
+
+// The ladder rung a configured carrier answers, if it is on the ladder.
+fn rung_of(carrier: &Carrier) -> Option<Rung> {
+    match carrier {
+        Carrier::Raw(_) => Some(Rung::Raw),
+        Carrier::Ws { .. } => Some(Rung::Ws),
+        Carrier::Xhttp { .. } => Some(Rung::Xhttp),
+        Carrier::Grpc(_) => Some(Rung::Grpc),
+        Carrier::HttpUpgrade { .. } => Some(Rung::HttpUpgrade),
+        _ => None,
+    }
+}
+
+// The (path, early-data budget) a non-raw rung reuses from the configured carrier.
+fn stream_params(carrier: &Carrier) -> Option<(&str, u32)> {
+    match carrier {
+        Carrier::Ws { path, ed } => Some((path, *ed)),
+        Carrier::Grpc(settings) => Some((settings.path.as_str(), 0)),
+        Carrier::HttpUpgrade { path, .. } | Carrier::HttpHeader { path, .. } => Some((path, 0)),
+        Carrier::Xhttp { settings, .. } => Some((settings.path.as_str(), 0)),
+        _ => None,
+    }
+}
+
+// The rung a dial starts at: the carrier this server was configured for, or Raw when it is off the ladder.
+fn ladder_start(carrier: &Carrier) -> Rung {
+    rung_of(carrier).unwrap_or(Rung::Raw)
+}
+
+static FATAL_DIALS: AtomicU64 = AtomicU64::new(0);
+
+static RETRYABLE_DIALS: AtomicU64 = AtomicU64::new(0);
+// The last dial failure, so a test that outlives its dial names the stage instead of timing out in silence.
+static LAST_DIAL: std::sync::Mutex<Option<(SocketAddr, Failure)>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static LAST_DIAL_BY_TARGET: std::sync::Mutex<Vec<(SocketAddr, Failure)>> =
+    std::sync::Mutex::new(Vec::new());
+
+// Echo stage tracing behind one env flag, on stdout because the harness captures stdout per test.
+static ECHO_TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub(crate) fn echo_trace_on() -> bool {
+    *ECHO_TRACE_ON.get_or_init(|| std::env::var("FERROX_ECHO_TRACE").is_ok())
+}
+
+static ECHO_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+pub(crate) fn echo_trace(stage: &str) {
+    if echo_trace_on() {
+        let at = ECHO_T0
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis();
+        println!("echo-trace: t={at} {stage}");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DialFailures {
+    pub fatal: u64,
+    pub retryable: u64,
+}
+
+pub(crate) fn dial_failures() -> DialFailures {
+    DialFailures {
+        fatal: FATAL_DIALS.load(Ordering::Relaxed),
+        retryable: RETRYABLE_DIALS.load(Ordering::Relaxed),
+    }
+}
+
+fn report_dial_failures() {
+    let failures = dial_failures();
+    if failures.fatal + failures.retryable == 0 {
+        return;
+    }
+    eprintln!(
+        "dials: {} fatal, {} retryable",
+        failures.fatal, failures.retryable
+    );
+    report_ladder_rates();
+}
+
+fn report_ladder_rates() {
+    let ladder = Ladder::global();
+    for rung in Rung::ALL {
+        eprintln!(
+            "ladder: {rung}: {} attempts, {} useful",
+            ladder.attempts(rung),
+            ladder.useful(rung)
+        );
+    }
+    eprintln!(
+        "ladder: {} climbs, {} descents",
+        ladder.climbs(),
+        ladder.descents()
+    );
+}
+
+fn no_delay(stream: &Connection) {
+    let _ = stream.set_nodelay(true);
+}
+
+/// Startup ends here: xray answers a config error with `Failed to start:` on stdout and status 23,
+/// so a `-test` run reports the same verdict systemd's restart policy keys on.
+pub(crate) fn exit(message: &str) -> ! {
+    if crate::test_only() {
+        println!("Failed to start: {message}");
+        std::process::exit(23);
+    }
+    eprintln!("{message}");
+    std::process::exit(1);
+}
+
+/// The RFC 1929 accounts a SOCKS5 front accepts: the name and the password the
+/// credential exchange carries.
+///
+/// A front with no accounts asks for no authentication, the one this tree has always
+/// served. A front that asks for the exchange and names no account refuses every
+/// credential, which is what a config that asks for password authentication without
+/// saying who may use it means.
+#[derive(Debug, Clone, Default)]
+struct SocksAccounts {
+    /// Whether the front asks for the credential exchange at all.
+    password: bool,
+    /// The accounts the front accepts, each with the email and level its counters key on.
+    pairs: Vec<SocksAccount>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SocksAccount {
+    user: String,
+    pass: String,
+    email: String,
+    level: u32,
+}
+
+impl SocksAccounts {
+    /// Whether the front wants the credential exchange, which i
