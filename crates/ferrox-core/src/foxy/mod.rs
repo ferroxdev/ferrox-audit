@@ -1,0 +1,1858 @@
+//! Foxy: an account-authenticated CONNECT lane in front of a CDN edge — arithmetic over the lane's inputs only (pass renewal, edge ordering, pinning, refusal backoff); nothing here opens a socket, reads a clock, or prints.
+
+pub mod account;
+pub mod catalog;
+pub mod connectip;
+pub mod flow;
+pub mod frames;
+pub mod hpack;
+pub mod link;
+pub mod masque;
+pub mod pin;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    Rejected(u16),
+    /// A refusal that named the target in its own head: the edge is healthy and the pair is valid, and no other edge or fresh token will carry this host.
+    BlockedHost(u16),
+    Stream,
+    Frame,
+    Io,
+    /// The edge presented a chain this device does not trust. It is a fact about the certificate, not about the moment: no retry changes it, and every carrier on that edge answers it the same way.
+    Untrusted,
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(status) => write!(f, "edge answered {status}"),
+            Self::BlockedHost(status) => write!(f, "edge will not carry this target ({status})"),
+            Self::Stream => f.write_str("the edge closed the stream"),
+            Self::Frame => f.write_str("the edge sent a frame the carrier cannot read"),
+            Self::Io => f.write_str("the carrier io failed"),
+            Self::Untrusted => f.write_str("this device does not trust the edge's certificate"),
+        }
+    }
+}
+
+impl std::error::Error for Failure {}
+
+impl From<std::io::Error> for Failure {
+    fn from(_: std::io::Error) -> Self {
+        Self::Io
+    }
+}
+
+impl From<crate::tls::TlsError> for Failure {
+    fn from(error: crate::tls::TlsError) -> Self {
+        match error {
+            crate::tls::TlsError::BadCertificate(_) => Self::Untrusted,
+            _ => Self::Io,
+        }
+    }
+}
+
+#[must_use]
+pub fn authority(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// The peer an edge name already is: a literal address and its port, read straight out of the text — no name built, no buffer taken, no resolver asked. A host that is not a literal answers `None`, so the names that need resolving still reach it.
+#[must_use]
+pub fn edge_peer(host: &str, port: u16) -> Option<std::net::SocketAddr> {
+    Some(std::net::SocketAddr::new(host.parse().ok()?, port))
+}
+
+/// The authority an edge's own head carries, which is not what its socket is keyed by: the name, bracketed when it already spells an address, and the port only when it is not the one the scheme implies. A plain name at the default port is the caller's text, borrowed, so a lane open there spells its authority without taking a buffer.
+#[must_use]
+pub fn edge_authority(host: &str, port: u16) -> std::borrow::Cow<'_, str> {
+    let address = host.contains(':');
+    if port == 443 {
+        return if address {
+            std::borrow::Cow::Owned(format!("[{host}]"))
+        } else {
+            std::borrow::Cow::Borrowed(host)
+        };
+    }
+    std::borrow::Cow::Owned(if address {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    })
+}
+
+/// The `Proxy-Authorization` line a pass is presented with: the scheme rides the literal because the record lane's gather stack holds seven runs, and a scheme coded into the value would need an eighth.
+pub const BEARER_HEAD: &[u8] = b"\r\nProxy-Authorization: Bearer ";
+
+/// HTTP/1.1 CONNECT, the one carrier an account's edge is certain to speak: the pieces in wire order, so the writer gathers them into one record instead of building a buffer to hold the request first.
+#[must_use]
+pub fn connect_request<'a>(
+    target: &'a str,
+    authorization_head: &'static [u8],
+    credential: &'a str,
+) -> [&'a [u8]; 7] {
+    [
+        b"CONNECT ",
+        target.as_bytes(),
+        b" HTTP/1.1\r\nHost: ",
+        target.as_bytes(),
+        authorization_head,
+        credential.as_bytes(),
+        b"\r\n\r\n",
+    ]
+}
+
+/// Where the head ends: the offset of the empty line that closes an HTTP/1.1 answer, or `None` while it has not arrived. The lane walks a window at a time and asks this before it reads again, so the delimiter rule lives in one place.
+///
+/// A window settles twenty-nine starts at once. Two lanes of comparison turn the window into one bit per octet — a `\r` mask and a `\n` mask — and the terminator is then an equation on those masks rather than a walk: `\r` at `j` and `\n` at `j+1` is `cr & (lf >> 1)`, so a whole terminator at `j` is that pair mask and the same pair mask two starts later, `pair & (pair >> 2)`. That is the four-byte weigh `head.windows(4).position(|w| w == b"\r\n\r\n")` makes at every offset, done for twenty-nine offsets in two compares, two mask extracts and six arithmetic ops. On x86-64 the lanes are one AVX2 compare each, behind the cached feature probe this tree's crypto ladder already pays; everywhere else the portable word walk runs — a SWAR pass marks the `\n` lanes of each eight-byte block and only the byte after a marked `\n` is checked against the whole terminator — and the two kernels answer the same offset because the sweeps below assert both against the byte walk. The window is stepped by the starts it proves, so no start is skipped and none is weighed twice, and the last window ends the buffer so the stride's remainder is weighed by a window rather than a start at a time. It is the tree's one terminator scan, and every reader that ends a head at `\r\n\r\n` — this lane's window walk, the `httpUpgrade` and xHTTP head readers, the observatory's probe head and the `hc` front's head reader — reaches it rather than reopening the byte loop.
+#[must_use]
+pub fn head_end(head: &[u8]) -> Option<usize> {
+    // A terminator needs four bytes, so the latest start that can still hold one.
+    match head.len() {
+        0..=3 => None,
+        n => head_end_in(head, n - 4),
+    }
+}
+
+/// Where a head that keeps arriving ends, for a reader that has already walked `scanned` octets of `bytes`: a terminator straddles the seam by at most three octets, so only those and what follows are weighed, and the call records the new length for the next ask. Ask again only after `None`: the first `Some` is the offset `head_end` gives on the buffer as it stood then, and a later ask resumes past it into the body.
+#[must_use]
+pub fn head_end_grown(bytes: &[u8], scanned: &mut usize) -> Option<usize> {
+    let from = bytes.len().min(*scanned).saturating_sub(3);
+    *scanned = bytes.len();
+    head_end(&bytes[from..]).map(|at| from + at)
+}
+
+/// The starts one window proves: bit `j` is `\r` at `j`, `\n` at `j+1`, `\r` at `j+2`, `\n` at `j+3`. The pair mask is the window's answer to "is a two-octet word here", and a terminator is that word at `j` and again at `j+2`, so the four-octet weigh is one shift and one and. The window's last three starts are never claimed: the shift that pairs a `\n` with the `\r` before it brings a zero in at the top, and the fourth octet of those starts is the first octet the window does not hold.
+#[cfg(any(target_arch = "x86_64", test))]
+#[inline]
+fn window_hits(cr: u32, lf: u32) -> u32 {
+    let pair = cr & (lf >> 1);
+    pair & (pair >> 2)
+}
+
+/// The starts no window covers, four bytes at a time: the portable kernel, and the whole scan where a window is not worth a kernel.
+fn head_end_at(head: &[u8], last: usize, mut at: usize) -> Option<usize> {
+    while at <= last {
+        if head[at..at + 4] == *b"\r\n\r\n" {
+            return Some(at);
+        }
+        at += 1;
+    }
+    None
+}
+
+/// The octets one probe weighs.
+#[cfg(target_arch = "x86_64")]
+const WINDOW: usize = 32;
+
+/// The scan a kernel runs once a window is one mask pair: `WINDOW` octets are weighed at `at`, the window steps by the starts it proves, and the last one is placed to end the buffer so the stride's remainder costs a window rather than a start at a time.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn head_end_by<const WINDOW: usize>(
+    weigh: impl Fn(usize) -> u32,
+    len: usize,
+    last: usize,
+) -> Option<usize> {
+    let stride = WINDOW - 3;
+    let mut at = 0usize;
+    while at + WINDOW <= len {
+        let hits = weigh(at);
+        if hits != 0 {
+            return Some(at + hits.trailing_zeros() as usize);
+        }
+        at += stride;
+    }
+    // The loop only leaves once `at + WINDOW` is past the end, which puts `at` above `base`, so the last window holds every start the stride left and the mask erases only those already weighed.
+    if at <= last {
+        let base = len - WINDOW;
+        let hits = weigh(base) & !((1u32 << (at - base)) - 1);
+        if hits != 0 {
+            return Some(base + hits.trailing_zeros() as usize);
+        }
+    }
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+fn head_end_in(head: &[u8], last: usize) -> Option<usize> {
+    // Four starts per mask extract, and one probe of the same cached word the crypto ladder reads.
+    if head.len() >= WINDOW && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: the probe above is the guard, and the kernel loads only windows it has proved end inside `head`.
+        return unsafe { head_end_avx2(head, last) };
+    }
+    head_end_words(head, last)
+}
+
+/// Thirty-two octets per two compares, and every start the window can prove.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn head_end_avx2(head: &[u8], last: usize) -> Option<usize> {
+    use core::arch::x86_64::{
+        __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+    };
+    let cr = _mm256_set1_epi8(b'\r'.cast_signed());
+    let lf = _mm256_set1_epi8(b'\n'.cast_signed());
+    head_end_by::<WINDOW>(
+        |at| {
+            let block: __m256i = unsafe { _mm256_loadu_si256(head.as_ptr().add(at).cast()) };
+            window_hits(
+                _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, cr)) as u32,
+                _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, lf)) as u32,
+            )
+        },
+        head.len(),
+        last,
+    )
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn head_end_in(head: &[u8], last: usize) -> Option<usize> {
+    head_end_words(head, last)
+}
+
+/// The portable kernel: a SWAR pass over the `\n` lanes of each eight-byte block, the four-byte verify only at a real candidate.
+fn head_end_words(head: &[u8], last: usize) -> Option<usize> {
+    const CR: u8 = b'\r';
+    const LF: u8 = b'\n';
+    const SPREAD: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let n = head.len();
+    let want_lf = (LF as u64).wrapping_mul(SPREAD);
+    let mut word = 0usize;
+    while word + 8 <= n {
+        let block = u64::from_le_bytes(
+            head[word..word + 8]
+                .try_into()
+                .expect("one eight-byte block"),
+        );
+        let x = block ^ want_lf;
+        // A zero byte of `x` is a `\n` lane; isolate those lanes and walk them low to high.
+        let mut lf = x.wrapping_sub(SPREAD) & !x & HIGH;
+        while lf != 0 {
+            let a = word + lf.trailing_zeros() as usize / 8;
+            // The terminator's first `\n` sits one byte past its start (`a >= 1`), which must still hold four bytes (`a - 1 <= last`).
+            if a >= 1 && a - 1 <= last {
+                let s = a - 1;
+                if head[s] == CR && head[s + 2] == CR && head[s + 3] == LF {
+                    return Some(s);
+                }
+            }
+            lf &= lf - 1;
+        }
+        word += 8;
+    }
+    // Starts past the last whole block, and the one whose first `\n` fell on the block boundary, are too few for SWAR to pay: check them as four-byte windows.
+    head_end_at(head, last, if word == 0 { 0 } else { word - 1 })
+}
+
+/// The first octet equal to `needle` at or after `from`, or `None` — eight octets a step and one mask a step.
+///
+/// Subtracting a byte-at-a-time `0x01` from the block with the needle folded out of it underflows to `0xff` at every octet that equals the needle, and `& !miss` keeps only those underflows, so one and-mask marks every hit in eight octets. Reading the mask low to high is exact: every octet below the first hit is nonzero, so no borrow reaches it from below, the subtraction leaves its high bit clear or takes it away with `& !miss`, and the lowest set high bit is therefore the first hit's own — `trailing_zeros / 8` names it, and the loop never looks back. A line, a field name and a request line are all shorter than a vector is wide, so this walks a word at a time on every target: eight octets a step is already the whole line for the spans a head is made of, where a thirty-two-octet window would spend more in its broadcast and its mask extract than the line has octets to weigh.
+#[must_use]
+#[inline]
+pub fn octet_in(bytes: &[u8], from: usize, needle: u8) -> Option<usize> {
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let tail = bytes.get(from..)?;
+    let repeated = u64::from(needle).wrapping_mul(LOW);
+    let mut at = 0;
+    while at + 8 <= tail.len() {
+        let block = u64::from_le_bytes(tail[at..at + 8].try_into().expect("one eight-byte block"));
+        let miss = block ^ repeated;
+        let hits = miss.wrapping_sub(LOW) & !miss & HIGH;
+        if hits != 0 {
+            return Some(from + at + (hits.trailing_zeros() / 8) as usize);
+        }
+        at += 8;
+    }
+    tail[at..]
+        .iter()
+        .position(|byte| *byte == needle)
+        .map(|hit| from + at + hit)
+}
+
+/// The first `\r\n` in `bytes`, as the offset of its `\r`: the line ending every HTTP/1.1 head and chunked frame uses. A lone `\n` is skipped, so the answer is exactly `bytes.windows(2).position(|w| w == b"\r\n")` at eight octets a step.
+#[must_use]
+pub fn line_end(bytes: &[u8]) -> Option<usize> {
+    let mut from = 1;
+    while let Some(lf) = octet_in(bytes, from, b'\n') {
+        if bytes[lf - 1] == b'\r' {
+            return Some(lf - 1);
+        }
+        from = lf + 1;
+    }
+    None
+}
+
+pub fn connect_status(head: &[u8]) -> Result<u16, Failure> {
+    let line_end = head_end(head).ok_or(Failure::Frame)?;
+    let line = &head[..line_end];
+    let mut parts = line.split(|byte| *byte == b' ');
+    let version = parts.next().ok_or(Failure::Frame)?;
+    if !version.starts_with(b"HTTP/1.") {
+        return Err(Failure::Frame);
+    }
+    let status = parts.next().ok_or(Failure::Frame)?;
+    let status = std::str::from_utf8(status).map_err(|_| Failure::Frame)?;
+    status.parse::<u16>().map_err(|_| Failure::Frame)
+}
+
+/// One field of an answer's head, read where the octets landed: a name matches case-insensitively as `connect_status` reads the code above it, and the value comes back borrowed with the one space after the colon gone. A field the answer does not carry is `None`, and a line with no colon is not a field. Cold-path only — an answer that opened the tunnel never has its head walked twice.
+#[must_use]
+pub fn head_field<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let end = head_end(head)?;
+    let mut lines = head[..end].split(|byte| *byte == b'\n');
+    lines.next()?;
+    for line in lines {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        // A slice has no `split_once` on this toolchain, and the separator is one byte to find.
+        let Some(at) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        if line[..at].eq_ignore_ascii_case(name) {
+            let value = &line[at + 1..];
+            return Some(value.strip_prefix(b" ").unwrap_or(value));
+        }
+    }
+    None
+}
+
+/// Half the remaining life, brought forward by a safety margin so a pass is replaced before the edge refuses it, and clamped so a long pass comes back on a clock.
+#[must_use]
+pub fn renewal_delay(expires_at: Option<u64>, now: u64) -> std::time::Duration {
+    const SAFETY: u64 = 30;
+    const FLOOR: u64 = 15;
+    const CEILING: u64 = 1_800;
+    const UNKNOWN: u64 = 240;
+    let Some(remaining) = expires_at.map(|at| at.saturating_sub(now)) else {
+        return std::time::Duration::from_secs(UNKNOWN);
+    };
+    let delay = (remaining / 2).min(remaining.saturating_sub(SAFETY));
+    std::time::Duration::from_secs(delay.clamp(FLOOR, CEILING))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pass {
+    /// The bearer the plane minted, shared rather than copied: a flow's dial clones the pass into every
+    /// carrier it tries, and the token is the same bytes each time.
+    pub token: std::sync::Arc<str>,
+    pub expires_at: Option<u64>,
+    pub quota_remaining: Option<u64>,
+    pub quota_reset: Option<u64>,
+    /// The allowance the plane grants, when it names one: the ceiling the remaining bytes are counted
+    /// against, and the only way to tell a metered account from an unmetered one. `None` is not zero —
+    /// a plane that names no ceiling has named no ceiling, not an empty one.
+    pub quota_limit: Option<u64>,
+}
+
+impl Pass {
+    #[must_use]
+    pub fn renews_in(&self, now: u64) -> std::time::Duration {
+        renewal_delay(self.expires_at, now)
+    }
+
+    /// The traffic allowance the plane named, in the one shape a caller prints: the bytes left in the
+    /// largest unit that keeps a digit, what it is left of when the plane named a ceiling, and when the
+    /// bytes come back. `None` when the plane said nothing, which is not zero — an account whose headers
+    /// name no allowance is not an account with nothing left.
+    #[must_use]
+    pub fn allowance_line(&self) -> Option<String> {
+        let left = self.quota_remaining?;
+        let mut line = allowance_bytes(left);
+        if let Some(limit) = self.quota_limit {
+            line.push_str(" of ");
+            line.push_str(&allowance_bytes(limit));
+        }
+        if let Some(reset) = self.quota_reset {
+            line.push_str(", resets in ");
+            line.push_str(&allowance_clock(reset));
+        }
+        Some(line)
+    }
+}
+
+/// Bytes in the largest unit that keeps a digit: integer arithmetic throughout, because a quota is a
+/// count of bytes and a float here is a rounding bug waiting for an account at 1023 MiB.
+fn allowance_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    const KIB: u64 = 1 << 10;
+    if bytes < KIB {
+        return format!("{bytes} B");
+    }
+    if bytes < MIB {
+        return format!("{} KiB", bytes / KIB);
+    }
+    if bytes < GIB {
+        return format!("{} MiB", bytes / MIB);
+    }
+    let tenths = bytes / (GIB / 10);
+    format!("{}.{} GiB", tenths / 10, tenths % 10)
+}
+
+/// A wait in the two units a person reads it in, and never a decimal: an hour and a minute is what a
+/// reset clock means, and the seconds under it are noise a caller cannot act on.
+fn allowance_clock(seconds: u64) -> String {
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// The pass itself is the problem, so a different edge answers the same way.
+#[must_use]
+pub fn pass_is_rejected(status: u16) -> bool {
+    matches!(status, 401 | 403 | 407)
+}
+
+/// This target is refused at the edge, so a second attempt costs a round trip to learn the same thing.
+#[must_use]
+pub fn target_is_unreachable(status: u16) -> bool {
+    matches!(status, 502..=504)
+}
+
+#[must_use]
+pub fn refusal_backoff(strikes: u32) -> std::time::Duration {
+    const BASE: u64 = 30;
+    const CAP: u64 = 600;
+    std::time::Duration::from_secs((BASE << strikes.saturating_sub(1).min(16)).min(CAP))
+}
+
+/// Remembers the carriers an edge went silent on, so the next flow to one is answered locally instead of paying a round trip for the same silence.
+///
+/// The entries are a list rather than a map, because the list is short — one entry per edge per carrier, a handful — and a lookup walks it without hashing anything. The joined `String` key this replaced cost one allocation per lookup, and the lookup is on the dial path: once per carrier per edge per flow.
+///
+/// The lookup takes the three parts rather than a key, so a caller that already holds the edge's name asks without copying it: the copy is paid once, when the silence is remembered.
+#[derive(Debug)]
+pub struct Refusals {
+    entries: Vec<(CarrierKey, u64)>,
+    cap: usize,
+}
+
+impl Refusals {
+    #[must_use]
+    pub fn new(cap: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Whether this edge went silent on this carrier, inside the window.
+    #[must_use]
+    pub fn blocked(&self, carrier: u8, host: &str, port: u16, now: u64) -> bool {
+        self.entries.iter().any(|(known, until)| {
+            known.carrier == carrier
+                && known.host.as_ref() == host
+                && known.port == port
+                && *until > now
+        })
+    }
+
+    pub fn remember(&mut self, carrier: u8, host: &str, port: u16, until: u64) {
+        if let Some(entry) = self.entries.iter_mut().find(|(known, _)| {
+            known.carrier == carrier && known.host.as_ref() == host && known.port == port
+        }) {
+            entry.1 = until;
+            return;
+        }
+        if self.entries.len() >= self.cap {
+            // The entry that expires first is the one to drop: the window is the whole of what an entry says, so the earliest expiry is the oldest news.
+            if let Some(at) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, until))| *until)
+                .map(|(at, _)| at)
+            {
+                self.entries.remove(at);
+            }
+        }
+        self.entries
+            .push((CarrierKey::new(carrier, host, port), until));
+    }
+
+    pub fn clear(&mut self, carrier: u8, host: &str, port: u16) {
+        self.entries.retain(|(known, _)| {
+            known.carrier != carrier || known.host.as_ref() != host || known.port != port
+        });
+    }
+}
+
+/// The key a carrier's silence is remembered under: the carrier, the edge's name and the port it was reached on, as three fields rather than a joined string.
+///
+/// The joined form was a `String` per lookup, and the lookup happens on the dial path — once per carrier per edge per flow — so a flow paid three allocations to ask a cache whether it had already been told. The three fields are what the entry was anyway: the name and the port are the edge's own, and the carrier is a byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CarrierKey {
+    /// The carrier the edge went silent on.
+    carrier: u8,
+    /// The edge's name.
+    host: std::sync::Arc<str>,
+    /// The port the edge was reached on.
+    port: u16,
+}
+
+impl CarrierKey {
+    fn new(carrier: u8, host: &str, port: u16) -> Self {
+        Self {
+            carrier,
+            host: std::sync::Arc::from(host),
+            port,
+        }
+    }
+}
+
+/// A tunnel that stayed up this long proves its edge good, so its end clears the streak counted against it; only tunnels that end sooner, one after another, rest the edge.
+pub const TUNNEL_STAYED_UP: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How many quick tunnel ends in a row take an edge out of the dial order.
+pub const EDGE_REST_STRIKES: u32 = 2;
+
+/// How long a rested edge stays out of the order, on the assumption it was the edge and not the moment.
+pub const EDGE_REST: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The quick-end streak after one more tunnel end that `lasted`: a tunnel that stayed up resets it to none, a shorter one extends it by one.
+#[must_use]
+pub fn count_tunnel_end(in_a_row: u32, lasted: std::time::Duration) -> u32 {
+    if lasted >= TUNNEL_STAYED_UP {
+        0
+    } else {
+        in_a_row.saturating_add(1)
+    }
+}
+
+/// The edges whose tunnels kept ending soon: each one's quick-end streak and, once the streak reached [`EDGE_REST_STRIKES`], until when the edge is out of the dial order. A check that only proves an edge answers keeps dialing one whose tunnel dies on arrival, as on an exit the edge refuses; this rests it so the next flow asks a different one.
+///
+/// The entries are a list keyed by the edge's own name and port rather than a map keyed by a joined string, the way [`Refusals`] is keyed: the lookup is on the dial path, once per edge per flow, and the joined key cost one allocation and a hash of the joined bytes every time.
+#[derive(Debug)]
+pub struct EdgeStrikes {
+    entries: Vec<(EdgeKey, (u32, u64))>,
+    cap: usize,
+}
+
+impl EdgeStrikes {
+    #[must_use]
+    pub fn new(cap: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Whether the edge at `host`:`port` is rested at `now`.
+    #[must_use]
+    pub fn resting(&self, host: &str, port: u16, now: u64) -> bool {
+        self.entries.iter().any(|(known, until)| {
+            known.host.as_ref() == host && known.port == port && until.1 > now
+        })
+    }
+
+    /// Records a tunnel through `host`:`port` that ended after lasting `lasted`, at `now`. A tunnel that stayed up clears the streak and frees the entry; a short one that completes the strikes rests the edge, otherwise it only bumps the streak.
+    pub fn note_end(&mut self, host: &str, port: u16, lasted: std::time::Duration, now: u64) {
+        let count = self
+            .entries
+            .iter()
+            .find(|(known, _)| known.host.as_ref() == host && known.port == port)
+            .map_or(0, |&(_, (count, _))| count);
+        let next = count_tunnel_end(count, lasted);
+        if next == 0 {
+            self.entries
+                .retain(|(known, _)| known.host.as_ref() != host || known.port != port);
+            return;
+        }
+        let entry = next >= EDGE_REST_STRIKES;
+        let known = self
+            .entries
+            .iter()
+            .any(|(known, _)| known.host.as_ref() == host && known.port == port);
+        if entry && !known && self.entries.len() >= self.cap {
+            // The entry that expires first is the one to drop: the window is the whole of what an entry says, so the earliest expiry is the oldest news.
+            if let Some(at) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|entry| (entry.1).1)
+                .map(|(at, _)| at)
+            {
+                self.entries.remove(at);
+            }
+        }
+        let until = if entry {
+            now.saturating_add(EDGE_REST.as_secs())
+        } else {
+            0
+        };
+        match self
+            .entries
+            .iter_mut()
+            .find(|(known, _)| known.host.as_ref() == host && known.port == port)
+        {
+            Some(slot) => slot.1 = (next, until),
+            None => self.entries.push((EdgeKey::new(host, port), (next, until))),
+        }
+    }
+}
+
+/// The edge a strike is counted against: its name and the port it was reached on, as two fields rather than a joined string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EdgeKey {
+    host: std::sync::Arc<str>,
+    port: u16,
+}
+
+impl EdgeKey {
+    fn new(host: &str, port: u16) -> Self {
+        Self {
+            host: std::sync::Arc::from(host),
+            port,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Candidate {
+    /// The edge's name, shared rather than copied: a flow dials the edge many times and every one of them reads this name, so a lane that held it once and copied it per dial paid the copy per flow.
+    pub host: std::sync::Arc<str>,
+    pub port: u16,
+    pub country: String,
+    pub city: String,
+}
+
+impl Candidate {
+    #[must_use]
+    pub fn authority(&self) -> String {
+        authority(&self.host, self.port)
+    }
+}
+
+#[must_use]
+pub fn candidates_for_country(candidates: &[Candidate], country: &str) -> Vec<Candidate> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.country.eq_ignore_ascii_case(country))
+        .cloned()
+        .collect()
+}
+
+/// Stored edge first when it is in the pinned country, then that country's listed edges in order, one alternate more than the last.
+///
+/// The order is borrowed and held in a fixed array rather than collected into a `Vec`, because the walk is on the dial path and the list is short enough to know its own size: the first edge and its alternates, and no more.
+#[must_use]
+pub fn dial_order<'a>(
+    candidates: &'a [Candidate],
+    country: &str,
+    stored: Option<&'a Candidate>,
+    max_alternates: usize,
+) -> DialOrder<'a> {
+    let mut order = DialOrder::new();
+    if let Some(stored) = stored.filter(|edge| edge.country.eq_ignore_ascii_case(country)) {
+        order.push(stored);
+    }
+    for edge in candidates {
+        if order.len() > max_alternates || order.len() == DIAL_ORDER_MAX {
+            break;
+        }
+        if edge.country.eq_ignore_ascii_case(country) && !order.contains(edge) {
+            order.push(edge);
+        }
+    }
+    order
+}
+
+/// The edges one flow may dial, in order, held where the flow already has its stack: the first edge and its alternates, and no more, so the order costs no allocation on the dial path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialOrder<'a> {
+    edges: [Option<&'a Candidate>; DIAL_ORDER_MAX],
+    len: usize,
+}
+
+/// How many edges one flow's order holds: the first and its alternates, and the cap on the count a dial walk asks for.
+pub const DIAL_ORDER_MAX: usize = 8;
+
+impl<'a> DialOrder<'a> {
+    fn new() -> Self {
+        Self {
+            edges: [None; DIAL_ORDER_MAX],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, edge: &'a Candidate) {
+        if self.len < DIAL_ORDER_MAX {
+            self.edges[self.len] = Some(edge);
+            self.len += 1;
+        }
+    }
+
+    /// The order's length: how many edges it holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the order holds no edge at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether this edge is already in the order.
+    #[must_use]
+    pub fn contains(&self, edge: &Candidate) -> bool {
+        self.edges[..self.len]
+            .iter()
+            .flatten()
+            .any(|held| *held == edge)
+    }
+
+    /// The edge at this place in the order, if the order reaches that far.
+    #[must_use]
+    pub fn get(&self, at: usize) -> Option<&'a Candidate> {
+        self.edges.get(at).copied().flatten()
+    }
+
+    /// The order's edges, in the order they are dialed.
+    pub fn iter(&self) -> impl Iterator<Item = &'a Candidate> {
+        // The array is copied rather than borrowed: the iterator then carries the order's own lifetime and no borrow of the order, so a caller can walk it while holding the order.
+        let edges = self.edges;
+        edges.into_iter().flatten()
+    }
+
+    /// The order with the edges a caller rejects left out, or the whole order when every edge is rejected: a full rejection must not black-hole a flow, so an order that would come back empty keeps every edge it had.
+    ///
+    /// The result is another fixed array, because the walk is on the dial path: a caller that collected the survivors into a vector paid a heap buffer for a list it walks once.
+    #[must_use]
+    pub fn filtered(&self, keep: impl Fn(&Candidate) -> bool) -> DialOrder<'a> {
+        let mut out = DialOrder::new();
+        for edge in self.iter() {
+            if keep(edge) {
+                out.push(edge);
+            }
+        }
+        if out.is_empty() {
+            for edge in self.iter() {
+                out.push(edge);
+            }
+        }
+        out
+    }
+}
+
+impl<'a> IntoIterator for DialOrder<'a> {
+    type Item = &'a Candidate;
+    type IntoIter = std::iter::Flatten<std::array::IntoIter<Option<&'a Candidate>, DIAL_ORDER_MAX>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.edges.into_iter().flatten()
+    }
+}
+
+/// One verdict per failure, not a score: the pass, the tunnel, or the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Target,
+    Unauthenticated,
+    Session,
+}
+
+#[derive(Debug, Default)]
+pub struct Health {
+    timeouts: std::collections::HashSet<String>,
+}
+
+impl Health {
+    /// Ten distinct targets that went silent with no success between them is the tunnel; one target that keeps failing is the target.
+    pub fn timed_out(&mut self, target: &str) -> Verdict {
+        self.timeouts.insert(target.to_owned());
+        if self.timeouts.len() >= 10 {
+            Verdict::Session
+        } else {
+            Verdict::Target
+        }
+    }
+
+    pub fn status(&mut self, status: u16) -> Verdict {
+        if pass_is_rejected(status) {
+            self.timeouts.clear();
+            Verdict::Unauthenticated
+        } else {
+            Verdict::Target
+        }
+    }
+
+    pub fn succeeded(&mut self) {
+        self.timeouts.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refused chain is the one TLS failure a caller can act on, so the mapping keeps its name; every other TLS failure stays a moment about the connection.
+    #[test]
+    fn a_refused_chain_is_untrusted_and_every_other_tls_failure_is_a_moment() {
+        for (error, want) in [
+            (
+                crate::tls::TlsError::BadCertificate("UnknownIssuer".to_owned()),
+                Failure::Untrusted,
+            ),
+            (crate::tls::TlsError::Timeout, Failure::Io),
+            (crate::tls::TlsError::Closed, Failure::Io),
+            (crate::tls::TlsError::NoSharedCipher, Failure::Io),
+            (
+                crate::tls::TlsError::Other("peer misbehaved".to_owned()),
+                Failure::Io,
+            ),
+        ] {
+            assert_eq!(Failure::from(error), want, "{want}");
+        }
+        assert_eq!(
+            Failure::Untrusted.to_string(),
+            "this device does not trust the edge's certificate"
+        );
+    }
+
+    /// The allowance a person reads: the bytes in the largest unit that keeps a digit, and the reset
+    /// clock in two units. Integer arithmetic, so a quota that lands on a boundary is not rounded into
+    /// the wrong unit, and no headers is no line rather than a zero.
+    #[test]
+    fn the_allowance_is_the_bytes_left_and_when_they_return() {
+        let pass = |left: Option<u64>, reset: Option<u64>| Pass {
+            token: std::sync::Arc::from(""),
+            expires_at: None,
+            quota_remaining: left,
+            quota_reset: reset,
+            quota_limit: None,
+        };
+        assert_eq!(
+            pass(Some(4_294_967_296), Some(3_600)).allowance_line(),
+            Some("4.0 GiB, resets in 1h 0m".to_owned())
+        );
+        assert_eq!(
+            pass(Some(1_610_612_736), None).allowance_line(),
+            Some("1.5 GiB".to_owned()),
+            "a half gibibyte is a tenth, not a truncation"
+        );
+        assert_eq!(
+            pass(Some((1 << 30) - 1), Some(90)).allowance_line(),
+            Some("1023 MiB, resets in 1m".to_owned()),
+            "one byte under a gibibyte is still mebibytes"
+        );
+        assert_eq!(
+            pass(Some(1_048_575), Some(45)).allowance_line(),
+            Some("1023 KiB, resets in 45s".to_owned())
+        );
+        assert_eq!(
+            pass(Some(512), Some(0)).allowance_line(),
+            Some("512 B, resets in 0s".to_owned())
+        );
+        assert_eq!(
+            pass(None, Some(3_600)).allowance_line(),
+            None,
+            "an account the plane said nothing about is not an empty one"
+        );
+    }
+
+    /// The ceiling the plane named rides with the remainder: what is left, and what it is left of. A
+    /// remainder on its own cannot be told from a spent one, and the plane that names a ceiling is
+    /// the only one that can say what the remainder is counted against.
+    #[test]
+    fn the_allowance_names_the_ceiling_it_is_left_of() {
+        let pass = |left: Option<u64>, limit: Option<u64>| Pass {
+            token: std::sync::Arc::from(""),
+            expires_at: None,
+            quota_remaining: left,
+            quota_reset: None,
+            quota_limit: limit,
+        };
+        assert_eq!(
+            pass(Some(4_294_967_296), Some(5_368_709_120)).allowance_line(),
+            Some("4.0 GiB of 5.0 GiB".to_owned())
+        );
+        assert_eq!(
+            pass(Some(0), Some(5_368_709_120)).allowance_line(),
+            Some("0 B of 5.0 GiB".to_owned()),
+            "a spent account says so next to the ceiling it spent"
+        );
+        assert_eq!(
+            pass(Some(4_294_967_296), None).allowance_line(),
+            Some("4.0 GiB".to_owned()),
+            "a plane that named no ceiling gets no ceiling claimed for it"
+        );
+    }
+
+    #[test]
+    fn an_authority_brackets_ipv6_and_leaves_names_alone() {
+        assert_eq!(authority("example.com", 443), "example.com:443");
+        assert_eq!(authority("::1", 443), "[::1]:443");
+        assert_eq!(authority("2001:db8::1", 8080), "[2001:db8::1]:8080");
+    }
+
+    /// A literal edge address is read out of the text it is written in — no name built and no buffer taken, which the window below counts rather than infers — and a host that is not a literal is left for the resolver with a `None`, not a half-read address.
+    #[test]
+    fn a_literal_edge_address_is_read_without_a_buffer_of_its_own() {
+        assert_eq!(
+            edge_peer("192.0.2.12", 8443),
+            Some("192.0.2.12:8443".parse().expect("address")),
+            "the listed address and its port, as one peer"
+        );
+        assert_eq!(
+            edge_peer("2001:db8::1", 443),
+            Some("[2001:db8::1]:443".parse().expect("address")),
+            "a bare v6 literal is an address, not the ambiguous host:port the old name spelled"
+        );
+        assert_eq!(
+            edge_peer("edge.example", 443),
+            None,
+            "a name is the resolver's"
+        );
+        assert_eq!(
+            edge_peer("fe80::1%eth0", 443),
+            None,
+            "a scoped address keeps the answer the resolver gives"
+        );
+        assert_eq!(edge_peer("", 443), None, "no host is not an address");
+        // Both branches, through an input the optimizer cannot fold out of the loop.
+        let hosts = ["192.0.2.12", "edge.example"];
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for at in 0..4096 {
+                std::hint::black_box(edge_peer(
+                    std::hint::black_box(hosts[at % hosts.len()]),
+                    std::hint::black_box(443),
+                ));
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "4096 reads of an edge address take no heap at all"
+        );
+    }
+
+    /// The authority as the edge's head wants it: bracketed when the name is an address, ported only off the default, and the caller's own text when neither applies. The borrow is witnessed by pointer identity, not by bytes — a test that only compares text passes with the copy and without it.
+    #[test]
+    fn an_edge_authority_brackets_an_address_and_borrows_a_plain_default_port_name() {
+        let host = String::from("edge.example");
+        let plain = edge_authority(&host, 443);
+        assert_eq!(
+            plain.as_ptr() as usize - host.as_ptr() as usize,
+            0,
+            "the authority IS the caller's own bytes, not a copy of them"
+        );
+        assert_eq!(plain, "edge.example");
+        assert_eq!(edge_authority("edge.example", 8443), "edge.example:8443");
+        assert_eq!(
+            edge_authority("2001:db8::1", 443),
+            "[2001:db8::1]",
+            "an address is bracketed even with no port to write"
+        );
+        assert_eq!(edge_authority("2001:db8::1", 8443), "[2001:db8::1]:8443");
+        assert_eq!(
+            edge_authority("::1", 443),
+            "[::1]",
+            "the shortest address is still not a bare name"
+        );
+        // The shape a lane opens on: plain names at the default port, alternating so the call cannot be folded out of the loop. An address at the default port is a buffer this window does not measure, and the page says so.
+        let hosts = ["edge.example", "edge2.example"];
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for at in 0..4096 {
+                std::hint::black_box(edge_authority(
+                    std::hint::black_box(hosts[at % hosts.len()]),
+                    std::hint::black_box(443),
+                ));
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "4096 authorities at the default port take no heap at all"
+        );
+    }
+
+    #[test]
+    fn a_connect_request_carries_one_authorization_and_nothing_else() {
+        let block = connect_request("example.com:443", BEARER_HEAD, "pass.jwt.value").concat();
+        assert_eq!(
+            String::from_utf8(block).expect("ascii"),
+            "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Bearer pass.jwt.value\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn only_a_two_hundred_opens_a_tunnel() {
+        assert_eq!(
+            connect_status(b"HTTP/1.1 200 Connection established\r\n\r\n"),
+            Ok(200)
+        );
+        assert_eq!(connect_status(b"HTTP/1.1 403 Forbidden\r\n\r\n"), Ok(403));
+        assert_eq!(connect_status(b"nonsense"), Err(Failure::Frame));
+        assert_eq!(connect_status(b"HTTP/2 200\r\n\r\n"), Err(Failure::Frame));
+        assert_eq!(connect_status(b"HTTP/1.1 abc\r\n\r\n"), Err(Failure::Frame));
+    }
+
+    /// The lookup a refusal is read with: a name matched whichever way the edge spelled it, the value as it arrived with or without its space, and a marker that only appears inside another field's value is not the field.
+    #[test]
+    fn head_field_reads_the_names_the_edge_sent() {
+        let head =
+            b"HTTP/1.1 403 Forbidden\r\nX-Hola-Error: Forbidden Host\r\nConnection: close\r\n\r\n";
+        let names: [&[u8]; 4] = [
+            b"X-Hola-Error",
+            b"x-hola-error",
+            b"X-HOLA-ERROR",
+            b"x-hoLa-ErRoR",
+        ];
+        for name in names {
+            assert_eq!(
+                head_field(head, name),
+                Some(&b"Forbidden Host"[..]),
+                "the name matches whichever way the edge spelled it: {name:?}"
+            );
+        }
+        assert_eq!(head_field(head, b"Connection"), Some(&b"close"[..]));
+        assert_eq!(head_field(head, b"Proxy-Connection"), None);
+        assert_eq!(
+            head_field(
+                b"HTTP/1.1 403 F\r\nX-Hola-Error:Forbidden Host\r\n\r\n",
+                b"X-Hola-Error"
+            ),
+            Some(&b"Forbidden Host"[..]),
+            "the space after the colon is the convention, not part of the value"
+        );
+        assert_eq!(
+            head_field(
+                b"HTTP/1.1 403 F\r\nNote: X-Hola-Error: Forbidden Host\r\n\r\n",
+                b"X-Hola-Error"
+            ),
+            None,
+            "the marker inside another field's value is not this field"
+        );
+        assert_eq!(
+            head_field(
+                b"HTTP/1.1 403 F\r\nnot a field\r\nX\r\n\r\n",
+                b"X-Hola-Error"
+            ),
+            None,
+            "a line with no colon is skipped, not a stop"
+        );
+        assert_eq!(
+            head_field(
+                b"HTTP/1.1 403 F\r\nX-Hola-Error: Forbidden Host\r\n",
+                b"X-Hola-Error"
+            ),
+            None,
+            "a head that never reached its blank line has no fields to read"
+        );
+        // Bytes alone cannot witness the borrow: the offset of the answer inside the caller's own head is what says nothing was staged.
+        let found = head_field(head, b"X-Hola-Error").expect("the edge named the host");
+        let offset = found.as_ptr() as usize - head.as_ptr() as usize;
+        let width = found.len();
+        assert!(
+            offset + width <= head.len(),
+            "the value lies inside the head it was read from: offset {offset}, {width} bytes"
+        );
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for at in 0..4096 {
+                std::hint::black_box(head_field(
+                    std::hint::black_box(head.as_slice()),
+                    std::hint::black_box(names[at % names.len()]),
+                ));
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "4096 field reads of an answer's head take no heap at all"
+        );
+    }
+
+    #[test]
+    fn a_pass_comes_back_at_half_its_life_and_never_later_than_the_ceiling() {
+        for (expires, now, want) in [
+            (Some(1_000_u64), 0_u64, 500_u64),
+            (Some(1_000), 400, 300),
+            (Some(100), 90, 15),
+            (None, 0, 240),
+            (Some(1_000_000), 0, 1_800),
+            (Some(10), 10, 15),
+            (Some(20), 0, 15),
+        ] {
+            assert_eq!(renewal_delay(expires, now).as_secs(), want, "at {now}");
+        }
+    }
+
+    #[test]
+    fn a_rejected_pass_and_an_unreachable_target_are_different_verdicts() {
+        for status in [401, 403, 407] {
+            assert!(pass_is_rejected(status), "{status}");
+            assert!(!target_is_unreachable(status), "{status}");
+        }
+        for status in [502, 503, 504] {
+            assert!(target_is_unreachable(status), "{status}");
+            assert!(!pass_is_rejected(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_backs_off_by_a_power_of_two_and_stops_at_ten_minutes() {
+        let backs: Vec<u64> = (0..=9).map(|n| refusal_backoff(n).as_secs()).collect();
+        assert_eq!(backs, [30, 30, 60, 120, 240, 480, 600, 600, 600, 600]);
+    }
+
+    /// The carrier-probe cache: remember, block inside the window, free at its edge, clear without a trace — so a QUIC-deaf edge is asked once per window and found again at the next.
+    #[test]
+    fn a_carrier_this_edge_did_not_answer_waits_out_its_window() {
+        let mut probe = Refusals::new(8);
+        probe.remember(2, "edge.example", 2499, 1_000);
+        assert!(probe.blocked(2, "edge.example", 2499, 10));
+        assert!(
+            !probe.blocked(1, "edge.example", 2499, 10),
+            "the other carrier is not what was asked"
+        );
+        assert!(
+            !probe.blocked(2, "edge.example", 2499, 1_000),
+            "the window ends, and the edge is asked again"
+        );
+        probe.remember(2, "edge.example", 2499, 2_000);
+        probe.clear(2, "edge.example", 2499);
+        assert!(
+            !probe.blocked(2, "edge.example", 2499, 10),
+            "a cleared carrier is asked"
+        );
+        assert!(probe.entries.is_empty(), "and the list is left empty");
+    }
+
+    /// The lookup takes the edge's own name, so a caller that already holds it asks without copying it: the joined key this replaced cost one allocation per lookup, and the lookup is on the dial path.
+    #[test]
+    fn a_carrier_cache_lookup_allocates_nothing() {
+        let mut probe = Refusals::new(8);
+        probe.remember(2, "edge.example", 2499, 1_000);
+        let host = String::from("edge.example");
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                assert!(probe.blocked(2, &host, 2499, 10));
+            }
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "the lookup copies nothing: the name is the caller's own"
+        );
+    }
+
+    #[test]
+    fn a_refusal_expires_and_the_cache_stays_capped() {
+        let mut refusals = Refusals::new(2);
+        refusals.remember(0, "a", 80, 30);
+        refusals.remember(0, "b", 80, 40);
+        assert!(refusals.blocked(0, "a", 80, 10) && refusals.blocked(0, "b", 80, 10));
+        assert!(!refusals.blocked(0, "a", 80, 40));
+        refusals.remember(0, "c", 80, 90);
+        assert_eq!(refusals.entries.len(), 2);
+        refusals.clear(0, "c", 80);
+        assert!(!refusals.blocked(0, "c", 80, 10));
+    }
+
+    /// One tunnel that stayed up clears the streak a short one built; only ends sooner than the mark, one after another, extend it.
+    #[test]
+    fn a_tunnel_that_stayed_up_clears_the_quick_end_streak() {
+        use std::time::Duration;
+        let short = TUNNEL_STAYED_UP.saturating_sub(Duration::from_secs(1));
+        assert_eq!(count_tunnel_end(0, short), 1);
+        assert_eq!(count_tunnel_end(1, short), 2);
+        assert_eq!(count_tunnel_end(5, Duration::from_secs(300)), 0);
+        assert_eq!(count_tunnel_end(5, Duration::from_secs(3600)), 0);
+    }
+
+    /// The strike lookup takes the edge's own name, so a caller that already holds it asks without copying it: the joined key this replaced cost one allocation and a hash of the joined bytes per lookup, and the lookup is on the dial path, once per edge per flow.
+    #[test]
+    fn an_edge_strike_lookup_allocates_nothing() {
+        let mut strikes = EdgeStrikes::new(8);
+        strikes.note_end("edge.example", 2499, TUNNEL_STAYED_UP, 100);
+        let host = String::from("edge.example");
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                assert!(!strikes.resting(&host, 2499, 100));
+            }
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "the lookup copies nothing: the name is the caller's own"
+        );
+    }
+
+    /// Two quick ends rest the edge for the window; a third carrier that carried traffic for its length frees the entry instead of adding a strike.
+    #[test]
+    fn two_quick_ends_rest_an_edge_and_a_long_tunnel_frees_it() {
+        use std::time::Duration;
+        let short = TUNNEL_STAYED_UP.saturating_sub(Duration::from_secs(1));
+        let mut strikes = EdgeStrikes::new(8);
+        strikes.note_end("edge", 443, short, 100);
+        assert!(
+            !strikes.resting("edge", 443, 100),
+            "one quick end is not yet a reason to rest"
+        );
+        strikes.note_end("edge", 443, short, 100);
+        assert!(
+            strikes.resting("edge", 443, 100),
+            "the second quick end in a row rests it"
+        );
+        assert!(
+            !strikes.resting("edge", 443, 400),
+            "another edge is untouched"
+        );
+        assert!(
+            !strikes.resting("edge", 443, 100 + EDGE_REST.as_secs()),
+            "the rest expires and the edge is dialed again"
+        );
+        // A fresh streak that runs long is proof of a good edge, not a third strike.
+        strikes.note_end("edge", 443, short, 500);
+        strikes.note_end("edge", 443, Duration::from_secs(300), 500);
+        strikes.note_end("edge", 443, short, 500);
+        assert!(
+            !strikes.resting("edge", 443, 500),
+            "the long tunnel cleared the streak, so one short end is not a rest"
+        );
+    }
+
+    fn edge(host: &str, country: &str, city: &str) -> Candidate {
+        Candidate {
+            host: std::sync::Arc::from(host),
+            port: 443,
+            country: country.to_owned(),
+            city: city.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_dial_order_stays_in_the_pinned_country_with_the_stored_edge_first() {
+        let edges = vec![
+            edge("de1", "DE", "berlin"),
+            edge("us1", "US", "nyc"),
+            edge("de2", "de", "frankfurt"),
+            edge("us2", "US", "sf"),
+        ];
+        let authorities =
+            |order: DialOrder<'_>| order.iter().map(Candidate::authority).collect::<Vec<_>>();
+        assert_eq!(
+            authorities(dial_order(&edges, "de", Some(&edges[2]), 2)),
+            ["de2:443", "de1:443"]
+        );
+        assert_eq!(
+            authorities(dial_order(&edges, "DE", Some(&edges[1]), 2)),
+            ["de1:443", "de2:443"]
+        );
+        assert_eq!(authorities(dial_order(&edges, "us", None, 0)), ["us1:443"]);
+        assert!(dial_order(&edges, "fr", None, 3).is_empty());
+    }
+
+    /// The order a flow walks is held, not built: a flow that collected the ladder into a vector paid a heap buffer for a list it had already, and a flow that copied the edges paid four strings per edge to name a list that never changes.
+    #[test]
+    fn a_dial_order_walks_without_touching_the_heap() {
+        let edges = vec![
+            edge("de1", "DE", "berlin"),
+            edge("us1", "US", "nyc"),
+            edge("de2", "de", "frankfurt"),
+            edge("us2", "US", "sf"),
+        ];
+        let (order, counts) = crate::alloc_count::measure(|| {
+            let order = dial_order(&edges, "de", Some(&edges[2]), 3);
+            std::hint::black_box(order.iter().count());
+            order
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "building the order a flow walks takes no heap at all"
+        );
+        assert_eq!(
+            order.len(),
+            2,
+            "the pinned country's edges, the stored one first"
+        );
+    }
+
+    /// The order the rest of the walk filters: the survivors are held in the order's own array, so a flow that collected them into a vector paid a heap buffer for a list of four.
+    #[test]
+    fn a_filtered_dial_order_holds_its_survivors_without_touching_the_heap() {
+        let edges = vec![
+            edge("de1", "DE", "berlin"),
+            edge("de2", "de", "frankfurt"),
+            edge("de3", "DE", "berlin"),
+        ];
+        let (kept, counts) = crate::alloc_count::measure(|| {
+            let order = dial_order(&edges, "de", None, 3);
+            let kept = order.filtered(|edge| edge.city == "berlin");
+            std::hint::black_box(kept.len());
+            kept
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "filtering the order takes no heap at all"
+        );
+        assert_eq!(
+            kept.len(),
+            2,
+            "the two berlin edges, and the frankfurt one left out"
+        );
+    }
+
+    /// Every edge that rests comes back: a filter that emptied the order would black-hole a flow, and the one that rests is the edge the lane has least reason to try.
+    #[test]
+    fn a_filter_that_rejects_every_edge_keeps_them_all() {
+        let edges = vec![edge("de1", "DE", "berlin"), edge("de2", "de", "frankfurt")];
+        let order = dial_order(&edges, "de", None, 3);
+        let kept = order.filtered(|_| false);
+        assert_eq!(kept.len(), 2, "a full rest must not black-hole a flow");
+    }
+
+    /// The edge's name is shared: a flow that cloned it paid a copy of the name per dial, and the name is the same bytes for every flow of the lane.
+    #[test]
+    fn an_edge_name_is_shared_rather_than_copied() {
+        let edge = edge("de1", "DE", "berlin");
+        let copy = edge.clone();
+        assert!(
+            std::sync::Arc::ptr_eq(&edge.host, &copy.host),
+            "the copy holds the same name, not a copy of it"
+        );
+    }
+
+    #[test]
+    fn ten_distinct_timeouts_without_a_success_condemn_the_tunnel() {
+        let mut health = Health::default();
+        for index in 0..9 {
+            assert_eq!(
+                health.timed_out(&format!("t{index}")),
+                Verdict::Target,
+                "{index}"
+            );
+        }
+        assert_eq!(health.timed_out("t9"), Verdict::Session);
+        let mut health = Health::default();
+        for _ in 0..99 {
+            assert_eq!(health.timed_out("one"), Verdict::Target);
+        }
+        health.succeeded();
+        assert!(health.timeouts.is_empty());
+        assert_eq!(health.status(401), Verdict::Unauthenticated);
+        assert_eq!(health.status(502), Verdict::Target);
+        health.timed_out("two");
+        health.status(403);
+        assert!(health.timeouts.is_empty());
+    }
+
+    #[test]
+    fn a_pin_matches_the_certificate_it_was_taken_from() {
+        let leaf = certificate(11);
+        let pin = pin::spki_pin(&leaf).expect("a pin");
+        assert!(pin.starts_with("sha256/") && pin.len() == 7 + 44);
+        assert!(pin::Pins::parse([pin.clone()]).holds(&leaf));
+        assert!(pin::Pins::default().holds(&leaf));
+        let other = "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        assert!(!pin::Pins::parse([other.to_owned()]).holds(&leaf));
+        assert!(pin::Pins::parse(["nonsense".to_owned(), pin]).holds(&leaf));
+        assert!(pin::Pins::parse(["sha256/".to_owned()]).is_empty());
+        assert_eq!(pin::Pins::parse([other.to_owned()]).len(), 1);
+    }
+
+    #[test]
+    fn a_certificate_that_is_not_a_certificate_yields_no_pin() {
+        for der in [
+            &[][..],
+            &[0x30, 0x00][..],
+            &[0x30, 0x03, 0x02, 0x01, 0x01][..],
+            &[0x30, 0x7f, 0x30, 0x7d][..],
+            &[0x31, 0x00][..],
+        ] {
+            assert!(pin::spki_pin(der).is_none(), "{der:?}");
+        }
+    }
+
+    fn certificate(issuer_width: usize) -> Vec<u8> {
+        pin::build::certificate(issuer_width).0
+    }
+
+    #[test]
+    fn a_pass_reports_when_it_wants_to_come_back() {
+        let pass = Pass {
+            token: std::sync::Arc::from("t"),
+            expires_at: Some(1_000),
+            quota_remaining: Some(12),
+            quota_reset: Some(9),
+            quota_limit: None,
+        };
+        assert_eq!(pass.renews_in(0).as_secs(), 500);
+        assert_eq!(pass.quota_remaining, Some(12));
+    }
+
+    /// A flow's dial clones the pass into every carrier it tries, and the token is the same bytes each time: the clone shares the token rather than copying it. A byte-level test passes with the copy and without it, so only the pointer can witness that the token was not copied.
+    #[test]
+    fn a_cloned_pass_shares_its_token_rather_than_copying_it() {
+        let pass = Pass {
+            token: std::sync::Arc::from("a-token-long-enough-to-stand-alone"),
+            expires_at: None,
+            quota_remaining: None,
+            quota_reset: None,
+            quota_limit: None,
+        };
+        let copied = pass.clone();
+        assert_eq!(
+            copied.token.as_ptr(),
+            pass.token.as_ptr(),
+            "the clone shares the token's bytes"
+        );
+        assert_eq!(copied.token.as_ref(), pass.token.as_ref());
+    }
+
+    /// `head_end` is the tree's one terminator scan and the shared head readers reach it in place of `windows(4).position`; this sweep is its oracle. A forged `\r\n\r`, a length that is not a multiple of eight, a terminator whose first `\n` lands exactly on a block boundary, and an all-`\n` body that keeps the verify busy must all return the very same offset — or the same `None` — as the byte-by-byte form it replaced.
+    #[test]
+    fn the_swar_terminator_scan_is_the_windows_four_scan() {
+        // Nested so the sweep takes any start iterator without collecting one first.
+        fn sweep(len: usize, starts: impl Iterator<Item = usize>) {
+            const CR: u8 = b'\r';
+            const LF: u8 = b'\n';
+            const NEEDLE: [u8; 4] = [CR, LF, CR, LF];
+            let oracle = |buf: &[u8]| buf.windows(4).position(|w| w == b"\r\n\r\n");
+            for start in starts {
+                // A `\n`-and-`Z` body with no `\r`, so the only terminator is the one planted at `start`.
+                if start + 4 <= len {
+                    let mut v: Vec<u8> = (0..len)
+                        .map(|i| if i % 5 == 0 { LF } else { b'Z' })
+                        .collect();
+                    v[start..start + 4].copy_from_slice(&NEEDLE);
+                    assert_eq!(head_end(&v), oracle(&v), "len {len} at {start}");
+                }
+            }
+            let no_lf: Vec<u8> = vec![CR; len];
+            assert_eq!(head_end(&no_lf), oracle(&no_lf), "len {len} no LF");
+            let all_lf: Vec<u8> = vec![LF; len];
+            assert_eq!(head_end(&all_lf), oracle(&all_lf), "len {len} all LF");
+        }
+
+        // Exhaustive over {\r, \n, Z} up to eight bytes: every alignment and near-miss.
+        const ALPHABET: [u8; 3] = *b"\r\nZ";
+        let mut small = [0u8; 8];
+        let oracle = |buf: &[u8]| buf.windows(4).position(|w| w == b"\r\n\r\n");
+        for len in 0..=8usize {
+            for code in 0..ALPHABET.len().pow(len as u32) {
+                let mut rest = code;
+                for slot in &mut small[..len] {
+                    *slot = ALPHABET[rest % ALPHABET.len()];
+                    rest /= ALPHABET.len();
+                }
+                let view = &small[..len];
+                assert_eq!(head_end(view), oracle(view), "exhaustive {view:?}");
+            }
+        }
+
+        // Every start over the lengths that straddle a block boundary at both ends.
+        for len in 0..=130usize {
+            sweep(len, 0..len);
+        }
+        // Every start across several whole windows of the x86 kernel and every remainder its stride leaves, not only the word boundary a multiple of eight puts a terminator on.
+        for len in [511usize, 512, 513, 527, 528, 529] {
+            sweep(len, 0..len);
+        }
+        // At scale, the first two words, mid-buffer, and the final partial word.
+        for len in [511usize, 512, 513, 4096, 16 * 1024] {
+            sweep(
+                len,
+                (0..17)
+                    .chain([len / 2, len / 2 + 1])
+                    .chain(len.saturating_sub(9)..len),
+            );
+        }
+    }
+
+    /// `line_end` is the line-ending scan the HTTP/1.1 head and chunked-frame readers reach; this sweep is its oracle, so every lone `\n`, every alignment and every start the byte walk finds or misses answers the same offset or the same `None`.
+    #[test]
+    fn the_swar_line_scan_is_the_windows_two_scan() {
+        fn sweep(len: usize, starts: impl Iterator<Item = usize>) {
+            const CR: u8 = b'\r';
+            const LF: u8 = b'\n';
+            let oracle = |buf: &[u8]| buf.windows(2).position(|w| w == b"\r\n");
+            for start in starts {
+                if start + 2 <= len {
+                    let mut v: Vec<u8> = (0..len)
+                        .map(|i| if i % 5 == 0 { LF } else { b'Z' })
+                        .collect();
+                    v[start] = CR;
+                    v[start + 1] = LF;
+                    assert_eq!(line_end(&v), oracle(&v), "len {len} at {start}");
+                }
+            }
+            let no_lf: Vec<u8> = vec![CR; len];
+            assert_eq!(line_end(&no_lf), oracle(&no_lf), "len {len} no LF");
+            let all_lf: Vec<u8> = vec![LF; len];
+            assert_eq!(line_end(&all_lf), oracle(&all_lf), "len {len} all LF");
+        }
+
+        const ALPHABET: [u8; 3] = *b"\r\nZ";
+        let mut small = [0u8; 8];
+        let oracle = |buf: &[u8]| buf.windows(2).position(|w| w == b"\r\n");
+        for len in 0..=8usize {
+            for code in 0..ALPHABET.len().pow(len as u32) {
+                let mut rest = code;
+                for slot in &mut small[..len] {
+                    *slot = ALPHABET[rest % ALPHABET.len()];
+                    rest /= ALPHABET.len();
+                }
+                let view = &small[..len];
+                assert_eq!(line_end(view), oracle(view), "exhaustive {view:?}");
+            }
+        }
+
+        for len in 0..=130usize {
+            sweep(len, 0..=len.saturating_sub(2));
+        }
+    }
+
+    /// `head_end_grown` resumes the tree's one scan across a seam instead of walking the buffer again: at every pair of arrival points it answers what the whole-buffer walk answers, or the same `None`, and a terminator finishing in the three octets after a cut is still found.
+    #[test]
+    fn the_resumed_scan_answers_the_whole_buffer_walk_at_every_seam() {
+        let cases: [&[u8]; 4] = [
+            b"\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nbody",
+            b"HTTP/1.1 200 OK\r\nX-Fill: 012345678901234567890123456789\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nX: y\r\n",
+        ];
+        for case in cases {
+            let want = head_end(case);
+            for first in 0..=case.len() {
+                for second in first..=case.len() {
+                    let mut scanned = 0;
+                    let mut got = head_end_grown(&case[..first], &mut scanned);
+                    if got.is_none() {
+                        got = head_end_grown(&case[..second], &mut scanned);
+                    }
+                    if got.is_none() {
+                        got = head_end_grown(case, &mut scanned);
+                    }
+                    assert_eq!(got, want, "{first} {second} {case:?}");
+                }
+            }
+        }
+        // The seam is three octets wide: a terminator finishing one octet past each cut is found.
+        let head = b"HTTP/1.1 200 OK\r\nA: b\r\n\r\n";
+        let at = head_end(head).expect("a terminator");
+        for cut in at..=at + 3 {
+            let mut scanned = 0;
+            assert_eq!(head_end_grown(&head[..cut], &mut scanned), None);
+            assert_eq!(head_end_grown(head, &mut scanned), Some(at));
+        }
+    }
+
+    /// A head the size of a served request, arriving in sixty-four-octet pieces.
+    fn a_long_head() -> Vec<u8> {
+        let mut head = b"HTTP/1.1 200 Connection established\r\n".to_vec();
+        while head.len() + 4 < 4096 {
+            head.extend_from_slice(b"X-Fill: 0123456789abcdef0123456789abcdef\r\n");
+        }
+        head.extend_from_slice(b"\r\n");
+        head
+    }
+
+    /// The growing scan: a 4 KiB head arriving sixty-four octets at a time is weighed once at each seam and stops at the first `Some`, the shape every caller uses, and the same sixty-five asks fold to the whole-buffer answer.
+    #[test]
+    fn a_growing_head_is_walked_once() {
+        let head = a_long_head();
+        let mut scanned = 0;
+        let mut fold: u32 = 0;
+        let mut end = 0;
+        loop {
+            end = (end + 64).min(head.len());
+            let got = head_end_grown(std::hint::black_box(&head[..end]), &mut scanned);
+            fold = fold
+                .wrapping_mul(31)
+                .wrapping_add(end as u32)
+                .wrapping_add(got.map_or(0, |at| at as u32 + 1));
+            if got.is_some() || end == head.len() {
+                break;
+            }
+        }
+        assert_eq!(
+            fold, 0x6e10_181f,
+            "one head in sixty-five pieces, folded after each ask"
+        );
+        assert_eq!(scanned, head.len());
+    }
+
+    /// The rewalk the growing scan replaced, kept as this run's other frame: the same sixty-five asks each weigh the whole prefix through `head_end`, the same pinned fold, so the pair prices the resume without a second CI run being trusted to agree with the first.
+    #[test]
+    fn a_growing_head_rewalked_costs_the_old_pass() {
+        let head = a_long_head();
+        let mut fold: u32 = 0;
+        let mut end = 0;
+        loop {
+            end = (end + 64).min(head.len());
+            let got = head_end(std::hint::black_box(&head[..end]));
+            fold = fold
+                .wrapping_mul(31)
+                .wrapping_add(end as u32)
+                .wrapping_add(got.map_or(0, |at| at as u32 + 1));
+            if got.is_some() || end == head.len() {
+                break;
+            }
+        }
+        assert_eq!(
+            fold, 0x6e10_181f,
+            "the same sixty-five asks, each over the whole prefix"
+        );
+    }
+
+    /// The mask equation a window runs is the four-byte weigh: bit `j` of the answer is set exactly
+    /// when the four octets at `j` are the terminator, for every start the window can hold, and no
+    /// start past the thirteen it proves is ever claimed. This is the half of the scan a kernel
+    /// supplies masks for, so it is swept where a kernel cannot be run at all.
+    #[test]
+    fn a_window_weighs_every_start_it_holds() {
+        fn masks(window: &[u8]) -> (u32, u32) {
+            let mut cr = 0u32;
+            let mut lf = 0u32;
+            for (at, byte) in window.iter().enumerate() {
+                match *byte {
+                    b'\r' => cr |= 1 << at,
+                    b'\n' => lf |= 1 << at,
+                    _ => {}
+                }
+            }
+            (cr, lf)
+        }
+        let weigh = |window: &[u8]| {
+            let (cr, lf) = masks(window);
+            window_hits(cr, lf)
+        };
+        // Every placement of the terminator in a window, and every single-octet near miss of it.
+        for at in 0..=12usize {
+            for damaged in 0..4usize {
+                let mut window = [b'Z'; 16];
+                window[at..at + 4].copy_from_slice(b"\r\n\r\n");
+                window[at + damaged] = b'Q';
+                assert_eq!(
+                    weigh(&window) & (1 << at),
+                    0,
+                    "a start at {at} with octet {damaged} broken is not the terminator"
+                );
+            }
+            let mut window = [b'Z'; 16];
+            window[at..at + 4].copy_from_slice(b"\r\n\r\n");
+            assert_eq!(weigh(&window), 1 << at, "the only start the window holds");
+        }
+        // A terminator past the thirteen proved starts is the next window's, not this one's.
+        for at in 13..16usize {
+            let mut window = [b'Z'; 16];
+            window[at..at + 4.min(16 - at)].copy_from_slice(&b"\r\n\r\n"[..4.min(16 - at)]);
+            assert_eq!(weigh(&window) & !0x1fff, 0, "no start past twelve at {at}");
+        }
+        // A body dense in both octets, swept against the byte walk over the whole window.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..4096usize {
+            let mut window = [0u8; 16];
+            for slot in &mut window {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                *slot = match (state >> 60) & 3 {
+                    0 => b'\r',
+                    1 => b'\n',
+                    _ => b'Z',
+                };
+            }
+            let wanted = (0..=12usize)
+                .filter(|at| window[*at..*at + 4] == *b"\r\n\r\n")
+                .fold(0u32, |bits, at| bits | (1 << at));
+            assert_eq!(weigh(&window), wanted, "{window:?}");
+        }
+    }
+
+    /// The loop the AVX2 kernel runs is the byte walk at every width a window could be: the stride,
+    /// the starts a window proves, and the one window placed to end the buffer are swept over every
+    /// start of every length with a scalar mask builder, so the arithmetic is proved by the same code
+    /// the kernel hands its own masks to.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_window_scan_is_the_byte_walk_at_every_width() {
+        fn weigh(window: &[u8]) -> u32 {
+            let mut cr = 0u32;
+            let mut lf = 0u32;
+            for (at, byte) in window.iter().enumerate() {
+                match *byte {
+                    b'\r' => cr |= 1 << at,
+                    b'\n' => lf |= 1 << at,
+                    _ => {}
+                }
+            }
+            window_hits(cr, lf)
+        }
+        fn check<const WINDOW: usize>(buf: &[u8]) -> Option<usize> {
+            let oracle = buf.windows(4).position(|w| w == b"\r\n\r\n");
+            let scanned =
+                head_end_by::<WINDOW>(|at| weigh(&buf[at..at + WINDOW]), buf.len(), buf.len() - 4);
+            assert_eq!(scanned, oracle, "width {WINDOW} over {buf:?}");
+            scanned
+        }
+        fn sweep<const WINDOW: usize>() {
+            // Every start of every length from the first whole window to well past four strides.
+            for len in WINDOW..=WINDOW * 4 + 40 {
+                for start in 0..len {
+                    let mut buf: Vec<u8> = (0..len)
+                        .map(|i| if i % 5 == 0 { b'\n' } else { b'Z' })
+                        .collect();
+                    if start + 4 <= len {
+                        buf[start..start + 4].copy_from_slice(b"\r\n\r\n");
+                    }
+                    check::<WINDOW>(&buf);
+                }
+                let none = vec![b'Z'; len];
+                assert_eq!(check::<WINDOW>(&none), None, "width {WINDOW} len {len}");
+            }
+            // Two terminators: the earlier is the answer, whichever window holds it.
+            for gap in WINDOW..WINDOW * 2 + 3 {
+                let len = gap + 8;
+                let mut buf = vec![b'Z'; len];
+                buf[0..4].copy_from_slice(b"\r\n\r\n");
+                buf[gap..gap + 4].copy_from_slice(b"\r\n\r\n");
+                assert_eq!(check::<WINDOW>(&buf), Some(0), "width {WINDOW} gap {gap}");
+                let mut late = buf;
+                late[0..4].copy_from_slice(b"ZZZZ");
+                assert_eq!(
+                    check::<WINDOW>(&late),
+                    Some(gap),
+                    "width {WINDOW} gap {gap}"
+                );
+            }
+        }
+        sweep::<8>();
+        sweep::<16>();
+        sweep::<32>();
+    }
+
+    /// The two kernels are one answer: where the feature is present every start of a sweep is asked of the vector kernel, the portable walk and `head_end`, and all three must name the same offset. The dispatch itself is not a behavioural claim — a fallback answers correctly too — so this test holds the kernels, and the count row is what says which one ran.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_vector_kernel_answers_the_word_walk_at_every_start() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for len in WINDOW..=WINDOW * 3 + 7 {
+            for start in 0..len - 3 {
+                let mut buf: Vec<u8> = (0..len)
+                    .map(|i| if i % 5 == 0 { b'\n' } else { b'Z' })
+                    .collect();
+                buf[start..start + 4].copy_from_slice(b"\r\n\r\n");
+                let last = len - 4;
+                // SAFETY: the probe above is the guard, and every load ends inside `buf`.
+                let vector = unsafe { head_end_avx2(&buf, last) };
+                assert_eq!(vector, head_end_words(&buf, last), "len {len} at {start}");
+                assert_eq!(head_end(&buf), vector, "len {len} at {start}");
+            }
+        }
+    }
+
+    /// The scan, and nothing else: 64 walks of one 87-byte `200` answer, each found offset folded into a running `u32` whose expected value is pinned, the head handed over opaquely so no round can be answered from the literal. The mirror below walks the same head a byte-window at a time under the identical fold, so one ops job reports both frames and only their difference is a claim about the scan.
+    #[test]
+    fn the_head_walk_costs_the_scan_and_nothing_else() {
+        const HEAD: &[u8] = b"HTTP/1.1 200 Connection established\r\nProxy-Agent: ferrox\r\nX-Trace: 0123456789abcdef\r\n\r\n";
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            let end =
+                head_end(std::hint::black_box(HEAD)).expect("the delimiter of a shipped head");
+            fold = fold.wrapping_mul(31).wrapping_add(end as u32 + 1);
+        }
+        assert_eq!(fold, 0x734b_5000, "64 walks of one head, folded after each");
+    }
+
+    /// The walk the scan replaced, kept as this run's other frame: the same 64 walks of the same head through `windows(4).position`, the same pinned fold, so the pair prices the scan without a second CI run being trusted to agree with the first.
+    #[test]
+    fn the_serial_terminator_walk_costs_the_same_answer() {
+        const HEAD: &[u8] = b"HTTP/1.1 200 Connection established\r\nProxy-Agent: ferrox\r\nX-Trace: 0123456789abcdef\r\n\r\n";
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            let end = std::hint::black_box(HEAD)
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("the delimiter of a shipped head");
+            fold = fold.wrapping_mul(31).wrapping_add(end as u32 + 1);
+        }
+        assert_eq!(
+            fold, 0x734b_5000,
+            "the same 64 walks, byte-window at a time"
+        );
+    }
+
+    /// `octet_in` is the tree's one octet scan, and every line, field-name and request-line walk reaches it in place of `iter().position`; this sweep is its oracle. A hit at every offset of every length across four whole blocks, asked from every start past it, is what puts a hit inside the word step's last octet, on its boundary and one octet either side.
+    #[test]
+    fn the_octet_scan_is_the_byte_walk_at_every_start() {
+        let oracle = |bytes: &[u8], from: usize, needle: u8| {
+            bytes
+                .get(from..)
+                .and_then(|tail| tail.iter().position(|byte| *byte == needle))
+                .map(|hit| hit + from)
+        };
+        for needle in [b'\n', b':', b'\r', b' ', 0x00, 0xff] {
+            let other = needle.wrapping_add(1);
+            for len in 0..=32usize {
+                for plant in 0..len {
+                    let body: Vec<u8> = (0..len)
+                        .map(|at| if at == plant { needle } else { other })
+                        .collect();
+                    for from in 0..=len + 1 {
+                        assert_eq!(
+                            octet_in(&body, from, needle),
+                            oracle(&body, from, needle),
+                            "needle {needle} len {len} plant {plant} from {from}"
+                        );
+                    }
+                }
+            }
+            let all = vec![needle; 40];
+            let none = vec![other; 40];
+            for from in 0..=41usize {
+                assert_eq!(octet_in(&all, from, needle), oracle(&all, from, needle));
+                assert_eq!(octet_in(&none, from, needle), oracle(&none, from, needle));
+            }
+        }
+        // The borrows the mask must not report: an octet the subtraction turns into `0xff` right behind a hit, and four hits in one word.
+        for body in [
+            vec![b'\n', 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            vec![1, 1, 1, 1, 1, 1, 1, b'\n', 1, 1],
+            vec![1, b'\n', 1, b'\n', 1, b'\n', 1, b'\n', 1, 1],
+        ] {
+            for from in 0..=body.len() {
+                assert_eq!(
+                    octet_in(&body, from, b'\n'),
+                    oracle(&body, from, b'\n'),
+                    "{body:?} from {from}"
+                );
+            }
+        }
+        // A body dense in every needle, walked from every start.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let body: Vec<u8> = (0..4096)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 56) as u8 % 16
+            })
+            .collect();
+        for from in 0..=body.len() {
+            for needle in [b'\n', b'\r', b':', 0x00] {
+                assert_eq!(
+                    octet_in(&body, from, needle),
+                    oracle(&body, from, needle),
+                    "dense body from {from}"
+                );
+            }
+        }
+    }
+}
