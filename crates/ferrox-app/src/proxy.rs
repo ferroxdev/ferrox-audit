@@ -655,4 +655,109 @@ fn serve_inbounds_counted(
                     }
                     "vmess" => {
                         let users = vmess_users.as_ref().expect("a vmess table");
-                        
+                        if serve_vmess_inbound_users(
+                            address,
+                            inbound,
+                            freedom,
+                            handler_stop.as_ref().map(Arc::clone),
+                            users,
+                        ) {
+                            if let Some(stop) = &handler_stop {
+                                if !matches!(
+                                    inbound_carrier(inbound),
+                                    Carrier::Kcp(_)
+                                        | Carrier::Xdrive { .. }
+                                        | Carrier::Quic
+                                        | Carrier::Hysteria(_)
+                                ) {
+                                    handler_stops.push((Arc::clone(stop), address.clone()));
+                                }
+                            }
+                            inbounds += 1;
+                        }
+                    }
+                    "shadowsocks" => {
+                        if serve_shadowsocks_inbound(
+                            address,
+                            inbound,
+                            freedom,
+                            &configured,
+                            handler_stop.as_ref(),
+                        ) {
+                            if let Some(stop) = h3_stop {
+                                handler_stops.push((Arc::clone(stop), address.clone()));
+                            }
+                            inbounds += 1;
+                        }
+                    }
+                    "hysteria" => {
+                        if serve_hysteria_inbound(address, inbound, freedom, label) {
+                            inbounds += 1;
+                        }
+                    }
+                    "tuic" => {
+                        if crate::tuic::serve_inbound(
+                            address,
+                            inbound,
+                            label,
+                            freedom,
+                            handler_stop.clone(),
+                        ) {
+                            if let Some(stop) = &handler_stop {
+                                handler_stops.push((Arc::clone(stop), address.clone()));
+                            }
+                            inbounds += 1;
+                        }
+                    }
+                    "anytls" => {
+                        if crate::anytls::serve_inbound(
+                            address,
+                            inbound,
+                            label,
+                            freedom,
+                            handler_stop.clone(),
+                        ) {
+                            if let Some(stop) = &handler_stop {
+                                handler_stops.push((Arc::clone(stop), address.clone()));
+                            }
+                            inbounds += 1;
+                        }
+                    }
+                    "socks" | "http" | "mixed" => {
+                        let Some(out) = routed(inbound, true) else {
+                            eprintln!(
+                                "inbound `{protocol}` in {label} names no outbound to carry it"
+                            );
+                            continue;
+                        };
+                        // A front with no tcp carrier has no chain to arm, so the inbound is refused rather than served unmasked.
+                        if crate::config::has_tcp_mask(inbound.get("streamSettings")) {
+                            eprintln!("inbound `{protocol}` in {label} asks for a finalmask tcp chain it cannot arm");
+                            continue;
+                        }
+                        let accounts = Arc::new(if protocol == "http" {
+                            http_accounts(inbound)
+                        } else {
+                            socks_accounts(inbound)
+                        });
+                        let role = match protocol {
+                            "http" => Role::Http { out, accounts },
+                            "socks" => Role::Socks { out, accounts },
+                            _ => Role::Mixed { out, accounts },
+                        };
+                        spawn_role(address, inbound_role(inbound, role), inbound_tag(inbound));
+                        inbounds += 1;
+                    }
+                    "dokodemo-door" => {
+                        if let Some(out) = routed(inbound, true) {
+                            let (armed, tcp) = serve_dokodemo(
+                                address,
+                                inbound,
+                                &out,
+                                label,
+                                handler_stop.as_ref(),
+                                fallible,
+                            );
+                            inbounds += armed;
+                            if tcp && !dokodemo_has(&dokodemo_networks(inbound), "udp") {
+            
