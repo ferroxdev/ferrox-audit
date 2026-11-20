@@ -1,0 +1,2301 @@
+use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
+
+use crate::conn::Connection;
+use crate::proxy::RELAY_SMALL_BUFFER;
+use ferrox_core::tls::RecordAlignment;
+use ferrox_core::vless::VisionCommand;
+use std::io::{Read, Write};
+
+const BUFFER: usize = 2048;
+/// The framed window is one `rustls` record and the relay's own first read: past the switch neither staging buffer is touched again, so neither reaches for a whole relay's worth.
+const WINDOW: usize = RELAY_SMALL_BUFFER;
+const SEED: [u32; 4] = [900, 500, 900, 256];
+const FILTER_PACKETS: i32 = 8;
+const TLS_SERVER_HELLO: [u8; 3] = [0x16, 0x03, 0x03];
+const TLS_HANDSHAKE_START: [u8; 2] = [0x16, 0x03];
+const TLS_APPLICATION_DATA: [u8; 3] = [0x17, 0x03, 0x03];
+const TLS13_VERSIONS: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+/// One per byte: subtracting these borrows through a zero byte, and the high
+/// bits it leaves are the only starts a six-byte compare is worth.
+const BYTE_ONES: u64 = 0x0101_0101_0101_0101;
+const BYTE_HIGHS: u64 = 0x8080_8080_8080_8080;
+/// The needle's second byte, one per byte, for the pair a start must open with.
+const BYTE_2B: u64 = 0x2b2b_2b2b_2b2b_2b2b;
+const TLS_AES_128_CCM_8_SHA256: u16 = 0x1305;
+const SHORTEST_FRAME: usize = 21;
+/// A framed block is one Xray buffer: `buf.Size` (8192) less the uuid and header, which is where the reference reshapes a longer piece and where its reader refuses the frame.
+const MAX_FRAME_CONTENT: usize = 8192 - SHORTEST_FRAME;
+/// Padding never exceeds `BUFFER - SHORTEST_FRAME`, so one static zero run covers every trailer the framer writes.
+const ZERO: [u8; BUFFER] = [0u8; BUFFER];
+
+pub(crate) struct Link<S: Read + Write + RecordAlignment> {
+    session: S,
+    raw: Option<Connection>,
+    direct: Option<fn(&mut S)>,
+    uuid: [u8; 16],
+    /// The framing walks the stream in place: `[..dot)` is delivered and drains away on
+    /// the next read, `[dot..)` is the walk's frontier, and the window is one record
+    /// wide while the framing lives. Nothing stages the content again on the way out.
+    have: Vec<u8>,
+    have_init: usize,
+    dot: usize,
+    walk: Walk,
+    #[cfg(test)]
+    staged: usize,
+    /// The command bytes the reader validated: one per frame, and the count the
+    /// validator's row is read from.
+    #[cfg(test)]
+    validated: usize,
+    /// The feed a read built: a steady read spends no scan, so it must build none.
+    #[cfg(test)]
+    feeds: usize,
+    /// The shared filter state's acquisitions: a framed write takes one, not four.
+    #[cfg(test)]
+    tls_accesses: std::sync::atomic::AtomicUsize,
+    read: Reading,
+    write: Writing,
+    tls: TlsCell,
+}
+
+/// One link owns its filter state; the two halves of a split link share it.
+enum TlsCell {
+    Owned(Tls),
+    Shared(Arc<Mutex<Tls>>),
+}
+
+impl TlsCell {
+    fn snapshot(&self) -> Tls {
+        match self {
+            Self::Owned(tls) => *tls,
+            Self::Shared(tls) => *tls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        }
+    }
+
+    fn update<R>(&mut self, f: impl FnOnce(&mut Tls) -> R) -> R {
+        match self {
+            Self::Owned(tls) => f(tls),
+            Self::Shared(tls) => f(&mut tls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)),
+        }
+    }
+}
+
+/// The filter's feed, one caller buffer deep: the content the walk hands the caller
+/// within one read is the run it watches, exactly what a contiguous buffer reached
+/// `observe` with — the run's head, the scan target and how far it has scanned it,
+/// and the boundary's evidence. One copy per byte, and the walk parses the head once.
+/// How far the run's head shaped: nothing, the client handshake, the server one.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Shaped {
+    Nothing,
+    Client,
+    Server,
+}
+
+struct Feeding {
+    head: [u8; 310],
+    head_len: usize,
+    run: usize,
+    start: usize,
+    left: usize,
+    scanned: usize,
+    /// the shape the run's head resolved to; its arm carries the presence and
+    /// version rows over to the shared state at the unit's end
+    shaped: Shaped,
+    sampled: bool,
+    cipher: u16,
+    found: bool,
+    /// A six-byte pattern can straddle two extents; those ten are the whole
+    /// boundary's evidence, five bytes each side.
+    span: [u8; 10],
+    span_len: usize,
+}
+
+impl Feeding {
+    fn new(tls: &Tls) -> Self {
+        Self {
+            head: [0u8; 310],
+            head_len: 0,
+            run: 0,
+            start: tls.server_hello_left,
+            left: tls.server_hello_left,
+            scanned: 0,
+            shaped: Shaped::Nothing,
+            sampled: false,
+            cipher: 0,
+            found: false,
+            span: [0u8; 10],
+            span_len: 0,
+        }
+    }
+}
+
+/// One extent joins the run: the head accumulates to its 310, the shape and the
+/// cipher read from it once each, and the scan target eats the extent in order.
+fn feed_extent(fresh: &[u8], feed: &mut Feeding) {
+    let want = 310usize.saturating_sub(feed.head_len);
+    if want > 0 {
+        let take_head = fresh.len().min(want);
+        feed.head[feed.head_len..feed.head_len + take_head].copy_from_slice(&fresh[..take_head]);
+        feed.head_len += take_head;
+    }
+    if feed.shaped == Shaped::Nothing && feed.run >= 6 {
+        // the shape fires once a read is long enough to carry it whole
+        let head = &feed.head;
+        if head[..3] == TLS_SERVER_HELLO && head[5] == 0x02 {
+            feed.left = (usize::from(head[3]) << 8 | usize::from(head[4])) + 5;
+            feed.shaped = Shaped::Server;
+        } else if head[..2] == TLS_HANDSHAKE_START && head[5] == 0x01 {
+            feed.shaped = Shaped::Client;
+        }
+    }
+    // the cipher reads only once the read has whole samples in reach
+    if feed.shaped != Shaped::Nothing && !feed.sampled && feed.run >= 79 && feed.left >= 79 {
+        feed.sampled = true;
+        let at = 44 + usize::from(feed.head[43]);
+        feed.cipher = u16::from_be_bytes([feed.head[at], feed.head[at + 1]]);
+    }
+    scan_extent(fresh, feed);
+}
+
+/// The one pattern the scan hunts, over eight bytes a turn: it opens `00 2b`, so a
+/// word's zero bytes and its `2b` bytes, one turn carried onto the other, leave a
+/// six-byte compare at the handful of starts that could still be the extension
+/// instead of at every one. A turn covers seven starts, the eighth being the next
+/// turn's first, so every offset the window form tested is still tested and none
+/// twice — and the last five bytes of the extent fall to the scalar tail.
+fn supports_tls13(bytes: &[u8]) -> bool {
+    let mut at = 0;
+    while at + 13 <= bytes.len() {
+        let word = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or_default());
+        // a byte behind a zero borrows and a byte behind 2b draws one: a mark is a candidate
+        let zero = word.wrapping_sub(BYTE_ONES) & !word & BYTE_HIGHS;
+        let flip = word ^ BYTE_2B;
+        let plus = flip.wrapping_sub(BYTE_ONES) & !flip & BYTE_HIGHS;
+        // byte 8's mark has nowhere to land, so the last start is the next turn's first
+        let mut marks = zero & (plus >> 8);
+        while marks != 0 {
+            let skip = (marks.trailing_zeros() >> 3) as usize;
+            marks &= marks - 1;
+            if bytes[at + skip..at + skip + 6] == TLS13_VERSIONS {
+                return true;
+            }
+        }
+        at += 7;
+    }
+    while at + 6 <= bytes.len() {
+        if bytes[at..at + 6] == TLS13_VERSIONS {
+            return true;
+        }
+        at += 1;
+    }
+    false
+}
+
+/// The scan target eats the extent in order; the pattern it hunts can straddle a
+/// boundary, and the span carries the evidence either way.
+fn scan_extent(fresh: &[u8], feed: &mut Feeding) {
+    if feed.found || feed.scanned >= feed.left {
+        return;
+    }
+    let share = fresh.len().min(feed.left - feed.scanned);
+    let open = share.min(5);
+    // the bridge is the span's last five bytes against the opening five
+    let held = feed.span_len.saturating_sub(5);
+    let tell = feed.span_len - held;
+    if tell > 0 && open > 0 {
+        let mut cross = [0u8; 10];
+        cross[..tell].copy_from_slice(&feed.span[held..feed.span_len]);
+        cross[tell..tell + open].copy_from_slice(&fresh[..open]);
+        if supports_tls13(&cross[..tell + open]) {
+            feed.found = true;
+        }
+    }
+    if share >= 6 && supports_tls13(&fresh[..share]) {
+        feed.found = true;
+    }
+    // the next boundary's evidence: the newest scanned bytes stay behind
+    if share >= 10 {
+        feed.span[..].copy_from_slice(&fresh[share - 10..share]);
+        feed.span_len = 10;
+    } else if feed.span_len + share <= 10 {
+        feed.span[feed.span_len..feed.span_len + share].copy_from_slice(&fresh[..share]);
+        feed.span_len += share;
+    } else {
+        // slide so the newest share, and only it, meets the window's back edge
+        let drop = feed.span_len + share - 10;
+        feed.span.copy_within(drop..feed.span_len, 0);
+        feed.span_len -= drop;
+        feed.span[feed.span_len..feed.span_len + share].copy_from_slice(&fresh[..share]);
+        feed.span_len += share;
+    }
+    feed.scanned += share;
+}
+
+/// straight into the caller's buffer, with no staging buffer on the way out.
+#[derive(Clone, Copy)]
+struct Walk {
+    /// the uuid window is resolved and the frames are running
+    framed: bool,
+    want_header: i32,
+    want_content: usize,
+    want_padding: usize,
+    command: u8,
+}
+
+struct Reading {
+    padding: bool,
+    raw: bool,
+    /// The budget only falls, so once it reaches zero no later read asks the cell again.
+    spent: bool,
+    /// The client strips the VLESS answer before the first frame, on the read that
+    /// first sees it: a server may withhold `[0, 0]` until it has downstream bytes,
+    /// and the relay's upload must not wait for the download to find it.
+    answer: Answer,
+    /// Reports a refused or truncated answer once, so the dial keeps the accounting the
+    /// eager read used to.
+    refused: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Answer {
+    None,
+    Pending {
+        head: [u8; 2],
+        filled: usize,
+        addons: usize,
+        sized: bool,
+    },
+}
+
+impl Answer {
+    pub(crate) fn pending() -> Self {
+        Self::Pending {
+            head: [0; 2],
+            filled: 0,
+            addons: 0,
+            sized: false,
+        }
+    }
+
+    pub(crate) fn is_pending(self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
+
+    /// Reads the pending answer through `read`, keeping the bytes it has if that read fails.
+    pub(crate) fn strip(
+        &mut self,
+        mut read: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+    ) -> std::io::Result<()> {
+        let Self::Pending {
+            mut head,
+            mut filled,
+            mut addons,
+            mut sized,
+        } = *self
+        else {
+            return Ok(());
+        };
+        loop {
+            if filled < 2 {
+                match read(&mut head[filled..]) {
+                    Ok(0) => {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                    }
+                    Ok(n) => filled += n,
+                    Err(error) => {
+                        *self = Self::Pending {
+                            head,
+                            filled,
+                            addons,
+                            sized,
+                        };
+                        return Err(error);
+                    }
+                }
+                continue;
+            }
+            if !sized {
+                addons = usize::from(head[1]);
+                sized = true;
+            }
+            if addons == 0 {
+                break;
+            }
+            let mut scratch = [0u8; u8::MAX as usize];
+            match read(&mut scratch[..addons]) {
+                Ok(0) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+                Ok(n) => addons -= n,
+                Err(error) => {
+                    *self = Self::Pending {
+                        head,
+                        filled,
+                        addons,
+                        sized,
+                    };
+                    return Err(error);
+                }
+            }
+        }
+        if head[0] != 0 {
+            return Err(std::io::Error::other("vless answer refused"));
+        }
+        *self = Self::None;
+        Ok(())
+    }
+}
+
+struct Writing {
+    padding: bool,
+    sent_uuid: bool,
+    raw: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Tls {
+    present: bool,
+    twelve_or_above: bool,
+    enable_xtls: bool,
+    budget: i32,
+    server_hello_left: usize,
+    cipher: u16,
+}
+
+impl<S: Read + Write + RecordAlignment> Link<S> {
+    fn filter(&self) -> Tls {
+        #[cfg(test)]
+        self.tls_accesses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.tls.snapshot()
+    }
+
+    fn filter_update<R>(&mut self, f: impl FnOnce(&mut Tls) -> R) -> R {
+        #[cfg(test)]
+        self.tls_accesses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.tls.update(f)
+    }
+
+    pub(crate) fn new(session: S, raw: Option<Connection>, uuid: &[u8; 16]) -> Self {
+        Self {
+            session,
+            raw,
+            direct: None,
+            uuid: *uuid,
+            have: Vec::new(),
+            have_init: 0,
+            dot: 0,
+            walk: Walk {
+                framed: false,
+                want_header: 0,
+                want_content: 0,
+                want_padding: 0,
+                command: 0,
+            },
+            #[cfg(test)]
+            staged: 0,
+            #[cfg(test)]
+            validated: 0,
+            #[cfg(test)]
+            feeds: 0,
+            #[cfg(test)]
+            tls_accesses: std::sync::atomic::AtomicUsize::new(0),
+            read: Reading {
+                padding: true,
+                raw: false,
+                spent: false,
+                answer: Answer::None,
+                refused: None,
+            },
+            write: Writing {
+                padding: true,
+                sent_uuid: false,
+                raw: false,
+            },
+            tls: TlsCell::Owned(Tls::new()),
+        }
+    }
+
+    /// A session whose direct switch lives on the session itself, so a split carrier peels its record layer the way the sealed raw path does.
+    pub(crate) fn switchable(session: S, uuid: &[u8; 16], direct: fn(&mut S)) -> Self {
+        let mut link = Self::new(session, None, uuid);
+        link.direct = Some(direct);
+        link
+    }
+
+    /// Hands the link a parked read's framed prefix as the walk's window, before the session.
+    pub(crate) fn preload(&mut self, prefix: Vec<u8>) {
+        debug_assert!(self.have.is_empty() && self.dot == 0);
+        self.have_init = prefix.len();
+        self.have = prefix;
+    }
+
+    /// The reader strips the VLESS answer before its first frame, on the read that first
+    /// sees it; the server's half never carries one.
+    pub(crate) fn expecting_answer(&mut self, refused: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.read.answer = Answer::pending();
+        self.read.refused = refused;
+    }
+
+    /// Reports a terminal answer failure at most once, and never after the answer validated.
+    fn refuse(&mut self) {
+        if let Some(refused) = self.read.refused.take() {
+            refused();
+        }
+    }
+
+    /// Two halves of one link: the reader frames the plaintext a driven session hands it, the
+    /// writer seals frames through the same session, and only the filter state is shared.
+    pub(crate) fn split(
+        read: S,
+        write: S,
+        raw_read: Option<Connection>,
+        raw_write: Option<Connection>,
+        uuid: &[u8; 16],
+    ) -> (Self, Self) {
+        let tls = Arc::new(Mutex::new(Tls::new()));
+        let reader = Self::with_tls(read, raw_read, uuid, TlsCell::Shared(Arc::clone(&tls)));
+        let writer = Self::with_tls(write, raw_write, uuid, TlsCell::Shared(tls));
+        (reader, writer)
+    }
+
+    fn with_tls(session: S, raw: Option<Connection>, uuid: &[u8; 16], tls: TlsCell) -> Self {
+        Self {
+            session,
+            raw,
+            direct: None,
+            uuid: *uuid,
+            have: Vec::new(),
+            have_init: 0,
+            dot: 0,
+            walk: Walk {
+                framed: false,
+                want_header: 0,
+                want_content: 0,
+                want_padding: 0,
+                command: 0,
+            },
+            #[cfg(test)]
+            staged: 0,
+            #[cfg(test)]
+            validated: 0,
+            #[cfg(test)]
+            feeds: 0,
+            #[cfg(test)]
+            tls_accesses: std::sync::atomic::AtomicUsize::new(0),
+            read: Reading {
+                padding: true,
+                raw: false,
+                spent: false,
+                answer: Answer::None,
+                refused: None,
+            },
+            write: Writing {
+                padding: true,
+                sent_uuid: false,
+                raw: false,
+            },
+            tls,
+        }
+    }
+}
+
+impl Tls {
+    fn new() -> Self {
+        Self {
+            present: false,
+            twelve_or_above: false,
+            enable_xtls: false,
+            budget: FILTER_PACKETS,
+            server_hello_left: 0,
+            cipher: 0,
+        }
+    }
+}
+
+/// A sealed session as the framer sees it: one frame is one sealed record, and the parts the
+/// walk hands over are sealed where they land.
+pub(crate) struct Sealed<S>(ferrox_core::vless_encryption::EncryptedStream<S>);
+
+impl<S: Read + Write + RecordAlignment> Sealed<S> {
+    fn enter_direct_mode(&mut self) {
+        self.0.enter_direct_mode();
+    }
+}
+
+impl<S: Read + Write> Read for Sealed<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl<S: Read + Write> Write for Sealed<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl<S: Read + Write + RecordAlignment> RecordAlignment for Sealed<S> {
+    fn engage_record_alignment(&mut self) {
+        self.0.get_mut().engage_record_alignment();
+    }
+
+    fn disarm_record_alignment(&mut self) {
+        self.0.get_mut().disarm_record_alignment();
+    }
+
+    fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        self.0.write_all_slices(parts)
+    }
+}
+
+impl<S: Read + Write + RecordAlignment> Link<Sealed<S>> {
+    /// The direct command peels the record layer, not the transport: the sealed stream keeps the
+    /// XOR header mask the reference's `XorConn` carries across the switch.
+    pub(crate) fn sealed(
+        session: ferrox_core::vless_encryption::EncryptedStream<S>,
+        uuid: &[u8; 16],
+    ) -> Self {
+        let mut link = Self::new(Sealed(session), None, uuid);
+        link.direct = Some(Sealed::<S>::enter_direct_mode);
+        link
+    }
+}
+
+impl<S: Read + Write + RecordAlignment> RecordAlignment for Link<S> {
+    fn engage_record_alignment(&mut self) {
+        self.session.engage_record_alignment();
+    }
+}
+
+impl<S: Read + Write + RecordAlignment> Link<S> {
+    /// The direct switch reads the raw clone, so the grain a shared read needs is armed on the handle it reads.
+    pub(crate) fn arm_read_timeout(&self, grain: std::time::Duration) -> std::io::Result<()> {
+        match &self.raw {
+            Some(raw) => raw.set_read_timeout(Some(grain)),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<S: Read + Write + RecordAlignment> Read for Link<S> {
+    /// The content the walk hands this caller buffer is one filter unit: it joins the
+    /// feeding spread through the run, and the machine spends at the unit's end.
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let session = &mut self.session;
+        match self.read.answer.strip(|buf| session.read(buf)) {
+            Ok(()) => self.read.refused = None,
+            Err(error) => {
+                if !crate::proxy::is_timeout(&error) {
+                    self.refuse();
+                }
+                return Err(error);
+            }
+        }
+        let tls = if self.read.spent {
+            None
+        } else {
+            let tls = self.filter();
+            self.read.spent = tls.budget == 0;
+            Some(tls)
+        };
+        let mut feed = tls
+            .filter(|tls| tls.budget > 0)
+            .map(|tls| Feeding::new(&tls));
+        let active = feed.is_some();
+        #[cfg(test)]
+        if feed.is_some() {
+            self.feeds += 1;
+        }
+        let n = self.drive_read(buf, feed.as_mut(), active)?;
+        if let Some(feed) = feed {
+            if feed.run > 0 {
+                self.spend(&feed);
+            }
+        }
+        Ok(n)
+    }
+}
+
+impl<S: Read + Write + RecordAlignment> Link<S> {
+    /// What the framing left in the window goes through as it stands, and the window
+    /// is handed back once drained.
+    /// The one caller buffer's walk: framed bytes pump in run order, the framing's
+    /// leftover delivers, and every extent that lands in the caller's buffer joins
+    /// the feeding. EOF mid-frame drops the frame; what the walk's switch left
+    /// unparsed is content the caller has not seen.
+    fn drive_read(
+        &mut self,
+        buf: &mut [u8],
+        mut feed: Option<&mut Feeding>,
+        active: bool,
+    ) -> std::io::Result<usize> {
+        loop {
+            if self.read.padding {
+                if self.dot < self.have.len() {
+                    let was = self.dot;
+                    match self.pump(Some(buf), feed.as_deref_mut(), active) {
+                        0 => {}
+                        n => return Ok(n),
+                    }
+                    if !self.read.padding {
+                        // the walk ended the framing; its tail delivers as content
+                        continue;
+                    }
+                    if self.dot > was {
+                        // A pass that moves without content yields the session lock to the writer.
+                        return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                    }
+                }
+                if !self.fill()? {
+                    if self.walk.framed && self.read.padding {
+                        return Ok(0);
+                    }
+                    return Ok(self.drain_tail(buf, feed.as_deref_mut(), active));
+                }
+            } else {
+                // the framing is over: what it left in the window is content, then raw
+                if self.dot < self.have.len() && !buf.is_empty() {
+                    return Ok(self.drain_tail(buf, feed.as_deref_mut(), active));
+                }
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                return self.read_direct(buf, active);
+            }
+        }
+    }
+
+    /// One spent unit: budget once, the scan target's rest rides through, the verdict
+    /// hands its confirmed switch or its exhausted window over, and the idle switch
+    /// arms the alignment only when its verdict earned it.
+    fn spend(&mut self, feed: &Feeding) {
+        let tls = self.filter_update(|tls| {
+            if tls.budget == 0 {
+                return None;
+            }
+            tls.budget -= 1;
+            // A split writer can observe a hello after this snapshot; its progress outranks ours.
+            if tls.server_hello_left == feed.start {
+                tls.server_hello_left = feed.left.saturating_sub(feed.scanned);
+            }
+            if feed.shaped != Shaped::Nothing {
+                tls.present = true;
+            }
+            if feed.shaped == Shaped::Server {
+                tls.twelve_or_above = true;
+            }
+            if feed.sampled {
+                tls.cipher = feed.cipher;
+            }
+            if feed.found {
+                tls.enable_xtls = tls.cipher != TLS_AES_128_CCM_8_SHA256;
+                tls.budget = 0;
+            } else if feed.left > 0 && feed.scanned >= feed.left {
+                tls.budget = 0;
+            }
+            Some(*tls)
+        });
+        if let Some(tls) = tls {
+            self.read.spent = tls.budget == 0;
+            self.engage(&tls);
+        } else {
+            self.read.spent = true;
+        }
+    }
+
+    fn drain_tail(&mut self, buf: &mut [u8], feed: Option<&mut Feeding>, active: bool) -> usize {
+        let n = (self.have.len() - self.dot).min(buf.len());
+        if n > 0 && active {
+            if let Some(feed) = feed {
+                feed_extent(&self.have[self.dot..self.dot + n], feed);
+            }
+        }
+        buf[..n].copy_from_slice(&self.have[self.dot..self.dot + n]);
+        self.dot += n;
+        if self.dot == self.have.len() {
+            self.have = Vec::new();
+            self.have_init = 0;
+            self.dot = 0;
+        }
+        n
+    }
+
+    /// Past the framing the payload lands in the caller's buffer: no copy, where the staged path needed two.
+    fn read_direct(&mut self, buf: &mut [u8], active: bool) -> std::io::Result<usize> {
+        let raw = self.read.raw;
+        let n = match self.raw.as_mut() {
+            Some(handle) if raw => handle.read(buf)?,
+            _ => self.session.read(buf)?,
+        };
+        if n > 0 && !raw && active {
+            let (tls, observed) = self.filter_update(|tls| {
+                let observed = tls.budget > 0;
+                if observed {
+                    tls.observe(&buf[..n]);
+                }
+                (*tls, observed)
+            });
+            self.read.spent = tls.budget == 0;
+            if observed {
+                self.engage(&tls);
+            }
+        }
+        Ok(n)
+    }
+
+    fn engage(&mut self, tls: &Tls) {
+        if self.read.padding && tls.enable_xtls {
+            self.session.engage_record_alignment();
+        }
+    }
+
+    #[cfg(test)]
+    fn stage(&mut self, n: usize) {
+        self.staged += n;
+    }
+
+    /// One command byte validated. The count is the validator's row, and the production
+    /// arm folds away: the validator's own cost is in the match it makes.
+    #[cfg(test)]
+    fn validate(&mut self) {
+        self.validated += 1;
+    }
+
+    #[cfg(not(test))]
+    #[allow(clippy::unused_self)]
+    fn validate(&mut self) {}
+
+    #[cfg(not(test))]
+    #[allow(clippy::unused_self)]
+    fn stage(&mut self, _n: usize) {}
+
+    fn compact(&mut self) {
+        if self.dot > 0 {
+            self.have.drain(..self.dot);
+            self.dot = 0;
+        }
+    }
+
+    /// Walks the frame the cursor is parked in as far as the window and the caller's
+    /// buffer allow. Content lands straight in the caller's buffer — the second copy
+    /// the staging buffer used to pay for — padding is skipped in place, and the uuid
+    /// window resolves only with a full uuid and either a mismatch (everything passes)
+    /// or the framing's first frame header. A walk that blocks mid-frame parks there
+    /// and reports what it handed out.
+    #[allow(clippy::too_many_lines)]
+    fn pump(
+        &mut self,
+        mut buf: Option<&mut [u8]>,
+        mut feed: Option<&mut Feeding>,
+        active: bool,
+    ) -> usize {
+        let end = self.have.len();
+        let mut dot = self.dot;
+        let mut walk = self.walk;
+        if !walk.framed {
+            if end - dot < 16 {
+                return 0;
+            }
+            if self.have[dot..dot + 16] != self.uuid {
+                // the uuid is a window, not a gate: an unframed peer stays on the session, never the raw clone a direct command would peel
+                self.session.disarm_record_alignment();
+                self.read.padding = false;
+                return 0;
+            }
+            if end - dot < SHORTEST_FRAME {
+                return 0;
+            }
+            walk = Walk {
+                framed: true,
+                want_header: 5,
+                want_content: 0,
+                want_padding: 0,
+                command: 0,
+            };
+            dot += 16;
+        }
+        let cap = buf.as_deref().map_or(usize::MAX, <[u8]>::len);
+        let mut held = 0;
+        let result = 'frames: loop {
+            // the header is read whole when the window offers five bytes; the tail is byte-by-byte
+            if walk.want_header == 5 && end - dot >= 5 {
+                let frame = &self.have[dot..dot + 5];
+                let body = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
+                let command = frame[0];
+                let content = (body >> 16) as usize;
+                let padding = (body & 0xffff) as usize;
+                self.validate();
+                let at = dot + 5;
+                let next = at + content + padding;
+                if next <= end && cap - held >= content {
+                    if content > 0 {
+                        let fresh = &self.have[at..at + content];
+                        if active {
+                            if let Some(feed) = feed.as_deref_mut() {
+                                feed.run += content;
+                                feed_extent(fresh, feed);
+                            }
+                        }
+                        if let Some(slot) = buf.as_deref_mut() {
+                            slot[held..held + content].copy_from_slice(fresh);
+                        }
+                        held += content;
+                    }
+                    dot = next;
+                    if command == VisionCommand::Continue.byte() {
+                        if held == 0 {
+                            break 'frames held;
+                        }
+                        continue 'frames;
+                    }
+                    self.session.disarm_record_alignment();
+                    self.read.padding = false;
+                    if command == VisionCommand::Direct.byte() {
+                        if let Some(direct) = self.direct {
+                            direct(&mut self.session);
+                        }
+                    }
+                    self.read.raw = command == VisionCommand::Direct.byte() && self.raw.is_some();
+                    break 'frames held;
+                }
+                walk.command = command;
+                walk.want_content = content;
+                walk.want_padding = padding;
+                walk.want_header = 0;
+                dot = at;
+            } else if walk.want_header > 0 {
+                if dot == end {
+                    // parked inside an incomplete header: nothing moves without bytes
+                    break 'frames held;
+                }
+                let byte = self.have[dot];
+                match walk.want_header {
+                    5 => {
+                        walk.command = byte;
+                        self.validate();
+                    }
+                    4 => walk.want_content = usize::from(byte) << 8,
+                    3 => walk.want_content |= usize::from(byte),
+                    2 => walk.want_padding = usize::from(byte) << 8,
+                    _ => walk.want_padding |= usize::from(byte),
+                }
+                dot += 1;
+                walk.want_header -= 1;
+                continue 'frames;
+            }
+            if walk.want_content > 0 {
+                let room = cap - held;
+                let take = walk.want_content.min(end - dot).min(room);
+                let fresh = &self.have[dot..dot + take];
+                if active {
+                    if let Some(feed) = feed.as_deref_mut() {
+                        feed.run += take;
+                        feed_extent(fresh, feed);
+                    }
+                }
+                if let Some(slot) = buf.as_deref_mut() {
+                    slot[held..held + take].copy_from_slice(fresh);
+                }
+                dot += take;
+                walk.want_content -= take;
+                held += take;
+                if walk.want_content > 0 {
+                    break 'frames held;
+                }
+            }
+            if walk.want_padding > 0 {
+                let take = walk.want_padding.min(end - dot);
+                dot += take;
+                walk.want_padding -= take;
+                if walk.want_padding > 0 {
+                    break 'frames held;
+                }
+            }
+            if walk.command == VisionCommand::Continue.byte() {
+                walk.want_header = 5;
+                if held == 0 {
+                    break 'frames held;
+                }
+                continue 'frames;
+            }
+            // a command that is not a continue ends the framing; its tail is content
+            self.session.disarm_record_alignment();
+            self.read.padding = false;
+            if walk.command == VisionCommand::Direct.byte() {
+                if let Some(direct) = self.direct {
+                    direct(&mut self.session);
+                }
+            }
+            self.read.raw = walk.command == VisionCommand::Direct.byte() && self.raw.is_some();
+            break 'frames held;
+        };
+        self.dot = dot;
+        self.walk = walk;
+        result
+    }
+
+    /// Reached only while the framing is live: the read lands in room held
+    /// steady at the window, and the cursor is parked where the walk stands — no
+    /// staging buffer, no second pass over the frames on the read path.
+    fn fill(&mut self) -> std::io::Result<bool> {
+        loop {
+            self.compact();
+            let base = self.have.len();
+            // SAFETY: `have_init` describes `have`; the read lands in room held steady at the window, with no staging copy.
+            unsafe { ferrox_core::read::init_room(&mut self.have, &mut self.have_init, WINDOW) };
+            let read = self.session.read(&mut self.have[base..]);
+            let n = match read {
+                Ok(n) => {
+                    self.have.truncate(base + n);
+                    n
+                }
+                Err(error) => {
+                    self.have.truncate(base);
+                    return Err(error);
+                }
+            };
+            if n == 0 {
+                return Ok(false);
+            }
+            self.stage(n);
+            if !self.read.padding || self.dot < self.have.len() {
+                // the framing switched over, or the parked walk has bytes for the next pump
+                return Ok(true);
+            }
+            // the window is through and the framing runs on: another read
+        }
+    }
+
+    fn frame_head(command: u8, content: usize, padding: usize) -> [u8; 5] {
+        let clen = (content as u16).to_be_bytes();
+        let plen = (padding as u16).to_be_bytes();
+        [command, clen[0], clen[1], plen[0], plen[1]]
+    }
+}
+
+impl Tls {
+    fn observe(&mut self, bytes: &[u8]) {
+        self.budget -= 1;
+        if bytes.len() >= 6 {
+            let head = &bytes[..6];
+            if head[..3] == TLS_SERVER_HELLO && head[5] == 0x02 {
+                self.server_hello_left = (usize::from(head[3]) << 8 | usize::from(head[4])) + 5;
+                self.present = true;
+                self.twelve_or_above = true;
+                if bytes.len() >= 79 && self.server_hello_left >= 79 {
+                    let at = 44 + usize::from(bytes[43]);
+                    if let Some(pair) = bytes.get(at..at.saturating_add(2)) {
+                        self.cipher = u16::from_be_bytes([pair[0], pair[1]]);
+                    }
+                }
+            } else if head[..2] == TLS_HANDSHAKE_START && head[5] == 0x01 {
+                self.present = true;
+            }
+        }
+        if self.server_hello_left == 0 {
+            return;
+        }
+        let scan = self.server_hello_left.min(bytes.len());
+        self.server_hello_left = self.server_hello_left.saturating_sub(bytes.len());
+        if supports_tls13(&bytes[..scan]) {
+            self.enable_xtls = self.cipher != TLS_AES_128_CCM_8_SHA256;
+            self.budget = 0;
+        } else if self.server_hello_left == 0 {
+            self.budget = 0;
+        }
+    }
+}
+
+impl<S: Read + Write + RecordAlignment> Write for Link<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !self.write.padding {
+            self.write_out(buf)?;
+            return Ok(buf.len());
+        }
+        let (tls, observed) = self.filter_update(|tls| {
+            let observed = tls.budget > 0;
+            if observed {
+                tls.observe(buf);
+            }
+            (*tls, observed)
+        });
+        let tls = if observed {
+            let tls = self.filter();
+            self.engage(&tls);
+            tls
+        } else {
+            tls
+        };
+        // The relay hands one buffer of up to 256 KiB: it frames as blocks of one Xray buffer, and the filter budget and the switch are counted per caller buffer as the reference counts them per `MultiBuffer`.
+        let complete =
+            tls.present && buf.len() >= 6 && buf[..3] == TLS_APPLICATION_DATA && is_record_run(buf);
+        let ends_early = !tls.twelve_or_above && tls.budget <= 1;
+        let mut at = 0;
+        while at < buf.len() {
+            let content = (buf.len() - at).min(MAX_FRAME_CONTENT);
+            let last = at + content == buf.len();
+            let padding = padding_len(content, tls.present);
+            let switches = last && complete;
+            let command = match (switches && tls.enable_xtls, ends_early || switches) {
+                (true, _) => VisionCommand::Direct.byte(),
+                (_, true) => 1,
+                _ => 0,
+            };
+            let head = Self::frame_head(command, content, padding);
+            let payload = &buf[at..at + content];
+            // Uuid on the first frame, then head, caller's buffer, zero trailer: one `write_all_slices`, one record, no copies.
+            let first = !self.write.sent_uuid;
+            self.write.sent_uuid = true;
+            let parts: &[&[u8]] = if first {
+                &[&self.uuid[..], &head, payload, &ZERO[..padding]]
+            } else {
+                &[&head, payload, &ZERO[..padding]]
+            };
+            self.session.write_all_slices(parts)?;
+            at += content;
+            if command != 0 {
+                self.write.padding = false;
+                if command == VisionCommand::Direct.byte() {
+                    if let Some(direct) = self.direct {
+                        direct(&mut self.session);
+                    }
+                }
+                self.write.raw = self.raw.is_some()
+                    && tls.enable_xtls
+                    && command == VisionCommand::Direct.byte();
+                self.write_out(&buf[at..])?;
+                return Ok(buf.len());
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.raw.as_mut() {
+            Some(raw) if self.write.raw => raw.flush(),
+            _ => self.session.flush(),
+        }
+    }
+}
+
+impl<S: Read + Write + RecordAlignment> Link<S> {
+    fn write_out(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self.raw.as_mut() {
+            Some(raw) if self.write.raw => raw.write_all(buf),
+            _ => self.session.write_all(buf),
+        }
+    }
+}
+
+fn padding_len(content: usize, long: bool) -> usize {
+    let drawn = if long && content < SEED[0] as usize {
+        random_below(SEED[1]) + SEED[2] as usize - content
+    } else {
+        random_below(SEED[3])
+    };
+    drawn.min(BUFFER.saturating_sub(SHORTEST_FRAME + content))
+}
+
+fn random_below(bound: u32) -> usize {
+    if bound == 0 {
+        return 0;
+    }
+    thread_local! {
+        static BATCH: RefCell<([u8; 2048], usize)> = const { RefCell::new(([0u8; 2048], 2048)) };
+    }
+    let Some(word) = BATCH
+        .try_with(|cell| {
+            let (buf, at) = &mut *cell.borrow_mut();
+            if *at + 4 > buf.len() {
+                getrandom::fill(&mut buf[..]).ok()?;
+                *at = 0;
+            }
+            let word = u32::from_be_bytes(buf[*at..*at + 4].try_into().ok()?);
+            *at += 4;
+            Some(word)
+        })
+        .ok()
+        .flatten()
+    else {
+        return 0;
+    };
+    usize::try_from(word % bound).unwrap_or(0)
+}
+
+/// A run of whole application-data records: one header compare and one length
+/// load per record, its body stepped over, and a zero-length record refused
+/// because a record with no body leaves the run nowhere to go.
+fn is_record_run(buf: &[u8]) -> bool {
+    let mut at = 0;
+    while at < buf.len() {
+        let Some(head) = buf.get(at..at + 5) else {
+            return false;
+        };
+        if head[..3] != TLS_APPLICATION_DATA {
+            return false;
+        }
+        let left = usize::from(head[3]) << 8 | usize::from(head[4]);
+        at += 5;
+        if left == 0 || buf.len() - at < left {
+            return false;
+        }
+        at += left;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    struct Fake {
+        read: Cursor<Vec<u8>>,
+        written: Vec<u8>,
+        disarmed: usize,
+        engaged: usize,
+    }
+
+    impl Fake {
+        fn new(input: &[u8]) -> Self {
+            Self {
+                read: Cursor::new(input.to_vec()),
+                written: Vec::new(),
+                disarmed: 0,
+                engaged: 0,
+            }
+        }
+    }
+
+    impl Read for Fake {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.read.read(buf)
+        }
+    }
+
+    impl Write for Fake {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl RecordAlignment for Fake {
+        fn engage_record_alignment(&mut self) {
+            self.engaged += 1;
+        }
+
+        fn disarm_record_alignment(&mut self) {
+            self.disarmed += 1;
+        }
+    }
+
+    const UUID: [u8; 16] = [0x11; 16];
+
+    fn link(input: &[u8]) -> Link<Fake> {
+        Link::new(Fake::new(input), None, &UUID)
+    }
+
+    fn frame(first: bool, command: u8, content: &[u8], padding: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        if first {
+            out.extend_from_slice(&UUID);
+        }
+        out.push(command);
+        out.extend_from_slice(&(content.len() as u16).to_be_bytes());
+        out.extend_from_slice(&(padding as u16).to_be_bytes());
+        out.extend_from_slice(content);
+        out.resize(out.len() + padding, 0);
+        out
+    }
+
+    #[test]
+    fn a_client_link_reads_the_addons_before_the_first_frame() {
+        let mut input = vec![0u8, 2, 0xaa, 0xbb];
+        input.extend(frame(true, 0, b"hello", 40));
+        let mut link = Link::new(Fake::new(&input), None, &UUID);
+        link.expecting_answer(None);
+        let mut out = Vec::new();
+        link.read_to_end(&mut out).expect("reads");
+        assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn a_client_link_refuses_a_truncated_addon() {
+        let mut link = Link::new(Fake::new(&[0u8, 2, 0xaa]), None, &UUID);
+        link.expecting_answer(None);
+        let mut out = [0u8; 8];
+        assert!(link.read(&mut out).is_err());
+    }
+
+    #[test]
+    fn a_client_link_strips_the_answer_before_the_first_frame() {
+        let mut input = vec![0u8, 0u8];
+        input.extend(frame(true, 0, b"hello", 40));
+        let mut link = Link::new(Fake::new(&input), None, &UUID);
+        link.expecting_answer(None);
+        let mut out = Vec::new();
+        link.read_to_end(&mut out).expect("reads");
+        assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn a_client_link_reports_a_refused_answer_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let refusals = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&refusals);
+        let mut link = Link::new(Fake::new(b"ab"), None, &UUID);
+        link.expecting_answer(Some(Arc::new(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+        })));
+        let mut out = [0u8; 8];
+        assert!(link.read(&mut out).is_err());
+        assert!(link.read(&mut out).is_err());
+        assert_eq!(refusals.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_continue_then_end_sequence_reads_back_as_content() {
+        let mut input = frame(true, 0, b"first", 40);
+        input.extend(frame(false, 0, b"second", 10));
+        input.extend(frame(false, 1, b"third", 0));
+        input.extend_from_slice(b"raw tail");
+        let mut link = link(&input);
+        let mut out = Vec::new();
+        link.read_to_end(&mut out).expect("reads");
+        assert_eq!(out, b"firstsecondthirdraw tail");
+        assert_eq!(
+            link.session.disarmed, 1,
+            "the end of the framing stops the limiter"
+        );
+    }
+
+    /// The end of the framing disarms the limiter; a later spend must not arm it again.
+    #[test]
+    fn a_spend_after_framing_ends_does_not_rearm_the_limiter() {
+        let mut input = frame(true, VisionCommand::Direct.byte(), b"tail", 0);
+        input.extend_from_slice(b"raw");
+        let mut link = link(&input);
+        link.tls.update(|tls| {
+            tls.enable_xtls = true;
+            tls.budget = 1;
+        });
+        let mut out = [0u8; 4];
+        assert_eq!(link.read(&mut out).expect("reads the framed content"), 4);
+        assert_eq!(&out, b"tail");
+        assert_eq!(link.session.engaged, 0, "the framing end stays disarmed");
+    }
+
+    #[test]
+    fn a_content_free_frame_hands_the_session_lock_back() {
+        let mut input = frame(true, 0, b"", 0);
+        input.extend(frame(false, 1, b"tail", 0));
+        let mut link = link(&input);
+        let mut out = [0u8; 8];
+        let error = link.read(&mut out).expect_err("a frame boundary yields");
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        let n = link.read(&mut out).expect("reads");
+        assert_eq!(&out[..n], b"tail");
+    }
+
+    #[test]
+    fn a_frame_split_across_reads_is_reassembled() {
+        let mut input = frame(true, 0, b"split", 30);
+        input.extend(frame(false, 1, b"tail", 4));
+        let mut link = link(&input);
+        let mut out = Vec::new();
+        link.read_to_end(&mut out).expect("reads");
+        assert_eq!(out, b"splittail");
+    }
+
+    /// A header split after its first two bytes must stay header: the bytes the window
+    /// still holds are the rest of the lengths, not content the caller may see.
+    #[test]
+    fn a_split_header_is_not_read_as_content() {
+        struct Chunked<'a> {
+            left: &'a [u8],
+            step: usize,
+        }
+        impl Read for Chunked<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.left.len().min(buf.len()).min(self.step);
+                buf[..n].copy_from_slice(&self.left[..n]);
+                self.left = &self.left[n..];
+                Ok(n)
+            }
+        }
+        impl Write for Chunked<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl RecordAlignment for Chunked<'_> {}
+
+        let mut input = frame(true, 0, b"a", 0);
+        // The first read ends three bytes into the next frame's five-byte header.
+        input.extend(frame(false, 0, b"bc", 0));
+        input.extend(frame(false, 1, b"", 0));
+        let split = 16 + 5 + 1 + 3;
+        let mut link = Link::new(
+            Chunked {
+                left: &input,
+                step: split,
+            },
+            None,
+            &UUID,
+        );
+        let mut got = Vec::new();
+        link.read_to_end(&mut got).expect("reads");
+        assert_eq!(got, b"abc");
+    }
+
+    #[test]
+    fn a_stream_without_the_uuid_is_content_from_the_start() {
+        let mut link = link(b"no framing here at all");
+        let mut out = Vec::new();
+        link.read_to_end(&mut out).expect("reads");
+        assert_eq!(out, b"no framing here at all");
+    }
+
+    /// The parked prefix becomes the walk's window in place: no copy, and its bytes
+    /// still cross the frame walk before the session's remainder.
+    #[test]
+    fn a_preloaded_prefix_is_the_walk_window_without_a_copy() {
+        let prefix = frame(true, VisionCommand::Continue.byte(), b"lead", 2);
+        let base = prefix.as_ptr();
+        let capacity = prefix.capacity();
+        let rest = frame(false, VisionCommand::End.byte(), b"tail", 0);
+        let mut link = link(&rest);
+        link.preload(prefix);
+        assert_eq!(
+            link.have.as_ptr(),
+            base,
+            "the prefix moved, it was not copied"
+        );
+        assert_eq!(
+            link.have.capacity(),
+            capacity,
+            "the prefix kept its allocation"
+        );
+        let mut out = Vec::new();
+        link.read_to_end(&mut out).expect("reads");
+        assert_eq!(out, b"leadtail");
+    }
+
+    /// Past the switch the tail is delivered with zero copies, where the framed path copied it twice.
+    #[test]
+    fn the_framing_switch_ends_the_staging() {
+        /// Hands out `step` bytes at a time so a read boundary lands on the end of the framing.
+        struct Drip<'a> {
+            left: &'a [u8],
+            step: usize,
+        }
+        impl Read for Drip<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.left.len().min(buf.len()).min(self.step);
+                buf[..n].copy_from_slice(&self.left[..n]);
+                self.left = &self.left[n..];
+                Ok(n)
+            }
+        }
+        impl Write for Drip<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl RecordAlignment for Drip<'_> {}
+
+        let tail = b"straight through, never staged";
+        let mut input = frame(true, 0, b"padded", 8);
+        input.extend(frame(false, 1, b"end", 0));
+        input.extend_from_slice(tail);
+        let framed = input.len() - tail.len();
+        let mut link = Link::new(
+            Drip {
+                left: &input,
+                step: framed,
+            },
+            None,
+            &UUID,
+        );
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 16];
+        loop {
+            let n = link.read(&mut buf).expect("reads");
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, [b"paddedend".as_slice(), tail.as_slice()].concat());
+        assert_eq!(
+            link.staged, framed,
+            "only framed bytes ever reach the window: {framed} in, no tail after"
+        );
+    }
+
+    /// The frame parser alone: a fixed window of frames carrying content and padding,
+    /// walked again and again with the filter spent and no caller buffer, so the frame
+    /// holds the parse and neither the copy nor the scan.
+    #[test]
+    fn the_frame_parser_probe_costs_the_walk_and_nothing_else() {
+        let mut input = Vec::new();
+        for _ in 0..7 {
+            input.extend(frame(false, 0, b"record", 4));
+        }
+        input.extend(frame(false, 1, b"record", 4));
+        let mut link = link(&[]);
+        link.tls.update(|tls| tls.budget = 0);
+        let mut frames = 0usize;
+        for _ in 0..64 {
+            link.have.clear();
+            link.have.extend_from_slice(&input);
+            link.dot = 0;
+            link.walk.framed = true;
+            link.walk.want_header = 5;
+            let tls = link.tls.snapshot();
+            let mut feed = Feeding::new(&tls);
+            let runs = link.pump(None, Some(&mut feed), false);
+            assert_eq!(runs, 48, "eight six-byte contents cross the walk");
+            link.read.padding = true;
+            link.read.raw = false;
+            frames += 8;
+        }
+        assert_eq!(frames, 512, "the walk saw every frame");
+    }
+
+    /// A split writer can see the server hello while the reader is parked; the reader's
+    /// older snapshot must not erase the scan the write already started.
+    #[test]
+    fn a_split_read_keeps_the_server_hello_scan_a_write_observed() {
+        let mut link = link(&[]);
+        let tls = link.tls.snapshot();
+        let feed = Feeding::new(&tls);
+        let mut head = vec![0x16, 0x03, 0x03, 0x00, 0x30, 0x02];
+        head.extend_from_slice(&[0u8; 6]);
+        link.tls.update(|tls| tls.observe(&head));
+        let left = link.tls.snapshot().server_hello_left;
+        assert!(left > 0, "the write observed a fragmented server hello");
+        link.spend(&feed);
+        assert_eq!(
+            link.tls.snapshot().server_hello_left,
+            left,
+            "the read snapshot undid the write's progress"
+        );
+        link.tls.update(|tls| tls.observe(&TLS13_VERSIONS));
+        assert!(
+            link.tls.snapshot().enable_xtls,
+            "the later fragment still selects Direct"
+        );
+    }
+
+    /// The walk the scan replaced, kept as this run's other frame: the same 64 walks of the same
+    /// hello through `windows(6)`, the same pinned fold, so one ops job reports both frames and
+    /// only their difference is a claim about the scan.
+    #[test]
+    fn the_serial_version_scan_costs_the_same_answer() {
+        let hello = scan_probe();
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            let found = std::hint::black_box(&hello)
+                .windows(TLS13_VERSIONS.len())
+                .any(|window| window == TLS13_VERSIONS);
+            fold += u32::from(found);
+        }
+        assert_eq!(fold, 64, "the same 64 walks, six-byte window at a time");
+    }
+
+    /// The scan, and nothing else: 64 walks of one 512-byte hello whose extension sits in its own
+    /// last six bytes, so every round runs the whole length, the hello handed over opaquely so no
+    /// round is answered from the literal.
+    #[test]
+    fn the_word_version_scan_costs_the_scan_and_nothing_else() {
+        let hello = scan_probe();
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            fold += u32::from(supports_tls13(std::hint::black_box(&hello)));
+        }
+        assert_eq!(fold, 64, "64 walks of one hello, folded after each");
+    }
+
+    /// A hello no word's zero bytes answer early: the pattern is the last six bytes, so a round that
+    /// stopped early would fold a miss. Two zeros a word is the worst a real hello's length fields
+    /// and extension types put in one, and every one of them costs the candidate a compare.
+    fn scan_probe() -> Vec<u8> {
+        const NOISE: [u8; 8] = [0x9a, 0x00, 0x71, 0x2b, 0xb5, 0x0d, 0x00, 0xe1];
+        let mut hello = vec![0x16, 0x03, 0x03, 0x00, 0xf0, 0x02];
+        for i in 0..500usize {
+            hello.push(NOISE[i % NOISE.len()]);
+        }
+        hello.extend_from_slice(&TLS13_VERSIONS);
+        hello
+    }
+
+    /// Every start the window form tested is still tested: the pattern is spliced at each offset of
+    /// a hello, and each prefix that ends inside it is compared against `windows(6)` at the same
+    /// length, where the word rounds and the scalar tail meet.
+    #[test]
+    fn the_word_version_scan_finds_every_offset_the_window_found() {
+        const NOISE: [u8; 8] = [0x00, 0x2c, 0x71, 0x2b, 0xb5, 0x0d, 0x00, 0xe1];
+        let mut body = Vec::new();
+        for i in 0..600usize {
+            body.push(NOISE[i % NOISE.len()]);
+        }
+        assert!(!supports_tls13(&body), "the body alone holds no extension");
+        for at in 0..=body.len() {
+            let mut case = body[..at].to_vec();
+            case.extend_from_slice(&TLS13_VERSIONS);
+            case.extend_from_slice(&body[at..]);
+            assert!(supports_tls13(&case), "the pattern spliced at {at}");
+            for cut in at..at + 6 {
+                assert_eq!(
+                    supports_tls13(&case[..cut]),
+                    case[..cut]
+                        .windows(6)
+                        .any(|window| window == TLS13_VERSIONS),
+                    "cut {cut} of the pattern spliced at {at}"
+                );
+            }
+        }
+        for case in [
+            &b"\x00\x01\x00\x01\x00\x01"[..],
+            b"\x00\x00\x00\x00\x00\x00",
+            b"\x00\x2b\x00\x02\x03",
+            b"",
+            b"\x00",
+        ] {
+            assert_eq!(
+                supports_tls13(case),
+                case.windows(6).any(|window| window == TLS13_VERSIONS),
+                "{case:02x?}"
+            );
+        }
+    }
+
+    /// The scan budget is spent after the handshake; a steady read must not build the
+    /// 320-byte feed the scan alone needs.
+    #[test]
+    fn a_steady_read_builds_no_feed() {
+        let input = frame(true, 0, b"body", 0);
+        let mut link = link(&input);
+        link.tls.update(|tls| tls.budget = 0);
+        let mut out = [0u8; 16];
+        let n = link.read(&mut out).expect("reads");
+        assert_eq!(&out[..n], b"body");
+        assert_eq!(link.feeds, 0, "the scan is over, so no feed is built");
+    }
+
+    /// The framed writer observes the filter and reads it back to frame: one acquisition
+    /// of the state a split link shares, where the first form took up to four.
+    #[test]
+    fn a_steady_framed_write_takes_the_shared_state_once() {
+        let (_reader, mut writer) = Link::split(Fake::new(&[]), Fake::new(&[]), None, None, &UUID);
+        writer.tls.update(|tls| tls.budget = 0);
+        writer
+            .tls_accesses
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let payload = vec![0x17; MAX_FRAME_CONTENT + 1];
+        writer.write_all(&payload).expect("writes");
+        assert_eq!(
+            writer
+                .tls_accesses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a steady framed write takes the shared state once"
+        );
+    }
+
+    /// A write after the filter is spent observes nothing, so it must not take the
+    /// session to rearm an alignment the exhausted filter already decided.
+    #[test]
+    fn a_spent_write_does_not_rearm_the_limiter() {
+        let (_reader, mut writer) = Link::split(Fake::new(&[]), Fake::new(&[]), None, None, &UUID);
+        writer.tls.update(|tls| {
+            tls.budget = 0;
+            tls.enable_xtls = true;
+        });
+        let before = writer.session.engaged;
+        writer.write_all(b"hello").expect("writes");
+        assert_eq!(
+            writer.session.engaged, before,
+            "a spent budget does not rearm the limiter"
+        );
+    }
+
+    /// The first read after the switch learns the filter is spent; from then on the
+    /// budget can only stay zero, so no read asks the shared cell again.
+    #[test]
+    fn a_spent_direct_read_takes_no_shared_state() {
+        let (mut reader, _writer) =
+            Link::split(Fake::new(b"tail"), Fake::new(&[]), None, None, &UUID);
+        reader.read.padding = false;
+        reader.walk.framed = true;
+        reader.tls.update(|tls| tls.budget = 0);
+        reader
+            .tls_accesses
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut out = [0u8; 8];
+        let n = reader.read(&mut out).expect("reads");
+        assert_eq!(&out[..n], b"tail");
+        assert_eq!(
+            reader
+                .tls_accesses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the read that learns the budget is spent takes it once"
+        );
+        reader
+            .tls_accesses
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(reader.read(&mut out).expect("reads"), 0);
+        assert_eq!(
+            reader
+                .tls_accesses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a spent direct read takes no shared state"
+        );
+    }
+
+    /// The command byte is validated once per frame, and a command the reference does
+    /// not know ends the framing the way `end` does: the bytes after it are not framed.
+    #[test]
+    fn a_frame_validates_its_command_once() {
+        let mut input = frame(true, 0, b"first", 3);
+        input.extend(frame(false, 0, b"second", 4));
+        input.extend(frame(false, 1, b"third", 0));
+        input.extend_from_slice(b"raw tail");
+        let mut framed = link(&input);
+        let mut out = Vec::new();
+        framed.read_to_end(&mut out).expect("reads");
+        assert_eq!(out, b"firstsecondthirdraw tail");
+        assert_eq!(
+            framed.validated, 3,
+            "one command byte per frame, and the tail carries none"
+        );
+        drop(framed);
+
+        // A command outside the three the reference knows ends the framing like `end`.
+        let mut unknown = frame(true, 0x07, b"kept", 0);
+        unknown.extend_from_slice(b"after");
+        let mut other = link(&unknown);
+        let mut out = Vec::new();
+        other.read_to_end(&mut out).expect("reads");
+        assert_eq!(out, b"keptafter", "an unknown command ends the framing");
+        assert_eq!(other.validated, 1, "the unknown command was validated too");
+    }
+
+    /// The framed staging never reaches for a full relay buffer: it is capped at one
+    /// record while the framing lives, and the switch hands both buffers back.
+    #[test]
+    fn the_framed_staging_buffers_stay_at_one_record() {
+        let mut input = Vec::new();
+        for i in 0..24u32 {
+            let content: Vec<u8> = (0..700u32).map(|k| (k as u8) ^ (i as u8)).collect();
+            input.extend(frame(i == 0, 0, &content, 300));
+        }
+        input.extend(frame(false, 1, b"end", 0));
+        let tail = vec![0xABu8; 40_000];
+        input.extend_from_slice(&tail);
+
+        let mut link = link(&input);
+        let mut got = Vec::new();
+        // The first read lands inside the framing, where the window is one record wide.
+        let mut head = [0u8; 64];
+        let n = link.read(&mut head).expect("reads");
+        assert!(n > 0, "the first read carries content");
+        assert_eq!(
+            link.have.capacity(),
+            WINDOW,
+            "the read buffer holds exactly the window, never a relay's 256 KiB"
+        );
+        got.extend_from_slice(&head[..n]);
+        link.read_to_end(&mut got).expect("reads");
+        let mut want: Vec<u8> = (0..24u32)
+            .flat_map(|i| (0..700u32).map(move |k| (k as u8) ^ (i as u8)))
+            .collect();
+        want.extend_from_slice(b"end");
+        want.extend_from_slice(&tail);
+        assert_eq!(got, want, "framing round-trips at one-record reads");
+
+        assert_eq!(
+            link.have.capacity(),
+            0,
+            "the switch hands the window back: a connection that lives on does not carry it"
+        );
+    }
+
+    /// A reader that answers in seeded chunks, so a red run replays anywhere.
+    struct Seeded<'a> {
+        left: &'a [u8],
+        state: u32,
+    }
+
+    impl Read for Seeded<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.left.is_empty() {
+                return Ok(0);
+            }
+            let mut x = self.state;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            self.state = x;
+            // Framed like the core sweep: whole UUID prefix first, splits after.
+            let take = (x as usize % 48 + 21).min(buf.len()).min(self.left.len());
+            buf[..take].copy_from_slice(&self.left[..take]);
+            self.left = &self.left[take..];
+            Ok(take)
+        }
+    }
+
+    impl Write for Seeded<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl RecordAlignment for Seeded<'_> {}
+
+    #[test]
+    fn seeded_splits_read_back_as_whole_content() {
+        let content: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+        let mut input = frame(true, 0, &content, 37);
+        input.extend(frame(false, 1, b"tail", 3));
+        input.extend_from_slice(b"raw tail");
+        let mut link = Link::new(
+            Seeded {
+                left: &input,
+                state: 0x9e37_79b9,
+            },
+            None,
+            &UUID,
+        );
+        let mut got = Vec::new();
+        link.read_to_end(&mut got).expect("reads");
+        let mut want = content;
+        want.extend_from_slice(b"tailraw tail");
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_direct_command_switches_the_reading_direction() {
+        let mut input = frame(true, 0, b"padded", 8);
+        input.extend(frame(false, 2, b"", 0));
+        input.extend_from_slice(b"after the switch");
+        let mut link = link(&input);
+        let mut out = Vec::new();
+        link.read_to_end(&mut out).expect("reads");
+        assert_eq!(out, b"paddedafter the switch");
+        assert!(!link.read.raw);
+        assert!(!link.read.padding);
+    }
+
+    /// A long run of full frames across many window and caller-buffer boundaries must
+    /// deliver exactly the concatenated content; the walk parks and resumes mid-frame
+    /// on every fill, so a stale length would surface as a missing or shifted byte.
+    #[test]
+    fn a_long_run_of_frames_survives_every_boundary() {
+        struct Drip<'a> {
+            left: &'a [u8],
+            step: usize,
+        }
+        impl Read for Drip<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.left.len().min(buf.len()).min(self.step);
+                buf[..n].copy_from_slice(&self.left[..n]);
+                self.left = &self.left[n..];
+                Ok(n)
+            }
+        }
+        impl Write for Drip<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl RecordAlignment for Drip<'_> {}
+
+        let mut want = Vec::new();
+        let mut input = frame(true, 0, b"", 1000);
+        for index in 0..400usize {
+            let content = vec![(index % 251) as u8; 8171];
+            input.extend(frame(false, 0, &content, (index * 37) % 256));
+            want.extend_from_slice(&content);
+        }
+        input.extend(frame(false, 1, b"tail", 7));
+        want.extend_from_slice(b"tail");
+        input.extend_from_slice(b"after-end");
+        want.extend_from_slice(b"after-end");
+
+        let mut link = Link::new(
+            Drip {
+                left: &input,
+                step: 1500,
+            },
+            None,
+            &UUID,
+        );
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 65_536];
+        loop {
+            let n = match link.read(&mut buf) {
+                Ok(n) => n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => panic!("reads: {error}"),
+            };
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got.len(), want.len());
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_truncated_frame_is_dropped_not_delivered() {
+        let mut input = frame(true, 0, b"kept", 0);
+        input.extend_from_slice(&[0x00, 0x00, 0x40]);
+        let mut link = link(&input);
+        let mut out = Vec::new();
+        link.read_to_end(&mut out).expect("reads");
+        assert_eq!(out, b"kept");
+    }
+
+    #[test]
+    fn bytes_after_padding_arrive_without_waiting_for_close() {
+        use std::time::Duration;
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut input = frame(true, 1, b"end", 0);
+            input.extend_from_slice(b"tail-part-one");
+            stream.write_all(&input).expect("writes");
+            std::thread::sleep(Duration::from_millis(200));
+            stream.write_all(b"tail-part-two").expect("writes");
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut link = Link::new(stream, None, &UUID);
+        let mut first = [0u8; 16];
+        link.read_exact(&mut first).expect("part one needs no EOF");
+        assert_eq!(&first, b"endtail-part-one");
+        let mut rest = Vec::new();
+        link.read_to_end(&mut rest).expect("rest arrives at close");
+        assert_eq!(rest, b"tail-part-two");
+        writer.join().expect("joins");
+    }
+
+    #[test]
+    fn writing_frames_the_payload_and_heads_the_first_with_the_uuid() {
+        let mut link = link(&[]);
+        link.write_all(b"hello").expect("writes");
+        let out = &link.session.written;
+        assert_eq!(&out[..16], &UUID);
+        assert_eq!(out[16], 0, "padding is still running");
+        let len = usize::from(u16::from_be_bytes([out[17], out[18]]));
+        let pad = usize::from(u16::from_be_bytes([out[19], out[20]]));
+        assert_eq!(len, 5);
+        assert_eq!(&out[21..26], b"hello");
+        assert_eq!(out.len(), 26 + pad);
+        assert!(pad < BUFFER);
+    }
+
+    /// A sink that records the slices it was handed, so the pointer can witness the removed copy.
+    struct Peeker {
+        written: Vec<u8>,
+        /// `(payload_ptr, payload_len)` for each `write_all_slices` call.
+        calls: Vec<(*const u8, usize)>,
+        /// uuid pointer for the calls where the framer prepended it (the first frame).
+        uuids: Vec<*const u8>,
+    }
+
+    impl Read for Peeker {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for Peeker {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl RecordAlignment for Peeker {
+        fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+            // First frame: uuid | head | caller's payload | zero trailer. Later: head | caller's payload | zero trailer.
+            let (uuid_at, payload_at) = match parts.len() {
+                3 => (None, 1),
+                4 => (Some(0), 2),
+                n => panic!("unexpected {n} parts"),
+            };
+            self.calls
+                .push((parts[payload_at].as_ptr(), parts[payload_at].len()));
+            if let Some(i) = uuid_at {
+                self.uuids.push(parts[i].as_ptr());
+            }
+            for part in parts {
+                self.written.extend_from_slice(part);
+            }
+            Ok(())
+        }
+    }
+
+    /// The payload pointer the caller handed `write` is the same pointer that reaches `write_all_slices`; a staging copy would move it.
+    #[test]
+    fn the_writer_hands_the_callers_payload_by_pointer() {
+        let mut link = Link::new(
+            Peeker {
+                written: Vec::new(),
+                calls: Vec::new(),
+                uuids: Vec::new(),
+            },
+            None,
+            &UUID,
+        );
+        let mut payload: Vec<u8> = (0..4_000u32).map(|i| (i % 251) as u8).collect();
+        let want_ptr = payload.as_ptr();
+        let want_len = payload.len();
+        link.write_all(&payload).expect("writes");
+        assert_eq!(link.session.calls.len(), 1);
+        let (got_ptr, got_len) = link.session.calls[0];
+        assert_eq!(
+            got_ptr, want_ptr,
+            "the caller's payload reached the session uncopied"
+        );
+        assert_eq!(got_len, want_len);
+        // Grow the caller's buffer so the next write would have shown a stale staging pointer.
+        payload.extend_from_slice(b"-more-");
+        let second_ptr = payload.as_ptr();
+        link.write_all(&payload).expect("writes");
+        assert_eq!(link.session.calls.len(), 2);
+        assert_eq!(
+            link.session.calls[1].0, second_ptr,
+            "still by pointer, after a realloc"
+        );
+    }
+
+    /// The pointer identity is the core sliced test; a join buffer here would grow the newtype.
+    #[test]
+    fn the_sealed_wrapper_adds_no_join_buffer() {
+        assert_eq!(
+            std::mem::size_of::<Sealed<Peeker>>(),
+            std::mem::size_of::<ferrox_core::vless_encryption::EncryptedStream<Peeker>>(),
+            "Sealed must forward the framer's parts, not join them into a staging buffer"
+        );
+    }
+
+    /// The relay hands one buffer of up to 64 KiB; past one `buf.Size` block the u16 length wraps and the reference's reader refuses the frame, so the buffer frames as whole blocks and every byte still arrives.
+    #[test]
+    fn a_bulk_write_frames_every_block_inside_the_bound() {
+        let body: Vec<u8> = (0..crate::proxy::RELAY_BUFFER as u32)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let base = body.as_ptr();
+        let mut link = Link::new(
+            Peeker {
+                written: Vec::new(),
+                calls: Vec::new(),
+                uuids: Vec::new(),
+            },
+            None,
+            &UUID,
+        );
+        link.write_all(&body).expect("writes");
+
+        let out = &link.session.written;
+        assert_eq!(&out[..16], &UUID, "one uuid for the whole buffer");
+        assert_eq!(link.session.uuids.len(), 1);
+        assert_eq!(
+            usize::from(u16::from_be_bytes([out[17], out[18]])),
+            MAX_FRAME_CONTENT,
+            "the block is the largest the bound allows, so the fewest of them"
+        );
+        let mut at = 16;
+        let mut framed = 0usize;
+        let mut blocks = 0usize;
+        while at + 5 <= out.len() {
+            assert_eq!(out[at], 0, "the filter window is still open past {blocks}");
+            let content = usize::from(u16::from_be_bytes([out[at + 1], out[at + 2]]));
+            let padding = usize::from(u16::from_be_bytes([out[at + 3], out[at + 4]]));
+            assert!(
+                content + padding <= MAX_FRAME_CONTENT,
+                "block {blocks} frames {content}+{padding} past the bound"
+            );
+            assert_eq!(
+                link.session.calls[blocks].0,
+                base.wrapping_add(framed),
+                "block {blocks} reaches the session from the caller's buffer"
+            );
+            assert_eq!(link.session.calls[blocks].1, content);
+            assert_eq!(
+                &out[at + 5..at + 5 + content],
+                &body[framed..framed + content]
+            );
+            assert_eq!(
+                &ZERO[..padding],
+                &out[at + 5 + content..at + 5 + content + padding]
+            );
+            if content == MAX_FRAME_CONTENT {
+                assert_eq!(padding, 0, "a full block carries no trailer to skip");
+            }
+            framed += content;
+            at += 5 + content + padding;
+            blocks += 1;
+        }
+        assert_eq!(at, out.len(), "every framed byte was walked");
+        assert_eq!(framed, body.len(), "the payload arrived whole");
+        assert_eq!(blocks, body.len().div_ceil(MAX_FRAME_CONTENT));
+        assert_eq!(link.session.calls.len(), blocks);
+    }
+
+    /// The uuid reaches the session as a slice of the link's own field; a stack-header build would have copied it there.
+    #[test]
+    fn the_writer_hands_the_uuid_by_pointer_on_the_first_frame() {
+        let mut link = Link::new(
+            Peeker {
+                written: Vec::new(),
+                calls: Vec::new(),
+                uuids: Vec::new(),
+            },
+            None,
+            &UUID,
+        );
+        let want_uuid = std::ptr::from_ref(&link.uuid).cast::<u8>();
+        link.write_all(b"hello").expect("writes");
+        assert_eq!(link.session.uuids.len(), 1, "the uuid goes out once");
+        assert_eq!(
+            link.session.uuids[0], want_uuid,
+            "the uuid reached the session by pointer, not copied into a stack head"
+        );
+        link.write_all(b"again").expect("writes");
+        assert_eq!(
+            link.session.uuids.len(),
+            1,
+            "no second prepended uuid after the first frame"
+        );
+    }
+
+    /// Steady write traffic leaves the read-side capacity alone; nothing on the write path allocates a buffer that grows.
+    #[test]
+    fn write_traffic_holds_the_buffer_capacities_steady() {
+        let mut link = link(&[]);
+        let have_before = link.have.capacity();
+        let body = vec![0x42u8; 1_400];
+        for _ in 0..64 {
+            link.write_all(&body).expect("writes");
+        }
+        assert_eq!(
+            link.have.capacity(),
+            have_before,
+            "no allocation on the write path"
+        );
+    }
+
+    #[test]
+    fn a_non_tls_stream_stops_padding_inside_the_filter_window() {
+        let mut link = link(&[]);
+        let mut commands = Vec::new();
+        let mut at = 0;
+        for round in 0..FILTER_PACKETS - 1 {
+            link.write_all(b"x").expect("writes");
+            commands.push(link.session.written[at + if round == 0 { 16 } else { 0 }]);
+            at = link.session.written.len();
+        }
+        assert_eq!(commands, vec![0, 0, 0, 0, 0, 0, 1]);
+        assert!(!link.write.padding);
+        assert_eq!(
+            link.tls.snapshot().budget,
+            1,
+            "the last buffer of the window is spent"
+        );
+        link.write_all(b"y").expect("writes");
+        assert!(link.session.written.ends_with(b"y"), "unframed from here");
+    }
+
+    #[test]
+    fn an_inner_tls13_stream_switches_to_raw_at_its_first_record() {
+        let mut link = link(&[]);
+        link.write_all(&server_hello()).expect("writes");
+        assert!(
+            link.tls.snapshot().enable_xtls,
+            "a 1.3 ServerHello is worth switching for"
+        );
+        assert!(link.write.padding, "the handshake is still padded");
+        let at = link.session.written.len();
+        link.write_all(&application_record()).expect("writes");
+        assert_eq!(link.session.written[at], 2, "command two");
+        assert!(!link.write.padding);
+        assert!(!link.write.raw, "no raw socket was wired, so no raw switch");
+    }
+
+    fn server_hello() -> Vec<u8> {
+        let mut payload = vec![0x02, 0x00, 0x00, 0x00];
+        payload.extend_from_slice(&[0x03, 0x03]);
+        payload.extend_from_slice(&[0x7fu8; 32]);
+        payload.push(32);
+        payload.extend_from_slice(&[0u8; 32]);
+        payload.extend_from_slice(&[0x00, 0x13, 0x01]);
+        payload.push(0);
+        payload.extend_from_slice(&[0x00, 0x00]);
+        payload.extend_from_slice(&TLS13_VERSIONS);
+        let len = u32::try_from(payload.len() - 4).unwrap();
+        payload[1..4].copy_from_slice(&len.to_be_bytes()[1..]);
+        let mut out = vec![0x16, 0x03, 0x03];
+        out.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    fn application_record() -> Vec<u8> {
+        let mut record = vec![0x17, 0x03, 0x03, 0x00, 0x05];
+        record.extend_from_slice(b"inner");
+        record
+    }
+
+    #[test]
+    fn a_record_boundary_is_only_a_boundary_between_records() {
+        let record = application_record();
+        assert!(is_record_run(&record));
+        assert!(!is_record_run(&record[..8]));
+        let mut two = record.clone();
+        two.extend_from_slice(&record);
+        assert!(is_record_run(&two));
+        let mut partial = record.clone();
+        partial.pop();
+        assert!(!is_record_run(&partial));
+        assert!(!is_record_run(&[0x16, 0x03, 0x03, 0x00, 0x05, 0]));
+        assert!(!is_record_run(&[0x17, 0x03, 0x04, 0x00, 0x01, 0]));
+    }
+
+    /// The header walk the five-byte steps replaced, kept as the reference: the same verdict on
+    /// every cut, corruption and refused record the run can hold.
+    fn serial_record_run(buf: &[u8]) -> bool {
+        let mut at = 0;
+        let mut head = 5;
+        let mut left = 0;
+        while at < buf.len() {
+            if head > 0 {
+                let byte = buf[at];
+                at += 1;
+                match head {
+                    3..=5 => {
+                        if byte != TLS_APPLICATION_DATA[5 - head as usize] {
+                            return false;
+                        }
+                    }
+                    2 => left = usize::from(byte) << 8,
+                    _ => left |= usize::from(byte),
+                }
+                head -= 1;
+            } else if left > 0 {
+                if buf.len() - at < left {
+                    return false;
+                }
+                at += left;
+                left = 0;
+                head = 5;
+            } else {
+                return false;
+            }
+        }
+        head == 5 && left == 0
+    }
+
+    #[test]
+    fn every_record_run_answers_as_the_byte_walk_did() {
+        let record = application_record();
+        let mut two = record.clone();
+        two.extend_from_slice(&record);
+        let mut corpus: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![0x17],
+            vec![0x17, 0x03],
+            vec![0x17, 0x03, 0x03, 0x00],
+            // a zero-length record is refused, wherever it sits
+            vec![0x17, 0x03, 0x03, 0x00, 0x00],
+            record.clone(),
+            two.clone(),
+        ];
+        // every cut of a two-record run: a short header, a short body, an exact end
+        for cut in 0..=two.len() {
+            corpus.push(two[..cut].to_vec());
+        }
+        // every single-byte corruption of a two-record run, at every offset
+        for at in 0..two.len() {
+            for byte in [0x00u8, 0x01, 0x02, 0x17, 0x03, 0xff] {
+                let mut case = two.clone();
+                case[at] = byte;
+                corpus.push(case);
+            }
+        }
+        for case in &corpus {
+            assert_eq!(is_record_run(case), serial_record_run(case), "{case:02x?}");
+        }
+    }
+
+    #[test]
+    fn padding_is_bounded_and_scales_with_the_payload() {
+        for len in [0usize, 1, 100, 899, 900, 2000, 5000, 100_000] {
+            let pad = padding_len(len, false);
+            assert!(pad < SEED[3] as usize, "len {len} padded by {pad}");
+        }
+        assert!(padding_len(10, true) >= SEED[2] as usize - 10);
+        assert!(padding_len(2000, true) < SEED[3] as usize);
+    }
+
+    #[test]
+    fn both_directions_spend_the_same_filter_budget() {
+        let mut link = link(&[]);
+        link.write_all(&[0x16, 0x03, 0x01, 0x00, 0x05, 0x01])
+            .expect("writes");
+        assert_eq!(link.tls.snapshot().budget, FILTER_PACKETS - 1);
+        assert!(
+            link.tls.snapshot().present,
+            "a ClientHello record makes the stream TLS"
+        );
+        assert!(
+            !link.tls.snapshot().twelve_or_above,
+            "a ClientHello says nothing about a version"
+        );
+    }
+}
