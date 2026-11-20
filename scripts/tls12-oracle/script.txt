@@ -1,0 +1,54 @@
+# Cases for the tls12-oracle: one Go-to-Go TLS 1.2 session per `0x` line,
+# `<suite-id> <crypto/tls name>`. Each session pins MinVersion, MaxVersion and CipherSuites to
+# that one suite, runs over loopback through a tee that keeps both directions' bytes, and logs
+# its master secret through KeyLogWriter. Output lines: `KEY <id> <96 hex>` the CLIENT_RANDOM
+# master secret, `C2S <id> <hex>` and `S2C <id> <hex>` every record each side wrote (plaintext
+# handshake, ChangeCipherSpec, encrypted Finished, one application record with a known payload),
+# then `RSA <n> <e> <msg> <ct>` and `MODEXP <n> <e> <em> <ct>` for the static-RSA key transport.
+#
+# The golden was captured with Go 1.24.6 on darwin/arm64. The Rust gate is
+# `shaped::oracle::tls12_sessions_match_go`: it expands the key block from the logged master
+# secret, opens and authenticates every encrypted record Go wrote, checks both Finished
+# messages, and re-seals them so a CBC record's header — explicit IV, MAC and padding count
+# included — matches Go's byte for byte, and an RC4 record matches whole behind its stream.
+
+# The six ECDHE-CBC suites, three with an ECDSA leaf and three with an RSA leaf. SHA-1 is what a
+# `-SHA` identifier names for the record MAC while the PRF stays SHA-256: the split this client
+# had no way to express before.
+0xc009 TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA
+0xc00a TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA
+0xc023 TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256
+0xc013 TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA
+0xc014 TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA
+0xc027 TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256
+
+# The five static-RSA suites: no ServerKeyExchange, and a pre-master the client encrypts to the
+# leaf's key. The record layer is suite-agnostic here, so these gate MAC, padding and the key
+# expansion; the RSA encryption itself is gated by the `RSA` and `MODEXP` lines.
+0x002f TLS_RSA_WITH_AES_128_CBC_SHA
+0x0035 TLS_RSA_WITH_AES_256_CBC_SHA
+0x003c TLS_RSA_WITH_AES_128_CBC_SHA256
+0x009c TLS_RSA_WITH_AES_128_GCM_SHA256
+0x009d TLS_RSA_WITH_AES_256_GCM_SHA384
+
+# The two 3DES-EDE-CBC rows, the last TLS 1.2 suites whose record layer is MAC-then-encrypt on a
+# block. Their block is eight bytes, not sixteen, so the explicit IV, the padding count and every
+# length in the header move with it.
+0x000a TLS_RSA_WITH_3DES_EDE_CBC_SHA
+0xc012 TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA
+
+# The three RC4-SHA rows, where the record layer is MAC-then-encrypt on a stream: the payload and
+# its 20-byte MAC go through `XORKeyStream` with no explicit IV and no padding, and the key block
+# carries no IV either. One stream runs across a session's records, so a re-seal that reaches the
+# right position matches Go's whole ciphertext — a byte gate CBC's random IV can never be.
+0x0005 TLS_RSA_WITH_RC4_128_SHA
+0xc011 TLS_ECDHE_RSA_WITH_RC4_128_SHA
+0xc007 TLS_ECDHE_ECDSA_WITH_RC4_128_SHA
+
+# What this list stops at, measured against the same Go build (1.24.6): the five rows
+# `InsecureCipherSuites()` names are all above, because both sides still negotiate one when it is
+# the only suite either end carries. `0x003d` is not: the server alerts `handshake failure`,
+# because no TLS 1.2 table this client reads contains it — uTLS keeps it behind
+# `EnableWeakCiphers()`, which xray never calls. The same is true of `0xc024`, `0xc028`, the DHE
+# and static-ECDH names and the SEED rows, which the `360`, `firefox_55/63` and iOS/Safari presets
+# advertise but no Go table implements.
