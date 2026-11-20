@@ -1137,4 +1137,244 @@ fn serve_vless_inbound(
         }
         "tls" => serve_vless_tls_inbound(address, inbound, &users, &carrier, freedom, path, stop),
         "reality" => serve_vless_reality_inbound(address, inbound, &users, &carrier, freedom, path),
-        _ if !vle
+        _ if !vless_security_supported(sec) => {
+            eprintln!("unsupported vless security `{sec}` in {path}: serves raw TCP only");
+            false
+        }
+        _ => {
+            let owned = address.to_owned();
+            if let Carrier::Kcp(config) = carrier {
+                let users = Arc::clone(&users);
+                let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+                let serve: KcpServe = Arc::new(move |conn: &Arc<ferrox_core::kcp::Connection>| {
+                    let _flow = crate::accesslog::flow(Some(conn.remote_addr()), "", 0);
+                    serve_vless_kcp(conn, &users, freedom, meter.clone());
+                });
+                return serve_kcp_bound(&owned, config, &serve, inbound);
+            }
+            let fallbacks = match server_fallbacks(inbound) {
+                Ok(fallbacks) => fallbacks.map(Arc::from),
+                Err(error) => {
+                    eprintln!("{error} in {path}: inbound refused");
+                    return false;
+                }
+            };
+            let decryption = match crate::config::server_decryption(inbound) {
+                Ok(decryption) => decryption,
+                Err(error) => {
+                    eprintln!("{error} in {path}: inbound refused");
+                    return false;
+                }
+            };
+            if decryption.is_some() && fallbacks.is_some() {
+                eprintln!(
+                    r#"VLESS settings: "fallbacks" can not be used together with "decryption" in {path}: inbound refused"#
+                );
+                return false;
+            }
+            let role = inbound_role(
+                inbound,
+                Role::Vless {
+                    users,
+                    carrier,
+                    freedom,
+                    fallbacks,
+                    decryption,
+                },
+            );
+            spawn_role_stopped(&owned, role, inbound_tag(inbound), None);
+            true
+        }
+    }
+}
+
+/// The hysteria listener a vless inbound's carrier hands off to, carrying the same `udpIdleTimeout` and `quicParams` the stream named.
+fn serve_hysteria_thread(
+    address: &str,
+    config: &ferrox_core::hysteria::Config,
+    identity: &ferrox_core::tls::TlsServerConfig,
+    masq: &ferrox_core::hysteria::Masquerade,
+    serve: &crate::hysteria::Serve,
+) -> bool {
+    let Some(prepared) = crate::hysteria::prepare(
+        address,
+        identity,
+        config.cc,
+        &config.obfs_password,
+        config.quic.as_ref(),
+    ) else {
+        return false;
+    };
+    let auth = config.auth.clone();
+    let udp_idle = std::time::Duration::from_secs(config.udp_idle);
+    let quic = config.quic;
+    let realm = config.realm.clone();
+    let masq = masq.clone();
+    let serve = Arc::clone(serve);
+    thread::spawn(move || {
+        crate::hysteria::serve_prepared(
+            prepared,
+            std::slice::from_ref(&auth),
+            &masq,
+            &serve,
+            udp_idle,
+            quic.as_ref(),
+            realm.as_deref(),
+        );
+    });
+    true
+}
+
+thread_local! {
+    /// The lane the flow on this thread resolved to; a dial under it carries that lane's counters.
+    static OUTBOUND_TAG: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// The last dial this thread attempted: `Some(false)` refused, `Some(true)` connected, `None` never needed one.
+    static DIAL_REPORT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run one front's dial and report the last attempt it made, so a caller can tell a
+/// refused proxy leg from a clean close without threading a result through every lane.
+pub(crate) fn observe_dial<T>(f: impl FnOnce() -> T) -> (T, Option<bool>) {
+    DIAL_REPORT.with(|slot| slot.set(None));
+    let value = f();
+    (value, DIAL_REPORT.with(std::cell::Cell::get))
+}
+
+/// The tag of the one outbound a config without routing uses, which is what its counters key on.
+static DEFAULT_OUTBOUND_TAG: Mutex<Option<String>> = Mutex::new(None);
+
+fn install_default_outbound_tag(root: &Json) {
+    let tag = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("tag"))
+        .and_then(Json::as_str)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned);
+    *DEFAULT_OUTBOUND_TAG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = tag;
+}
+
+fn default_outbound_tag() -> Option<String> {
+    DEFAULT_OUTBOUND_TAG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// The counters a carrier that builds its own stream handles charges, for a flow on this thread.
+pub(crate) fn flow_outbound_meter() -> Option<crate::stats::Meter> {
+    OUTBOUND_TAG.with(|cell| {
+        cell.borrow()
+            .as_deref()
+            .map(|tag| crate::stats::outbound(Some(tag)))
+    })
+}
+
+/// The counters an inbound listener charges, for a carrier whose streams carry their own handles.
+pub(crate) fn inbound_meter(inbound: &Json) -> crate::stats::Meter {
+    crate::stats::inbound(inbound_tag(inbound).as_deref())
+}
+
+struct OutboundTag;
+
+impl OutboundTag {
+    fn enter(tag: Option<&str>) -> Self {
+        OUTBOUND_TAG.with(|cell| *cell.borrow_mut() = tag.map(str::to_owned));
+        Self
+    }
+}
+
+impl Drop for OutboundTag {
+    fn drop(&mut self) {
+        OUTBOUND_TAG.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+/// xray's `sendThrough`: the source a flow leaves from, one address or a fresh host in a CIDR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendThrough {
+    Address(IpAddr),
+    Cidr { base: IpAddr, prefix: u8 },
+}
+
+impl SendThrough {
+    /// The source one dial binds; a CIDR rolls a host in its subnet as `ParseRandomIP` does.
+    fn address(self) -> Result<IpAddr, std::io::Error> {
+        let (base, prefix) = match self {
+            Self::Address(address) => return Ok(address),
+            Self::Cidr { base, prefix } => (base, prefix),
+        };
+        let bits = if base.is_ipv4() { 32 } else { 128 };
+        if prefix == bits {
+            return Ok(base);
+        }
+        let mut raw = [0u8; 16];
+        #[cfg(test)]
+        if FAIL_ENTROPY.with(std::cell::Cell::get) {
+            return Err(std::io::Error::other("no entropy"));
+        }
+        getrandom::fill(&mut raw).map_err(std::io::Error::other)?;
+        Ok(match base {
+            IpAddr::V4(base) => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - u32::from(prefix))
+                };
+                let base = u32::from(base) & mask;
+                let roll = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) & !mask;
+                IpAddr::V4(std::net::Ipv4Addr::from(base | roll))
+            }
+            IpAddr::V6(base) => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - u32::from(prefix))
+                };
+                let base = u128::from(base) & mask;
+                let roll = u128::from_le_bytes(raw) & !mask;
+                IpAddr::V6(std::net::Ipv6Addr::from(base | roll))
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_ENTROPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn resolve_source(send: Option<SendThrough>) -> Result<Option<IpAddr>, std::io::Error> {
+    send.map(SendThrough::address).transpose()
+}
+
+thread_local! {
+    /// The source the outbound a flow entered names, read by the one dial seam.
+    static SEND_THROUGH: std::cell::Cell<Option<SendThrough>> = const { std::cell::Cell::new(None) };
+    /// The `streamSettings.sockopt` that outbound names, read by the same seam.
+    static DIAL_SOCKOPTS: std::cell::RefCell<Option<Arc<crate::sockopt::SocketOptions>>> = const { std::cell::RefCell::new(None) };
+    /// The family the outbound a flow entered resolves a named target to before the request carries it.
+    static TARGET_STRATEGY: std::cell::Cell<Option<FreedomDomain>> = const { std::cell::Cell::new(None) };
+}
+
+struct SendThroughGuard;
+
+impl SendThroughGuard {
+    fn enter(source: Option<SendThrough>) -> Self {
+        SEND_THROUGH.with(|cell| cell.set(source));
+        Self
+    }
+}
+
+impl Drop for SendThroughGuard {
+    fn drop(&mut self) {
+        SEND_THROUGH.with(|cell| cell.set(None));
+    }
+}
+
+/// The options the flow on this thread dials with, for a carrier that binds its own datagram socket.
+pub(crate) fn flow_sockopts() -> Option<Arc<crate::sockopt::SocketOptions>> {
+    DIAL_SOCKOPTS.with(|c
